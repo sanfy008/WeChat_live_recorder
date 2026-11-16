@@ -58,9 +58,12 @@ class AsrConfig:
     # 但有 120s 单次上限和内容安全过滤风险，所以必须有本地兜底。
     engine: str = "auto"
     # Gemini 模型。实测质量排序：4-argon（最准）> 3.8-flash（快，但会串繁体）≈ 4-hydrogen（最快）
-    gemini_model: str = "google-vertex/gemini-4-hydrogen"
+    gemini_model: str = "group/hydrogen"
     gemini_endpoint: str = "http://127.0.0.1:3425/v1/chat/completions"
     gemini_api_key: str = "magpie-alma"
+    # Gemini 并发路数。实测 4 路加速 2.6x，8 路因网关争抢反而回落到 1.6x。
+    # 1 = 串行（旧行为）。只对云端引擎生效，本地 whisper 走 CPU 并发无益。
+    gemini_workers: int = 4
 
     # faster-whisper 模型：tiny/base/small/medium/large-v3
     # 中文场景 CPU 实时性优先选 small；有 GPU 可用 medium/large-v3

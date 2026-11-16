@@ -74,15 +74,19 @@ class GeminiASR:
 
     def __init__(
         self,
-        model: str = "google-vertex/gemini-4-hydrogen",
+        model: str = "group/hydrogen",
         endpoint: str = DEFAULT_ENDPOINT,
         api_key: str = "magpie-alma",
         reasoning_effort: str = "low",
         timeout: int = 300,
         lexicon_hint: str = "",
         correct_after: bool = True,
+        workers: int = 1,
     ) -> None:
         self.model = model
+        # 并发路数。实测 4 路最优（2.04x），8 路反而因争抢回落到 1.59x。
+        # 默认 1 = 串行，保持原有行为。
+        self.workers = max(1, int(workers))
         self.endpoint = endpoint
         self.api_key = api_key
         self.reasoning_effort = reasoning_effort
@@ -100,6 +104,13 @@ class GeminiASR:
         )
 
     # ---------- 单次 HTTP 调用 ----------
+
+    def _postprocess(self, text: str) -> list[str]:
+        """繁转简 → 错字纠正 → 拆行。串行/并发两条路径共用。"""
+        text = to_simplified(text)
+        if self.correct_after:
+            text = lexicon.correct_text(text)
+        return [x.strip() for x in text.split("\n") if x.strip()]
 
     def _call_once(self, pcm: np.ndarray) -> str:
         import io
@@ -162,29 +173,50 @@ class GeminiASR:
         chunk_samples = MAX_CHUNK_SECONDS * SAMPLE_RATE
         out: list[dict] = []
 
-        for offset in range(0, len(audio), chunk_samples):
-            piece = audio[offset : offset + chunk_samples]
-            start = offset / SAMPLE_RATE
-            dur = len(piece) / SAMPLE_RATE
+        # 先把所有块切好（内存里只是视图，不复制数据）
+        pieces: list[tuple[int, np.ndarray]] = [
+            (offset, audio[offset : offset + chunk_samples])
+            for offset in range(0, len(audio), chunk_samples)
+        ]
+
+        def _run_one(item: tuple[int, np.ndarray]) -> tuple[int, str | None, str | None]:
+            """返回 (offset, text, error)。异常不抛出，交给上层降级。"""
+            offset, piece = item
             try:
-                text = self._call_once(piece)
+                return offset, self._call_once(piece), None
             except urllib.error.HTTPError as e:
                 body = ""
                 try:
                     body = e.read().decode()[:200]
                 except Exception:
                     pass
-                raise RuntimeError(f"HTTP {e.code}: {body}") from e
+                return offset, None, f"HTTP {e.code}: {body}"
+            except Exception as e:  # noqa: BLE001
+                return offset, None, f"{type(e).__name__}: {e}"
+
+        if self.workers > 1 and len(pieces) > 1:
+            from concurrent.futures import ThreadPoolExecutor
+
+            print(f"[gemini-asr] 并发 {self.workers} 路处理 {len(pieces)} 块")
+            with ThreadPoolExecutor(max_workers=self.workers) as ex:
+                results = list(ex.map(_run_one, pieces))
+        else:
+            results = [_run_one(p) for p in pieces]
+
+        # 关键：按 offset 排序，而不是按完成顺序，否则时间轴会乱
+        for offset, text, err in sorted(results, key=lambda r: r[0]):
+            start = offset / SAMPLE_RATE
+            dur = len(audio[offset : offset + chunk_samples]) / SAMPLE_RATE
+            if err:
+                # 单块失败不再让整场崩：记日志、跳过，保留其余内容
+                print(f"[gemini-asr] {start:.0f}s 块失败，跳过：{err}")
+                continue
 
             if not text:
                 print(f"[gemini-asr] {start:.0f}s 片段返回空文本，跳过")
                 continue
 
-            # 繁转简 → 按实测错字表纠正（省实/金广附/指标到校等专有名词）
-            text = to_simplified(text)
-            if self.correct_after:
-                text = lexicon.correct_text(text)
-            lines = [x.strip() for x in text.split("\n") if x.strip()]
+            lines = self._postprocess(text)
             if not lines:
                 continue
 

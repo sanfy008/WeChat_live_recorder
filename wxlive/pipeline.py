@@ -86,6 +86,7 @@ def build_engine(cfg: Config):
             api_key=cfg.asr.gemini_api_key,
             lexicon_hint=hint,
             correct_after=cfg.asr.use_lexicon,
+            workers=getattr(cfg.asr, "gemini_workers", 1),
         )
 
     kind = (cfg.asr.engine or "auto").lower()

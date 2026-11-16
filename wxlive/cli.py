@@ -213,6 +213,7 @@ def cmd_record(args: argparse.Namespace) -> int:
             device=args.device_type,
             compute_type=args.compute_type,
             language=args.language,
+            gemini_workers=getattr(args, "workers", 4),
         ),
     )
     cfg.session_name = args.name or ""
@@ -306,7 +307,7 @@ def cmd_fetch(args: argparse.Namespace) -> int:
                 gemini_model=args.gemini_model, no_lexicon=args.no_lexicon,
                 lexicon_path=args.lexicon_path, model=args.model,
                 device_type=args.device_type, compute_type=args.compute_type,
-                language=args.language,
+                language=args.language, workers=getattr(args, "workers", 4),
             )
             return cmd_transcribe(ns)
         return 0
@@ -415,6 +416,9 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--compute-type", default="int8",
                         choices=["int8", "int8_float16", "float16", "float32"])
         sp.add_argument("--language", default="zh")
+        sp.add_argument("--workers", type=int, default=4,
+                        help="Gemini 并发路数（默认 4，实测 2.6x；8 路因争抢反而慢）。"
+                             "设 1 可强制串行")
 
     sp = sub.add_parser("gui", help="打开图形界面（推荐）")
     sp.set_defaults(func=cmd_gui)
