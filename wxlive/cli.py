@@ -228,6 +228,93 @@ def cmd_record(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_fetch(args: argparse.Namespace) -> int:
+    """从视频号 API 取址 → 解密下载 → 抽音频（可选直接转写）。
+
+    前提：本地抓流工具在跑，且已在微信里打开过目标视频（让工具捕获到）。
+    """
+    from .config import RECORDINGS_DIR, ensure_dirs
+    from . import fetch as F
+
+    try:
+        if args.list:
+            items = F.list_contents(args.api)
+            if not items:
+                print("工具里还没有捕获到任何内容。")
+                print("请先在微信里打开目标视频，让抓流工具捕获到它。")
+                return 1
+            print(f"已捕获 {len(items)} 条：\n")
+            for i, it in enumerate(items, 1):
+                print(f"  {i}. 《{it.title}》")
+                print(f"     id={it.content_id}")
+            return 0
+
+        if not args.target:
+            print("请给出标题关键词或 id（或用 --list 查看）")
+            return 1
+
+        item = F.find_content(args.target, args.api)
+        print(f"目标：《{item.title}》")
+        print(f"id  ：{item.content_id}")
+
+        key = F.get_decrypt_key(item, args.api)
+        flag, enc_len = F.probe_encryption(item.url)
+        print(f"加密：flag={flag} enc_len={enc_len}  key={'已取到' if key else '无'}")
+        if flag and not key:
+            print("文件已加密但没拿到密钥，中止")
+            return 1
+
+        ensure_dirs()
+        stem = F.safe_filename(args.name or item.title)
+
+        if args.no_video:
+            print("下载中（不保留视频）…")
+        else:
+            print("下载中…")
+        last = [0.0]
+
+        def prog(done: int, secs: float) -> None:
+            mb = done / 1048576
+            now = time.time()
+            if now - last[0] >= 2:
+                last[0] = now
+                rate = mb / max(1e-6, secs)
+                print(f"  {mb:6.1f} MB  {rate:5.1f} MB/s", flush=True)
+
+        if args.no_video:
+            # 直接流式抽音频：先落临时文件避免 moov seek 问题不可行，
+            # 因此仍先下完整文件，最后删掉。
+            tmp = Path(RECORDINGS_DIR) / (stem + ".mp4")
+            video = F.download_decrypted(item, key, tmp, on_progress=prog)
+            wav = F.extract_audio(video, Path(RECORDINGS_DIR) / (stem + ".wav"))
+            video.unlink(missing_ok=True)
+            print(f"已删除临时视频，保留音频：{wav.name}")
+        else:
+            video = F.download_decrypted(
+                item, key, Path(RECORDINGS_DIR) / (stem + ".mp4"), on_progress=prog)
+            print(f"视频：{video}  ({video.stat().st_size/1048576:.1f} MB)")
+            wav = F.extract_audio(video, Path(RECORDINGS_DIR) / (stem + ".wav"))
+            print(f"音频：{wav}  ({wav.stat().st_size/1048576:.1f} MB)")
+
+        dur, has_audio = F.probe_media(wav)
+        print(f"时长：{dur/60:.1f} 分钟，含音轨：{has_audio}")
+
+        if args.transcribe:
+            print("\n开始转写…")
+            ns = argparse.Namespace(
+                input=str(wav), engine=args.engine,
+                gemini_model=args.gemini_model, no_lexicon=args.no_lexicon,
+                lexicon_path=args.lexicon_path, model=args.model,
+                device_type=args.device_type, compute_type=args.compute_type,
+                language=args.language,
+            )
+            return cmd_transcribe(ns)
+        return 0
+    except F.FetchError as exc:
+        print(f"失败：{exc}")
+        return 1
+
+
 def cmd_transcribe(args: argparse.Namespace) -> int:
     """把已有音频文件转成逐字稿（离线补转，或换模型重转）。"""
     import numpy as np
@@ -315,7 +402,7 @@ def build_parser() -> argparse.ArgumentParser:
     def add_asr_opts(sp: argparse.ArgumentParser) -> None:
         sp.add_argument("--engine", default="auto", choices=["auto", "local", "gemini"],
                         help="转写引擎：auto=Gemini优先失败降级本地(默认) / local=纯本地 / gemini=纯云端")
-        sp.add_argument("--gemini-model", default="google-vertex/gemini-4-hydrogen",
+        sp.add_argument("--gemini-model", default="group/hydrogen",
                         help="Gemini 模型（4-hydrogen 最快(默认) / 4-argon 最准 / 3.8-flash 快但会串繁体）")
         sp.add_argument("--no-lexicon", action="store_true",
                         help="关闭 XSC 领域词表（默认开启：注入校名/术语 + 错字纠正 + 暗语展开）")
@@ -338,7 +425,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("doctor", help="环境自检")
     sp.add_argument("--device", default="", help="设备名关键字")
     sp.add_argument("--model", default="small")
-    sp.add_argument("--gemini-model", default="google-vertex/gemini-4-hydrogen")
+    sp.add_argument("--gemini-model", default="group/hydrogen")
     sp.set_defaults(func=cmd_doctor)
 
     sp = sub.add_parser("stream", help="流地址直录（拿到直播流地址时用，音质最好）")
@@ -352,6 +439,20 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--name", default="", help="会话名，会体现在文件名里")
     add_asr_opts(sp)
     sp.set_defaults(func=cmd_record)
+
+    sp = sub.add_parser("fetch", help="从视频号下载（自动解密），可选直接转写")
+    sp.add_argument("target", nargs="?", default="",
+                    help="标题关键词或内容 id；不填配合 --list 查看")
+    sp.add_argument("--list", action="store_true", help="列出工具已捕获的内容")
+    sp.add_argument("--api", default="http://127.0.0.1:2022",
+                    help="抓流工具的 API 地址（默认 127.0.0.1:2022）")
+    sp.add_argument("--name", default="", help="输出文件名（默认用标题）")
+    sp.add_argument("--no-video", action="store_true",
+                    help="只留音频，下载完删掉视频")
+    sp.add_argument("--transcribe", action="store_true",
+                    help="抽出音频后立即转写")
+    add_asr_opts(sp)
+    sp.set_defaults(func=cmd_fetch)
 
     sp = sub.add_parser("transcribe", help="转写已有音频文件")
     sp.add_argument("input", help="音频文件路径（wav/mp3/m4a 等）")
