@@ -323,6 +323,33 @@ def test_banxing_codes_from_official_chart():
         assert got == v, f"{k} 应为 {v}，实为 {got}"
 
 
+def test_ranking_chart_classes_and_codes():
+    """重点班排行表增补的班型术语与区属简称。"""
+    from wxlive import lexicon
+    lexicon.apply_loaded(lexicon.load())
+
+    for term in ("七中四叶草", "十六中君武", "南武剑吴", "天外2+4", "黄广T5", "花执灵格风重点"):
+        assert term in lexicon.TERMS, f"terms 缺少 {term}"
+
+    expect_codes = {
+        "煌上煌": "广大附黄华路课改班",
+        "琶执": "琶洲执信",
+        "亚铁": "亚运城铁一",
+        "江外": "江南外国语",
+        "侨外": "华侨外国语",
+        "西雅": "西关广雅",
+        "荔省": "荔湾省实",
+        "天执": "天河执信",
+    }
+    for k, v in expect_codes.items():
+        assert lexicon.CODES.get(k) == v, f"{k} 应为 {v}，实为 {lexicon.CODES.get(k)}"
+
+    out = lexicon.expand_codes("琶执重点和西雅重点怎么选")
+    assert "琶执（琶洲执信）" in out
+    assert "西雅（西关广雅）" in out
+
+
+
 def test_zeigao_is_class_not_school():
     """"择高班"是班型代码(ZG)，不是某所学校。"""
     from wxlive import lexicon

@@ -986,6 +986,12 @@ class App(FetchTabMixin, tk.Tk):
             if not messagebox.askyesno("任务进行中", "当前有任务在跑，确定退出？"):
                 return
             self.stop_flag.set()
+        # 先取消下载页的 after 定时器再 destroy：
+        # 否则事件循环始终"有事可做"，pythonw 进程会残留不退出
+        try:
+            self.fetch_shutdown()
+        except Exception:  # noqa: BLE001
+            pass
         self.destroy()
 
 

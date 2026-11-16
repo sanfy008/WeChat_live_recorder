@@ -122,6 +122,8 @@ class Session:
         if now - self._last_md_write < 2.0:
             return
         self._last_md_write = now
+        # 实时追加仍用逐句（尚无完整上下文，无法可靠断段）；
+        # 收尾时 close() 会按段落整体重写
         lines = [f"**[{_ts(offset + s['start'])}]** {s['text']}\n" for s in segs]
         with self.md_path.open("a", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
@@ -153,14 +155,23 @@ class Session:
         self.json_path.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
 
         # 完整重写 md（补齐可能因节流漏掉的句子）
-        body = "\n".join(f"**[{_ts(s['start'])}]** {s['text']}" for s in self.segments)
+        # 说明：md 是"给人看 / 给 LLM 分析"的产物，用段落聚合渲染。
+        # json / jsonl 保持逐句 + 原始时间戳，不受影响 —— 精确回查和
+        # 将来的说话人分离都靠它们。
+        from . import render as _render
+
+        groups = _render.group_segments(self.segments)
+        body = _render.render_paragraphs(self.segments)
         self.md_path.write_text(
             f"# 微信直播逐字稿\n\n"
             f"- 会话 ID：`{self.id}`\n"
             f"- 开始时间：{self.started_at.strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"- 时长：{_ts(doc['duration_seconds'])}\n"
             f"- 句数：{len(self.segments)}\n"
+            f"- 段落：{len(groups)}\n"
             f"- 音频文件：`{self._audio_name()}`\n\n"
+            f"> 本文件为段落聚合版（按直播转折话术断段），便于阅读与分析。\n"
+            f"> 需要精确到句和时间戳，请查同名 `.json`。\n\n"
             f"---\n\n{body}\n",
             encoding="utf-8",
         )

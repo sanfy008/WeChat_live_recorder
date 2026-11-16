@@ -1,13 +1,18 @@
-"""从视频号下载/转写：API 取址 → 解密 → 抽音频。
+"""\u4ECE\u89C6\u9891\u53F7\u4E0B\u8F7D/\u8F6C\u5199\uFF1AAPI \u53D6\u5740 \u2192 \u89E3\u5BC6 \u2192 \u62BD\u97F3\u9891\u3002
 
-依赖本地 wx_video_download（tools/wxcd）提供的 API：
-    GET  /api/content/list                       列出已捕获的内容
-    GET  /api/content/detail?id=wxchannels:<id>  取解密密钥 metadata.key
+\u4F9D\u8D56\u672C\u5730 wx_video_download\uFF08tools/wxcd\uFF09\u63D0\u4F9B\u7684 API\uFF1A
+    GET  /api/content/list    \u5217\u51FA\u5DF2\u6355\u83B7\u7684\u5185\u5BB9\uFF08\u652F\u6301 keyword/limit/offset/page\uFF09
+    GET  /api/content/detail  \u53D6\u89E3\u5BC6\u5BC6\u94A5 metadata.key
 
-为什么不再让工具自己下：
-    工具下载完会自动把 400MB 视频转成 MP3（ffmpeg -vn libmp3lame），
-    对"只要音频来转写"的场景纯属浪费：转码几分钟 + 额外占空间。
-    这里只拉一次流、本地解密、直接出 16k 单声道 WAV。
+\u4E3A\u4EC0\u4E48\u4E0D\u518D\u8BA9\u5DE5\u5177\u81EA\u5DF1\u4E0B\uFF1A
+    \u5DE5\u5177\u4E0B\u8F7D\u5B8C\u4F1A\u81EA\u52A8\u628A 400MB \u89C6\u9891\u8F6C\u6210 MP3\uFF08ffmpeg -vn libmp3lame\uFF09\uFF0C
+    \u5BF9"\u53EA\u8981\u97F3\u9891\u6765\u8F6C\u5199"\u7684\u573A\u666F\u7EAF\u5C5E\u6D6A\u8D39\uFF1A\u8F6C\u7801\u51E0\u5206\u949F + \u989D\u5916\u5360\u7A7A\u95F4\u3002
+    \u8FD9\u91CC\u53EA\u62C9\u4E00\u6B21\u6D41\u3001\u672C\u5730\u89E3\u5BC6\u3001\u76F4\u63A5\u51FA 16k \u5355\u58F0\u9053 WAV\u3002
+
+**\u8FD9\u4E2A\u5DE5\u5177\u6CA1\u6709\u5220\u9664\u5185\u5BB9\u7684 API**\uFF08\u6838\u5BF9\u8FC7 ltaoo/wx_channels_download \u7684
+internal/api/routes.go\uFF0Ccontent \u53EA\u6709 list / detail / relations\uFF09\u3002
+\u6240\u4EE5"\u5220\u9664/\u6E05\u7A7A\u5217\u8868"\u53EA\u80FD\u5728\u6211\u4EEC\u8FD9\u4FA7\u8BB0\u8D26\uFF08\u89C1 localstore.py\uFF09\uFF0C
+\u5DE5\u5177\u81EA\u5DF1\u7684\u5E93\u4E0D\u53D7\u5F71\u54CD\u3002
 """
 
 from __future__ import annotations
@@ -28,118 +33,345 @@ DEFAULT_API = "http://127.0.0.1:2022"
 
 
 class FetchError(RuntimeError):
-    """取址/下载失败。"""
+    """\u53D6\u5740/\u4E0B\u8F7D\u5931\u8D25\u3002"""
+
+
+def _fmt_size(n: int) -> str:
+    if n < 0:
+        return "\u672A\u77E5"
+    v = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if v < 1024 or unit == "GB":
+            return f"{v:.0f} {unit}" if unit == "B" else f"{v:.1f} {unit}"
+        v /= 1024.0
+    return f"{v:.1f} GB"
+
+
+def _fmt_ts(ts: int, ms: bool = False) -> str:
+    """\u65F6\u95F4\u6233 \u2192 \u672C\u5730\u53EF\u8BFB\u65F6\u95F4\u30020 \u6216\u975E\u6CD5\u503C\u8FD4\u56DE\u7A7A\u4E32\u3002"""
+    if not ts:
+        return ""
+    try:
+        v = float(ts) / (1000.0 if ms else 1.0)
+        if v <= 0:
+            return ""
+        return time.strftime("%m-%d %H:%M", time.localtime(v))
+    except (ValueError, OSError, OverflowError):
+        return ""
 
 
 @dataclass
 class ContentItem:
-    """一条已捕获的视频号内容。"""
+    """\u4E00\u6761\u5DF2\u6355\u83B7\u7684\u89C6\u9891\u53F7\u5185\u5BB9\u3002"""
 
-    content_id: str          # 纯数字 id
+    content_id: str          # \u7EAF\u6570\u5B57 id
     title: str
-    url: str                 # 带签名的直链
+    url: str                 # \u5E26\u7B7E\u540D\u7684\u76F4\u94FE
     source_url: str = ""
     cover_url: str = ""
+    author: str = ""         # \u4F5C\u8005\u6635\u79F0\uFF08\u5DE5\u5177\u4ECE accounts[].nickname \u7ED9\uFF09
+    publish_time: int = 0    # \u4F5C\u54C1\u53D1\u5E03\u65F6\u523B\uFF08unix \u79D2\uFF09
+    captured_at: int = 0     # \u88AB\u5DE5\u5177\u6355\u83B7\u7684\u65F6\u523B\uFF08unix \u6BEB\u79D2\uFF09
+    duration_seconds: float = 0.0  # \u53EA\u6709\u89E3\u6790\uFF08HEAD/\u6574\u6BB5\u63A2\u6D4B\uFF09\u540E\u624D\u77E5\u9053
 
     @property
     def api_id(self) -> str:
         return f"wxchannels:{self.content_id}"
 
+    @property
+    def publish_text(self) -> str:
+        return _fmt_ts(self.publish_time, ms=False)
+
+    @property
+    def captured_text(self) -> str:
+        return _fmt_ts(self.captured_at, ms=True)
+
+
+@dataclass
+class ContentPage:
+    """\u4E00\u9875\u5217\u8868\u7ED3\u679C\u3002
+
+    \u5DE5\u5177\u7684 /api/content/list \u652F\u6301 page/page_size/limit/offset/keyword\uFF0C
+    \u5E76\u8FD4\u56DE total \u2014\u2014 \u53EA\u53D6 list \u4F1A\u628A\u603B\u6570\u4E22\u6389\uFF0C\u754C\u9762\u4E0A\u5C31\u53EA\u80FD\u663E\u793A
+    "\u672C\u6B21\u8BFB\u5230 N \u6761"\uFF0C\u7FFB\u9875\u4E5F\u65E0\u4ECE\u5224\u65AD\u6709\u6CA1\u6709\u4E0B\u4E00\u9875\u3002
+    """
+
+    items: list[ContentItem]
+    total: int = 0
+    page: int = 1
+    page_size: int = 0
+
+    @property
+    def has_more(self) -> bool:
+        return self.page_size > 0 and self.page * self.page_size < self.total
+
+
+@dataclass
+class ProbeInfo:
+    """\u4E0B\u8F7D\u524D\u89E3\u6790\uFF08HEAD \u63A2\u6D4B\uFF09\u7684\u7ED3\u8BBA\u3002
+
+    \u4E0D\u89E3\u6790\u4E5F\u80FD\u4E0B\uFF0C\u4F46\u4EE3\u4EF7\u662F\uFF1A\u5730\u5740\u8FC7\u671F\uFF08\u5E26 sign/svrnonce \u6709\u65F6\u6548\uFF09\u8981\u7B49
+    \u4E0B\u5230 0 \u5B57\u8282\u624D\u77E5\u9053\uFF1B\u4E0D\u77E5\u9053\u8981\u4E0D\u8981\u5148\u53D6\u89E3\u5BC6\u5BC6\u94A5\uFF0C\u53EF\u80FD\u767D\u62C9\u51E0\u767E MB \u5BC6\u6587\uFF1B
+    \u8FDB\u5EA6\u6761\u6CA1\u6709\u603B\u6570\uFF0C\u53EA\u80FD\u662F\u8109\u51B2\u52A8\u753B\u3002\u89E3\u6790\u53EA\u8981\u4E00\u4E2A HEAD \u8BF7\u6C42\u3002
+    """
+
+    ok: bool = False
+    status: int = 0
+    encrypted: bool = False
+    enc_len: int = 0
+    size_bytes: int = -1
+    reason: str = ""
+
+    @property
+    def size_text(self) -> str:
+        return _fmt_size(self.size_bytes)
+
+    @property
+    def summary(self) -> str:
+        if not self.ok:
+            return self.reason or "\u89E3\u6790\u5931\u8D25"
+        return ("\u52A0\u5BC6" if self.encrypted else "\u660E\u6587") + " / " + self.size_text
+
 
 def _api_get(base: str, path: str, timeout: int = 20) -> dict:
     url = base.rstrip("/") + path
-    # 本地 API，绝不能走系统代理
+    # \u672C\u5730 API\uFF0C\u7EDD\u4E0D\u80FD\u8D70\u7CFB\u7EDF\u4EE3\u7406
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
         with opener.open(url, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8"))
     except Exception as exc:  # noqa: BLE001
         raise FetchError(
-            f"无法访问 {path}。抓流工具是否在运行？"
-            f"（应在 tools/wxcd 下用根命令启动）原始错误：{exc}"
+            f"\u65E0\u6CD5\u8BBF\u95EE {path}\u3002\u6293\u6D41\u5DE5\u5177\u662F\u5426\u5728\u8FD0\u884C\uFF1F"
+            f"\uFF08\u5E94\u5728 tools/wxcd \u4E0B\u7528\u6839\u547D\u4EE4\u542F\u52A8\uFF09\u539F\u59CB\u9519\u8BEF\uFF1A{exc}"
         ) from exc
 
 
-def list_contents(api: str = DEFAULT_API) -> list[ContentItem]:
-    """列出工具已捕获的内容（新→旧）。"""
-    data = _api_get(api, "/api/content/list")
+def _parse_item(it: dict) -> ContentItem | None:
+    """\u628A\u5DE5\u5177\u8FD4\u56DE\u7684\u4E00\u6761\u8BB0\u5F55\u8F6C\u6210 ContentItem\u3002\u7F3A id / url \u7684\u4E22\u5F03\u3002"""
+    cid = str(it.get("external_id") or "").strip()
+    url = str(it.get("url") or "").strip()
+    if not cid or not url:
+        return None
+
+    # \u4F5C\u8005\uFF1Aaccounts[] \u91CC role=owner \u7684\u662F\u771F\u6B63\u4F5C\u8005\uFF0C\u5176\u4F59\u662F\u8F6C\u53D1/\u5408\u4F5C\u53F7
+    author = ""
+    accounts = it.get("accounts") or []
+    if isinstance(accounts, list) and accounts:
+        pick = None
+        for acc in accounts:
+            if isinstance(acc, dict) and str(acc.get("role") or "") == "owner":
+                pick = acc
+                break
+        if pick is None and isinstance(accounts[0], dict):
+            pick = accounts[0]
+        if pick:
+            author = str(pick.get("nickname") or "").strip()
+
+    def _int(key: str) -> int:
+        try:
+            return int(it.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    return ContentItem(
+        content_id=cid,
+        title=str(it.get("title") or "").strip() or cid,
+        url=url,
+        source_url=str(it.get("source_url") or ""),
+        cover_url=str(it.get("cover_url") or ""),
+        author=author,
+        publish_time=_int("publish_time"),
+        captured_at=_int("created_at"),
+    )
+
+
+def list_page(api: str = DEFAULT_API, keyword: str = "",
+              limit: int | None = None, offset: int | None = None,
+              page: int | None = None, page_size: int | None = None,
+              platform: str = "wxchannels") -> ContentPage:
+    """\u8BFB\u4E00\u9875\u5185\u5BB9\u5217\u8868\uFF0C\u5E26 total\u3002
+
+    \u53C2\u6570\u5BF9\u5E94\u5DE5\u5177\u81EA\u5DF1\u7684\u67E5\u8BE2\u53C2\u6570\uFF08internal/api/handler_content.go \u7684
+    handle_content_list_with_type \u91CC those form \u7ED1\u5B9A\uFF09\uFF1A
+        keyword / limit / offset / page / page_size / platform_id
+
+    \u6CE8\u610F keyword \u662F**\u670D\u52A1\u7AEF**\u8FC7\u6EE4\uFF08SQL LIKE\uFF09\uFF0C\u4E0D\u662F\u524D\u7AEF\u8FC7\u6EE4\uFF1B
+    \u4E2D\u6587\u5FC5\u987B URL \u7F16\u7801\uFF0C\u5426\u5219\u670D\u52A1\u7AEF\u6536\u5230\u4E71\u7801\u4F1A\u8FD4\u56DE 0 \u6761\uFF08\u5B9E\u6D4B\uFF09\u3002
+    """
+    qs: list[str] = []
+    if platform:
+        qs.append("platform_id=" + urllib.parse.quote(platform))
+    kw = (keyword or "").strip()
+    if kw:
+        qs.append("keyword=" + urllib.parse.quote(kw))
+    if limit is not None and limit > 0:
+        qs.append(f"limit={int(limit)}")
+    if offset is not None and offset >= 0:
+        qs.append(f"offset={int(offset)}")
+    if page is not None and page > 0:
+        qs.append(f"page={int(page)}")
+    if page_size is not None and page_size > 0:
+        qs.append(f"page_size={int(page_size)}")
+
+    path = "/api/content/list" + (("?" + "&".join(qs)) if qs else "")
+    data = _api_get(api, path)
     if data.get("code") not in (0, None):
-        raise FetchError(f"接口返回错误：{data.get('msg')}")
-    items = []
-    for it in (data.get("data") or {}).get("list") or []:
-        cid = str(it.get("external_id") or "").strip()
-        url = str(it.get("url") or "").strip()
-        if not cid or not url:
-            continue
-        items.append(ContentItem(
-            content_id=cid,
-            title=str(it.get("title") or "").strip() or cid,
-            url=url,
-            source_url=str(it.get("source_url") or ""),
-            cover_url=str(it.get("cover_url") or ""),
-        ))
-    return items
+        raise FetchError(f"\u63A5\u53E3\u8FD4\u56DE\u9519\u8BEF\uFF1A{data.get('msg')}")
+
+    payload = data.get("data") or {}
+    items: list[ContentItem] = []
+    for raw in payload.get("list") or []:
+        if isinstance(raw, dict):
+            item = _parse_item(raw)
+            if item:
+                items.append(item)
+
+    try:
+        total = int(payload.get("total") or 0)
+    except (TypeError, ValueError):
+        total = 0
+    if not total:
+        total = len(items)
+
+    return ContentPage(items=items, total=total,
+                       page=int(payload.get("page") or 1),
+                       page_size=int(payload.get("page_size") or len(items)))
+
+
+def list_contents(api: str = DEFAULT_API, keyword: str = "",
+                  limit: int | None = None,
+                  offset: int | None = None) -> list[ContentItem]:
+    """\u5217\u51FA\u5DE5\u5177\u5DF2\u6355\u83B7\u7684\u5185\u5BB9\uFF08\u65B0\u2192\u65E7\uFF09\u3002\u53EA\u5173\u5FC3\u6761\u76EE\u65F6\u7528\u8FD9\u4E2A\u3002"""
+    return list_page(api, keyword=keyword, limit=limit, offset=offset).items
 
 
 def find_content(keyword: str, api: str = DEFAULT_API) -> ContentItem:
-    """按标题关键词或 id 找内容。命中多条时取第一条。"""
+    """\u6309\u6807\u9898\u5173\u952E\u8BCD\u6216 id \u627E\u5185\u5BB9\u3002\u547D\u4E2D\u591A\u6761\u65F6\u53D6\u7B2C\u4E00\u6761\u3002"""
     kw = keyword.strip()
     if not kw:
-        raise FetchError("关键词不能为空")
-    items = list_contents(api)
+        raise FetchError("\u5173\u952E\u8BCD\u4E0D\u80FD\u4E3A\u7A7A")
+    page = list_page(api, keyword=kw)
+    items = page.items
     for it in items:
         if it.content_id == kw or it.api_id == kw:
             return it
-    hits = [it for it in items if kw in it.title]
+    hits = [it for it in items if kw.lower() in it.title.lower()]
     if not hits:
-        titles = "、".join(f"《{it.title}》" for it in items[:5]) or "（空）"
-        raise FetchError(f"没找到包含「{kw}」的内容。已捕获：{titles}")
+        titles = "\u3001".join(f"\u300A{it.title}\u300B" for it in items[:5]) or "\uFF08\u7A7A\uFF09"
+        raise FetchError(f"\u6CA1\u627E\u5230\u5305\u542B\u300C{kw}\u300D\u7684\u5185\u5BB9\u3002\u5DF2\u6355\u83B7\uFF1A{titles}")
     return hits[0]
 
 
+def probe_item(item: ContentItem, timeout: int = 20) -> ProbeInfo:
+    """\u4E0B\u8F7D\u524D\u89E3\u6790\uFF1A\u5730\u5740\u662F\u5426\u8FC7\u671F\u3001\u8981\u4E0D\u8981\u89E3\u5BC6\u3001\u6587\u4EF6\u591A\u5927\u3002
+
+    \u8FD9\u4E00\u6B65\u662F"\u53EF\u9009"\u7684 \u2014\u2014 \u4E0D\u89E3\u6790\u76F4\u63A5\u4E0B\u4E5F\u80FD\u6210\uFF0C\u4F46\u4EE3\u4EF7\u89C1 ProbeInfo \u6CE8\u91CA\u3002
+    """
+    from .sphdecrypt import head_info
+
+    try:
+        info = head_info(item.url, timeout=timeout)
+    except Exception as exc:  # noqa: BLE001
+        return ProbeInfo(ok=False, reason=f"\u8FDE\u4E0D\u4E0A\uFF1A{type(exc).__name__}: {exc}")
+
+    try:
+        status = int(info.get("status") or 0)
+    except (TypeError, ValueError):
+        status = 0
+
+    if status in (401, 403):
+        return ProbeInfo(
+            ok=False, status=status,
+            reason=f"HTTP {status}\uFF1A\u5730\u5740\u53EF\u80FD\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u5728\u5FAE\u4FE1\u91CC\u91CD\u65B0\u6253\u5F00\u8BE5\u89C6\u9891\u518D\u5237\u65B0")
+    if status == 404:
+        return ProbeInfo(ok=False, status=status,
+                         reason="HTTP 404\uFF1A\u8D44\u6E90\u4E0D\u5B58\u5728\uFF08\u53EF\u80FD\u5DF2\u4E0B\u67B6\uFF09")
+    if status >= 400:
+        return ProbeInfo(ok=False, status=status, reason=f"HTTP {status}")
+
+    enc_flag = 0
+    enc_len = 0
+    size = -1
+    try:
+        enc_flag = int(info.get("enc_flag") or 0)
+        enc_len = int(info.get("enc_len") or 0)
+        size = int(info.get("content_length") or -1)
+    except (TypeError, ValueError):
+        pass
+
+    return ProbeInfo(ok=True, status=status, encrypted=bool(enc_flag),
+                     enc_len=enc_len, size_bytes=size)
+
+
 def get_decrypt_key(item: ContentItem, api: str = DEFAULT_API) -> int:
-    """取解密密钥。视频号把 key 放在 content.metadata 里（十进制字符串）。"""
+    """\u53D6\u89E3\u5BC6\u5BC6\u94A5\u3002\u89C6\u9891\u53F7\u628A key \u653E\u5728 content.metadata \u91CC\uFF08\u5341\u8FDB\u5236\u5B57\u7B26\u4E32\uFF09\u3002"""
     data = _api_get(api, "/api/content/detail?id=" +
                     urllib.parse.quote(item.api_id))
     if data.get("code") not in (0, None):
-        raise FetchError(f"取详情失败：{data.get('msg')}")
+        raise FetchError(f"\u53D6\u8BE6\u60C5\u5931\u8D25\uFF1A{data.get('msg')}")
     content = (data.get("data") or {}).get("content") or {}
     raw = content.get("metadata") or ""
     if not raw:
-        raise FetchError("详情里没有 metadata，拿不到解密密钥")
+        raise FetchError("\u8BE6\u60C5\u91CC\u6CA1\u6709 metadata\uFF0C\u62FF\u4E0D\u5230\u89E3\u5BC6\u5BC6\u94A5")
     try:
         meta = json.loads(raw) if isinstance(raw, str) else raw
         return int(str(meta.get("key") or "0"))
     except (ValueError, TypeError) as exc:
-        raise FetchError(f"解密密钥解析失败：{raw!r}") from exc
+        raise FetchError(f"\u89E3\u5BC6\u5BC6\u94A5\u89E3\u6790\u5931\u8D25\uFF1A{raw!r}") from exc
 
 
 def _find_ffmpeg() -> str:
     exe = shutil.which("ffmpeg")
     if not exe:
-        raise FetchError("找不到 ffmpeg，请先安装")
+        raise FetchError("\u627E\u4E0D\u5230 ffmpeg\uFF0C\u8BF7\u5148\u5B89\u88C5")
     return exe
 
 
 def safe_filename(name: str) -> str:
-    """去掉 Windows 文件名非法字符。"""
+    """\u53BB\u6389 Windows \u6587\u4EF6\u540D\u975E\u6CD5\u5B57\u7B26\u3002"""
     bad = '<>:"/\\|?*'
     out = "".join("_" if c in bad else c for c in name)
-    return out.strip().strip(".")[:120] or "untitled"
+    out = "".join(" " if ord(c) < 32 else c for c in out)
+    out = out.strip().strip(".")
+    # Windows \u4FDD\u7559\u540D\uFF08CON/PRN/AUX/NUL/COM1..9/LPT1..9\uFF09\uFF0C\u5E26\u540E\u7F00\u4E5F\u4E0D\u884C
+    stem = out.split(".")[0].upper()
+    reserved = {"CON", "PRN", "AUX", "NUL"} | {
+        f"{p}{i}" for p in ("COM", "LPT") for i in range(1, 10)}
+    if stem in reserved:
+        out = "_" + out
+    return out[:120] or "untitled"
+
+
+def unique_path(path: Path) -> Path:
+    """\u540C\u540D\u6587\u4EF6\u4E0D\u8986\u76D6\uFF0C\u8FFD\u52A0 (2)(3)\u2026\u3002
+
+    \u5DE5\u5177\u81EA\u5DF1\u7684\u4E0B\u8F7D\u4E5F\u8E29\u8FC7\u8FD9\u4E2A\u5751\uFF08\u88AB\u91CD\u540D\u89C6\u9891\u8986\u76D6\uFF09\uFF0C\u6211\u4EEC\u540C\u6837\u8981\u907F\u8BA9\uFF1A
+    \u540C\u4E00\u4E2A\u76F4\u64AD\u95F4\u5F00\u4E24\u573A\uFF0C\u6807\u9898\u53EF\u80FD\u4E00\u6A21\u4E00\u6837\u3002
+    """
+    path = Path(path)
+    if not path.exists():
+        return path
+    stem, suffix = path.stem, path.suffix
+    for i in range(2, 1000):
+        cand = path.with_name(f"{stem}({i}){suffix}")
+        if not cand.exists():
+            return cand
+    raise FetchError(f"\u540C\u540D\u6587\u4EF6\u8FC7\u591A\uFF1A{path.name}")
 
 
 def download_decrypted(item: ContentItem, key: int,
                        dest: Path | None = None,
                        on_progress=None) -> Path:
-    """下载并解密整段媒体，返回落地路径。
+    """\u4E0B\u8F7D\u5E76\u89E3\u5BC6\u6574\u6BB5\u5A92\u4F53\uFF0C\u8FD4\u56DE\u843D\u5730\u8DEF\u5F84\u3002
 
-    必须先完整落盘再给 ffmpeg：视频号的 MP4 是分片结构，
-    `moov` 在文件头之后，用管道喂 ffmpeg 时无法 seek，
-    会报 "moov atom not found"。
+    \u5FC5\u987B\u5148\u5B8C\u6574\u843D\u76D8\u518D\u7ED9 ffmpeg\uFF1A\u89C6\u9891\u53F7\u7684 MP4 \u662F\u5206\u7247\u7ED3\u6784\uFF0C
+    moov \u5728\u6587\u4EF6\u5934\u4E4B\u540E\uFF0C\u7528\u7BA1\u9053\u5582 ffmpeg \u65F6\u65E0\u6CD5 seek\uFF0C
+    \u4F1A\u62A5 "moov atom not found"\u3002
     """
     flag, enc_len = probe_encryption(item.url)
     if flag and not key:
-        raise FetchError("文件已加密但未拿到密钥，无法解密")
+        raise FetchError("\u6587\u4EF6\u5DF2\u52A0\u5BC6\u4F46\u672A\u62FF\u5230\u5BC6\u94A5\uFF0C\u65E0\u6CD5\u89E3\u5BC6")
 
     if dest is None:
         from .config import RECORDINGS_DIR
@@ -166,14 +398,14 @@ def download_decrypted(item: ContentItem, key: int,
 
     if total == 0:
         part.unlink(missing_ok=True)
-        raise FetchError("下载到 0 字节，地址可能已过期")
+        raise FetchError("\u4E0B\u8F7D\u5230 0 \u5B57\u8282\uFF0C\u5730\u5740\u53EF\u80FD\u5DF2\u8FC7\u671F")
     os.replace(part, dest)
     return dest
 
 
 def extract_audio(video: Path, wav: Path | None = None,
                   sample_rate: int = 16000, on_progress=None) -> Path:
-    """从视频中抽出 16k 单声道 WAV（转写引擎的输入格式）。"""
+    """\u4ECE\u89C6\u9891\u4E2D\u62BD\u51FA 16k \u5355\u58F0\u9053 WAV\uFF08\u8F6C\u5199\u5F15\u64CE\u7684\u8F93\u5165\u683C\u5F0F\uFF09\u3002"""
     video = Path(video)
     if wav is None:
         from .config import RECORDINGS_DIR
@@ -191,12 +423,12 @@ def extract_audio(video: Path, wav: Path | None = None,
                        encoding="utf-8", errors="replace")
     if r.returncode != 0 or not wav.exists() or wav.stat().st_size == 0:
         tail = (r.stderr or "").strip()[-400:]
-        raise FetchError(f"抽音频失败（rc={r.returncode}）：{tail}")
+        raise FetchError(f"\u62BD\u97F3\u9891\u5931\u8D25\uFF08rc={r.returncode}\uFF09\uFF1A{tail}")
     return wav
 
 
 def probe_media(path: Path) -> tuple[float, bool]:
-    """返回 (时长秒, 是否有音轨)。"""
+    """\u8FD4\u56DE (\u65F6\u957F\u79D2, \u662F\u5426\u6709\u97F3\u8F68)\u3002"""
     exe = shutil.which("ffprobe")
     if not exe:
         return 0.0, False

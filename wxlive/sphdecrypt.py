@@ -218,25 +218,55 @@ def probe_encryption(url: str, timeout: int = 30) -> tuple[int, int]:
 
     返回 (enc_flag, enc_len)。enc_flag=0 表示明文，无需解密。
 
-    坑：**必须发不带 Range 的请求**。带 `Range: bytes=0-15` 时，
-    服务器返回的 `X-enclen` 会跟着缩成 16（只报这一段），
-    而真实加密区通常是 131072（128KB）。用缩水的值去解密，
-    只有前 16 字节被还原，`moov` 仍在密文里，ffmpeg 会报
-    "moov atom not found"。
+    实现委托给 `head_info()`：两者要的响应头完全一样，
+    分开写容易出现"一边带 Range 一边不带"的偏差。
     """
+    info = head_info(url, timeout=timeout)
+    return int(info.get("enc_flag") or 0), int(info.get("enc_len") or 0)
+
+
+def head_info(url: str, timeout: int = 20) -> dict:
+    """HEAD 探测流地址的元信息。
+
+    返回 dict：
+        status           HTTP 状态码（0 表示没拿到）
+        content_length   字节数（-1 = 服务端没给）
+        enc_flag         X-encflag（1 = 需要解密）
+        enc_len          X-enclen（加密区字节数）
+
+    坑（与 probe_encryption 同源）：**不能带 Range 头**。
+    带 `Range: bytes=0-x` 时服务端返回的 X-enclen 会缩成该段长度，
+    用这个缩水值去解密只能还原开头几个字节，moov 仍在密文里，
+    ffmpeg 照样报 "moov atom not found"。
+
+    有些 CDN 不支持 HEAD → 退回不带 Range 的 GET，只读响应头就关掉。
+    """
+    out = {"status": 0, "content_length": -1, "enc_flag": 0, "enc_len": 0}
+
+    def _fill(r) -> None:
+        out["status"] = getattr(r, "status", None) or 0
+        try:
+            out["content_length"] = int(r.headers.get("Content-Length") or -1)
+        except (TypeError, ValueError):
+            out["content_length"] = -1
+        try:
+            out["enc_flag"] = int(r.headers.get("X-encflag") or 0)
+            out["enc_len"] = int(r.headers.get("X-enclen") or 0)
+        except (TypeError, ValueError):
+            pass
+
     req = urllib.request.Request(url, headers=_headers(), method="HEAD")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            enc_flag = int(r.headers.get("X-encflag") or 0)
-            enc_len = int(r.headers.get("X-enclen") or 0)
-        return enc_flag, enc_len
-    except Exception:
-        # 有些 CDN 不支持 HEAD，退回 GET 并立刻关闭
-        req = urllib.request.Request(url, headers=_headers())
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            enc_flag = int(r.headers.get("X-encflag") or 0)
-            enc_len = int(r.headers.get("X-enclen") or 0)
-        return enc_flag, enc_len
+            _fill(r)
+        return out
+    except Exception:  # noqa: BLE001
+        pass
+
+    req = urllib.request.Request(url, headers=_headers())
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        _fill(r)
+    return out
 
 
 def open_decrypted(url: str, enc_len: int, seed_key: int,

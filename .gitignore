@@ -10,6 +10,9 @@ __pycache__/
 # ===== 应用内部状态 =====
 .alma-snapshots/
 config/user.json
+# 下载页的隐藏/已下载记账：纯本机运行时状态，每台机器不同，不该入库
+config/fetch_state.json
+config/*.tmp
 
 # ===== 运行产物（体积大或含隐私，不入库）=====
 output/
