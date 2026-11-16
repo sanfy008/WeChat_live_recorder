@@ -1,0 +1,6 @@
+# 默认统一 LF
+* text=auto eol=lf
+
+# bat 必须 CRLF，否则 cmd.exe 解析失败（本项目踩过这个坑）
+# 注意：这条必须写在默认规则之后，git 按最后匹配的规则生效
+*.bat text eol=crlf

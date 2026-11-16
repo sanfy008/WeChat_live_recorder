@@ -1,0 +1,25 @@
+# ===== Python =====
+.venv/
+.venv-trim/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+
+# ===== 应用内部状态 =====
+.alma-snapshots/
+config/user.json
+
+# ===== 运行产物（体积大或含隐私，不入库）=====
+output/
+*.log
+
+# ===== 第三方工具运行时（含二进制与数据库）=====
+tools/wxcd/
+tools/proxy-backup.txt
+
+# ===== 测试音频（体积大，用脚本可重新生成）=====
+tests/eval/
+tests/fixtures/*.wav
+tests/fixtures/*.mp3

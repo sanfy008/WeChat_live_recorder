@@ -1,0 +1,14 @@
+# 音频采集（WASAPI loopback）
+PyAudioWPatch>=0.2.12
+# 音频读写
+soundfile>=0.14
+# 高质量重采样（48k -> 16k，ASR 必需）
+soxr>=1.1
+# 数值计算
+numpy>=2.0
+# 本地 ASR 引擎
+faster-whisper>=1.2
+# 繁转简（Gemini 偶尔输出繁体）
+opencc-python-reimplemented>=0.1.7
+# 可选：FunASR / SenseVoice（未接入主链路，仅供实验）
+# funasr>=1.4
