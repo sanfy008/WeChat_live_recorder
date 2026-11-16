@@ -96,6 +96,10 @@ class Session:
                 "end": round(offset + s["end"], 2),
                 "text": text,
                 "raw_text": s["text"] if text != s["text"] else None,
+                # 句级时间戳的可信度：云端 Gemini 不返回时间，是按字数摊的估算值
+                # （实测中位偏差 19.3s）；本地 whisper 有真实对齐。
+                # 显式标出来，避免下游把它当精确值用。
+                "ts_source": s.get("ts_source", "exact"),
                 "speaker": None,  # 预留：后续做说话人分离时填 S1/S2
             }
             self.segments.append(rec)

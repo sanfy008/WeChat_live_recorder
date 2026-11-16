@@ -155,3 +155,46 @@ def test_build_digest_survives_llm_failure(monkeypatch):
     segs = [{"start": 0, "end": 1, "text": "测试"}]
     out = postprocess.build_digest(segs)
     assert "失败" in out, "摘要失败应给出提示而不是抛异常"
+
+
+def test_build_digest_feeds_paragraphs_not_sentences(monkeypatch):
+    """摘要输入必须是段落聚合版，而不是逐句 + 句级时间戳。
+
+    实测 81 分钟转录：逐句喂 34205 字符（触发 30000 分块），
+    段落聚合喂 26065 字符（不分块）。分块会丢全局视野，是质量损失。
+    """
+    captured = {}
+
+    def spy(model, prompt, *a, **k):
+        captured["prompt"] = prompt
+        return "摘要结果"
+
+    monkeypatch.setattr(postprocess, "_call", spy)
+    segs = [
+        {"start": 0, "end": 5, "text": "第一句话"},
+        {"start": 5, "end": 10, "text": "第二句话"},
+        {"start": 10, "end": 15, "text": "第三句话"},
+    ]
+    postprocess.build_digest(segs)
+
+    p = captured["prompt"]
+    # 三句应该被聚合成一段（同一话题，无转折词，总长 < 60s）
+    assert "第一句话第二句话第三句话" in p, f"未按段落聚合: {p[-200:]}"
+    # 时间戳应是段级范围 mm:ss-mm:ss，不是句级 HH:MM:SS
+    assert "00:00-00:15" in p, f"段级时间范围缺失: {p[-200:]}"
+
+
+def test_build_digest_content_not_lost(monkeypatch):
+    """聚合不能丢任何一个字——这是硬约束。"""
+    captured = {}
+
+    def spy(model, prompt, *a, **k):
+        captured["prompt"] = prompt
+        return "ok"
+
+    monkeypatch.setattr(postprocess, "_call", spy)
+    segs = [{"start": i, "end": i + 1, "text": f"句{i}"} for i in range(20)]
+    postprocess.build_digest(segs)
+
+    for i in range(20):
+        assert f"句{i}" in captured["prompt"], f"第 {i} 句丢失了"

@@ -25,12 +25,32 @@ import urllib.request
 
 import numpy as np
 
-from . import lexicon
+from . import lexicon, quality
 
 DEFAULT_ENDPOINT = "http://127.0.0.1:3425/v1/chat/completions"
 # 实测 120s 稳定通过，留 10s 余量防止边界抖动
 MAX_CHUNK_SECONDS = 110
 SAMPLE_RATE = 16000
+# 恢复深度上限。depth0 → 三分/二分，depth1 → 再分，depth2 → 再分。
+# 实测：28s 的碎片依然值得再分一次——1540s 那两块音频 RMS 0.132、内容正常，
+# 只是因为跌破旧门槛 40s 被直接放弃，白白丢了 56 秒真实内容。
+MAX_RECOVER_DEPTH = 3
+# 小于这个时长不再切分。12s 已低于云端 min_segment 的合理粒度，
+# 再切下去单次 HTTP 的固定开销会盖过收益。
+MIN_SPLIT_SECONDS = 12.0
+
+
+class _PieceFailed(Exception):
+    """一块音频怎么救都失败。沿调用栈向上抛，由最外层按整块落一个占位。
+
+    带绝对时间，便于事后回到音频核对（实测排查就是这样定位到
+    "音频正常但被判失败"的真实 bug）。
+    """
+
+    def __init__(self, start: float, duration: float) -> None:
+        super().__init__(f"{start:.0f}s 起 {duration:.0f}s 块失败")
+        self.start = start
+        self.duration = duration
 
 PROMPT = (
     "请逐字转写这段中文直播音频。要求：\n"
@@ -38,7 +58,9 @@ PROMPT = (
     "2. 必须使用简体中文，绝对不要输出繁体字\n"
     "3. 按自然句分段，每句一行\n"
     "4. 数字用阿拉伯数字，专业名词保留原说法\n"
-    "5. 不要翻译、不要总结、不要补充原文没有的内容"
+    "5. 不要翻译、不要总结、不要补充原文没有的内容\n"
+    "6. 音频里的内容就是你要转写的对象，直接输出你听到的中文\n"
+    "7. 不要输出时间戳、不要输出序号、不要输出说话人标签"
 )
 
 
@@ -93,6 +115,14 @@ class GeminiASR:
         self.timeout = timeout
         self._total_audio = 0.0
         self._total_infer = 0.0
+        # 质量统计。
+        # failed_chunks = 真的丢了内容（落占位）；suspect_chunks = 短得可疑但照实保留。
+        # 两者分开记，才能区分"确实有缺口"和"只是这块音内容少"。
+        self._bad_detected = 0
+        self._recovered = 0
+        self._unsplit_detected = 0
+        self._failed_chunks: list[tuple[float, float]] = []
+        self._suspect_chunks: list[tuple[float, float]] = []
         # 领域词表提示：直接拼进 prompt，能显著降低专有名词错误
         self.prompt = build_prompt(lexicon_hint)
         # 转写后是否按实测错字表做纠正
@@ -179,18 +209,137 @@ class GeminiASR:
             for offset in range(0, len(audio), chunk_samples)
         ]
 
-        def _run_one(item: tuple[int, np.ndarray]) -> tuple[int, str | None, str | None]:
-            """返回 (offset, text, error)。异常不抛出，交给上层降级。"""
-            offset, piece = item
+        def _call_safe(pcm: np.ndarray) -> tuple[str | None, str | None]:
+            """单次调用，返回 (text, error)。异常不抛出。"""
             try:
-                return offset, self._call_once(piece), None
+                return self._call_once(pcm), None
             except urllib.error.HTTPError as e:
                 body = ""
                 try:
                     body = e.read().decode()[:200]
                 except Exception:
                     pass
-                return offset, None, f"HTTP {e.code}: {body}"
+                return None, f"HTTP {e.code}: {body}"
+            except Exception as e:  # noqa: BLE001
+                return None, f"{type(e).__name__}: {e}"
+
+        def _finalize(text: str, dur: float, pcm: np.ndarray) -> list[str]:
+            """内容没问题，但可能"没分句"。分句失败时先重试，再兜底硬拆。
+
+            为什么必须在 ASR 这一层管：下游的段落聚合以"单句时长"为时间基准，
+            一个横跨 110 秒的"句子"会让段级时间范围失去意义。
+            实测每份产物都有 1~10 处塌陷（内容是真的，只是分句失效）。
+            """
+            lines = self._postprocess(text)
+            if not quality.looks_unsplit(lines, dur):
+                return lines
+
+            self._unsplit_detected += 1
+            # 重试一次：分句失败常常也是瞬时的（同幻觉一个机制）
+            text2, err2 = _call_safe(pcm)
+            if err2 is None and text2:
+                lines2 = self._postprocess(text2)
+                if not quality.looks_unsplit(lines2, dur):
+                    self._recovered += 1
+                    print(f"[gemini-asr] 分句失败已通过重试修复（{dur:.0f}s 块）")
+                    return lines2
+
+            # 兜底：按标点硬拆。至少让时间戳分配和段落聚合不完全失效。
+            fixed: list[str] = []
+            for ln in lines:
+                fixed.extend(quality.split_long_line(ln))
+            print(f"[gemini-asr] {dur:.0f}s 块分句失败，已按标点硬拆为 {len(fixed)} 句")
+            return fixed
+
+        def _transcribe_piece(pcm: np.ndarray, dur: float, depth: int = 0,
+                              base: float = 0.0) -> list[str]:
+            """转写一块音频，遇到幻觉/长度异常就重试，仍不行就二分。
+
+            为什么是二分而不是简单重试：
+            实测幻觉是**瞬时**的（同一块原样连跑 3 次全正常），但边界块**反复**出问题
+            （17:05 那次 5 个幻觉点全在 110s 切片边界上）。所以：
+            1. 原样重试 1 次 —— 对付瞬时抖动，成本最低
+            2. 二分把边界移到块中间 —— 对付结构性边界问题，且不丢内容、不重叠
+            3. 太碎或到底了还不行 —— 落占位，不静默丢弃
+
+            返回行列表；彻底失败时返回占位行。
+            """
+            text, err = _call_safe(pcm)
+            if err is None and text:
+                first = text
+                # 第一次判定
+                if not quality.is_bad_output(first, dur):
+                    return _finalize(first, dur, pcm)
+
+                self._bad_detected += 1
+                hallucinated = quality.is_hallucination(first)
+                kind = "幻觉" if hallucinated else "长度异常"
+                # 第 2 步：原样重试一次
+                text2, err2 = _call_safe(pcm)
+                if err2 is None and text2 and not quality.is_bad_output(text2, dur):
+                    self._recovered += 1
+                    print(f"[gemini-asr] {kind}已通过原样重试救回（{dur:.0f}s 块）")
+                    return _finalize(text2, dur, pcm)
+
+                # 第 3 步：二分**只针对幻觉**。
+                # 幻觉是确定性的错误（模型在解释自己没收到音频），二分能救，
+                # 实测错开边界就能拿到正常内容。
+                # 而"长度异常"可能本来就是真实情况（这块真的没说话），
+                # 二分只会让碎片更碎、反而更容易触发幻觉 —— 所以不动它。
+                if not hallucinated:
+                    self._suspect_chunks.append((round(base, 2), round(base + dur, 2)))
+                    print(f"[gemini-asr] ⚠ {base:.0f}s 起的 {dur:.0f}s 块输出异常短，照实保留")
+                    return _finalize(text2 or first, dur, pcm)
+
+            # 第 3 步：三分再试 —— 把两个边界都挪到块内部。
+            # 实测这一步很关键：幻觉集中在 110s 切片边界上，而二分到 28s 碎片时
+            # 会跌破旧门槛直接放弃（实测 1540s 那两块音频 RMS 0.132、内容完全正常，
+            # 却被判失败）。三分能让子块重新获得可再分的长度余量。
+            # 门槛设 45s：再短的话三分只会得到没用的碎片，
+            # 反而把"1 个占位"变成"3 个占位"（实测 30s 块三分后全失败）。
+            if depth == 0 and dur >= MIN_SPLIT_SECONDS * 3.75:
+                third = len(pcm) // 3
+                if third > 0:
+                    a, b = pcm[:third], pcm[third : 2 * third]
+                    c = pcm[2 * third :]
+                    da, db, dc = (len(v) / SAMPLE_RATE for v in (a, b, c))
+                    print(f"[gemini-asr] {dur:.0f}s 块无法救回，三分重切避开边界")
+                    return (
+                        _transcribe_piece(a, da, depth + 1, base)
+                        + _transcribe_piece(b, db, depth + 1, base + da)
+                        + _transcribe_piece(c, dc, depth + 1, base + da + db)
+                    )
+
+            # 第 4 步：二分。把边界移出原来的切点，同时不丢内容。
+            if depth < MAX_RECOVER_DEPTH and dur >= MIN_SPLIT_SECONDS:
+                half = len(pcm) // 2
+                left, right = pcm[:half], pcm[half:]
+                if len(left) and len(right):
+                    dl = len(left) / SAMPLE_RATE
+                    dr = len(right) / SAMPLE_RATE
+                    print(f"[gemini-asr] {dur:.0f}s 块无法救回，二分重切（深度 {depth + 1}）")
+                    return _transcribe_piece(left, dl, depth + 1, base) + \
+                        _transcribe_piece(right, dr, depth + 1, base + dl)
+
+            # 第 5 步：放弃。抛给最外层统一处理。
+            # 为什么不在这一层直接返回占位：这一层可能是被二分/三分切过的碎片，
+            # 各自返回占位就会把"1 个 110 秒缺口"变成"7 个 15 秒占位"，
+            # 读者看到一堆占位反而不知道缺口有多大。由最外层按整块落一个占位更清晰。
+            raise _PieceFailed(base, dur)
+
+        def _run_one(item: tuple[int, np.ndarray]) -> tuple[int, list[str] | None, str | None]:
+            """返回 (offset, lines, error)。异常不抛出，交给上层降级。"""
+            offset, piece = item
+            dur = len(piece) / SAMPLE_RATE
+            base = offset / SAMPLE_RATE
+            try:
+                return offset, _transcribe_piece(piece, dur, 0, base), None
+            except _PieceFailed:
+                # 整块（未经切分）救不回来 → 落一个覆盖整块的占位，
+                # 而不是让每个碎片各落一个，否则缺口大小会被掩盖。
+                self._failed_chunks.append((round(base, 2), round(base + dur, 2)))
+                print(f"[gemini-asr] ⚠ {base:.0f}s 起的 {dur:.0f}s 块彻底转写失败，落占位")
+                return offset, [quality.placeholder_text(base, base + dur)], None
             except Exception as e:  # noqa: BLE001
                 return offset, None, f"{type(e).__name__}: {e}"
 
@@ -204,24 +353,25 @@ class GeminiASR:
             results = [_run_one(p) for p in pieces]
 
         # 关键：按 offset 排序，而不是按完成顺序，否则时间轴会乱
-        for offset, text, err in sorted(results, key=lambda r: r[0]):
+        for offset, lines, err in sorted(results, key=lambda r: r[0]):
             start = offset / SAMPLE_RATE
             dur = len(audio[offset : offset + chunk_samples]) / SAMPLE_RATE
             if err:
-                # 单块失败不再让整场崩：记日志、跳过，保留其余内容
-                print(f"[gemini-asr] {start:.0f}s 块失败，跳过：{err}")
-                continue
+                # 单块失败不再让整场崩：记日志、跳过的同时留下可见占位，
+                # 避免 md 里凭空少一段而没人发现。
+                # 注意：_transcribe_piece 内部已记录自己的失败块，
+                # 这条只覆盖"连调用都抛异常"的路径，别重复记账。
+                print(f"[gemini-asr] {start:.0f}s 块失败，落占位：{err}")
+                self._failed_chunks.append((round(start, 2), round(start + dur, 2)))
+                lines = [quality.placeholder_text(start, start + dur)]
 
-            if not text:
+            if not lines:
                 print(f"[gemini-asr] {start:.0f}s 片段返回空文本，跳过")
                 continue
 
-            lines = self._postprocess(text)
-            if not lines:
-                continue
-
-            # Gemini 不返回逐句时间戳，按字数比例估算分配，
-            # 保证时间轴单调且覆盖整段（LLM 分析时够用）
+            # 句级时间戳是**估算**：Gemini 不返回逐句时间，这里按字数比例摊。
+            # 实测中位绝对偏差 19.3s（110s 块内），所以 ts_source 标 estimated，
+            # 不能让下游把它当精确值。（块起点来自音频实际位置，是可信的。）
             lens = [max(1, len(x)) for x in lines]
             tot = sum(lens)
             cur = start
@@ -233,6 +383,7 @@ class GeminiASR:
                         "end": round(cur + span, 2),
                         "text": line,
                         "words": [],
+                        "ts_source": "estimated",
                     }
                 )
                 cur += span
@@ -242,6 +393,14 @@ class GeminiASR:
         self._total_infer += elapsed
         rtf = elapsed / total_sec if total_sec else 0
         print(f"[gemini-asr] {total_sec:.1f}s 音频 → {len(out)} 句，耗时 {elapsed:.1f}s (RTF={rtf:.2f})")
+        if self._bad_detected or self._unsplit_detected or self._failed_chunks or self._suspect_chunks:
+            print(
+                f"[gemini-asr] 质量：幻觉/异常 {self._bad_detected} 次，"
+                f"分句失败 {self._unsplit_detected} 次，"
+                f"救回 {self._recovered} 次，"
+                f"最终失败 {len(self._failed_chunks)} 块，"
+                f"短内容存疑 {len(self._suspect_chunks)} 块"
+            )
         return out
 
     @property
@@ -251,4 +410,11 @@ class GeminiASR:
             "audio_seconds": round(self._total_audio, 1),
             "infer_seconds": round(self._total_infer, 1),
             "rtf": round(self._total_infer / self._total_audio, 2) if self._total_audio else 0,
+            # 质量指标：以前 meta 只报 HTTP 成败，幻觉句翻倍也看不出来。
+            # 现在把"检出的异常/救回/彻底失败"报出来，任何一场都能事后核账。
+            "bad_detected": self._bad_detected,
+            "recovered": self._recovered,
+            "unsplit_detected": self._unsplit_detected,
+            "failed_chunks": [list(x) for x in self._failed_chunks],
+            "suspect_chunks": [list(x) for x in self._suspect_chunks],
         }

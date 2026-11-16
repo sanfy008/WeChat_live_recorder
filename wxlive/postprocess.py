@@ -91,19 +91,43 @@ def fix_errors(lines: list[str], model: str = DEFAULT_MODEL,
 
 def build_digest(segments: list[dict], model: str = DEFAULT_MODEL,
                  endpoint: str = DEFAULT_ENDPOINT, api_key: str = "magpie-alma",
-                 title: str = "") -> str:
-    """生成结构化要点。长文本超限时自动按段摘要再归并。"""
+                 title: str = "",
+                 group_seconds: float = 60.0) -> str:
+    """生成结构化要点。长文本超限时自动按段摘要再归并。
+
+    ## 为什么按段落喂而不是逐句喂
+
+    实测同一份 81 分钟转录（863 句）：
+
+    | 形态 | 输入字符 | 是否触发 30000 分块 |
+    |---|---|---|
+    | 逐句 + 句级时间戳 | 34,205 | **是**（27.8% 是时间戳） |
+    | 段落聚合 + 段级时间 | 26,065 | 否 |
+
+    降 23.8%，而且**不再触发分块**——分块意味着全片被切成几段分别摘要再归并，
+    全局视野丢失，这是实实在在的质量损失，不只是省钱。
+
+    另外句级时间戳本来是"按字数摊"的估算值（实测中位偏差 19.3s），
+    拿 27.8% 的 token 去喂一个假的精度，本身也不划算。
+    段落边界取的是聚合后的真实块起点，比句级估算可信。
+    """
     if not segments:
         return ""
 
-    text = "\n".join(f"[{_ts(s['start'])}] {s['text']}" for s in segments)
+    from . import render as _render
+
+    groups = _render.group_segments(segments, max_seconds=group_seconds)
+    if not groups:
+        return ""
+
+    text = "\n".join(f"[{_span(g['start'], g['end'])}] {g['text']}" for g in groups)
 
     # 上下文保护：太长就先分块摘要
     if len(text) > 30000:
         chunks, cur = [], []
         size = 0
-        for s in segments:
-            line = f"[{_ts(s['start'])}] {s['text']}"
+        for g in groups:
+            line = f"[{_span(g['start'], g['end'])}] {g['text']}"
             if size + len(line) > 12000 and cur:
                 chunks.append("\n".join(cur))
                 cur, size = [], 0
@@ -145,3 +169,19 @@ def _ts(seconds: float) -> str:
     h, rem = divmod(s, 3600)
     m, sec = divmod(rem, 60)
     return f"{h:02d}:{m:02d}:{sec:02d}"
+
+
+def _span(start: float, end: float) -> str:
+    """段落时间范围，mm:ss（超过 1 小时用 h:mm:ss）。
+
+    与 render._fmt_span 保持同样的口径：段级时间来自聚合后的真实块边界，
+    比句级"按字数摊"的估算值可信，所以不带秒级伪精度。
+    """
+
+    def one(sec: float) -> str:
+        sec = max(0, int(sec))
+        h, rem = divmod(sec, 3600)
+        m, s = divmod(rem, 60)
+        return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+    return f"{one(start)}-{one(end)}"
