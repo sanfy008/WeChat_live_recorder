@@ -120,6 +120,29 @@ def test_fetch_widgets_created(app):
                  "fetch_keep_video_var", "fetch_auto_trans_var"):
         assert hasattr(app, attr), f"缺少控件 {attr}"
 
+
+def test_fetch_state_ready_before_any_callback(app):
+    """构建下载页时，状态变量必须先于任何回调就绪。
+
+    这里踩过一个真 bug（2026-11-16 修黑框闪烁时撞出来的）：
+    ``_build_fetch_tab`` 里的"启动就探一次代理"会走 ``_ui()`` →
+    ``self._ui_queue.put()``，但 ``_ui_queue`` 原先在本方法**末尾**才创建。
+    于是启动时后台线程抛 AttributeError，界面上只表现为
+    状态条永远停在「读取中…」—— 看起来像"读得慢"，实际是崩了。
+
+    所以断言两件事：属性存在（不抛），以及启动探测真的落到了界面上。
+    """
+    for attr in ("_ui_queue", "_fetch_cancel", "_fetch_items",
+                 "_fetch_proxy_after"):
+        assert hasattr(app, attr), f"启动时缺少 {attr}，回调会抛 AttributeError"
+
+    _pump(app)
+    text = app.fetch_proxy_var.get()
+    assert text and "读取中" not in text, (
+        f"状态条还停在初始值 {text!r} —— 启动时的代理探测没有完成"
+    )
+
+
     # 本轮新增的控件：搜索 / 翻页 / 删除恢复 / 解析开关 / 中止
     for attr in ("fetch_search_var", "fetch_show_hidden_var", "fetch_only_new_var",
                  "fetch_page_size_var", "fetch_page_var",

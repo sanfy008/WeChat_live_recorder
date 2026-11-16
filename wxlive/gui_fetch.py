@@ -53,6 +53,17 @@ class FetchTabMixin:
         # 本地状态（隐藏/已下载）在界面构建时就加载，后面所有刷新都基于它
         self._fetch_state = fetchstate.load_state()
 
+        # 状态变量必须在**任何**可能触发的回调之前准备好。
+        # 这里踩过一个真 bug：下面第 95 行附近会调 _fetch_refresh_proxy()，
+        # 它内部走 _ui() → self._ui_queue.put()，而 _ui_queue 原先在本方法
+        # 末尾才创建 —— 于是启动时抛 AttributeError（后台线程里，
+        # 界面上只表现为状态条永远停在"读取中…"，很容易误判成"读得慢"）。
+        self._fetch_items = {}
+        self._fetch_busy = False
+        self._fetch_proxy_after = None
+        self._fetch_cancel = threading.Event()
+        self._ui_queue = queue.Queue()
+
         # ===== 顶部：工具状态 =====
         top = ttk.Frame(f)
         top.pack(fill="x", padx=12, pady=(10, 4))
@@ -249,11 +260,6 @@ class FetchTabMixin:
         if fetchstate.hint_dismissed(self._fetch_state):
             self._fetch_hide_note()
 
-        self._fetch_items = {}
-        self._fetch_busy = False
-        self._fetch_proxy_after = None
-        self._fetch_cancel = threading.Event()
-        self._ui_queue = queue.Queue()
         # 不能在这里直接调 _pump_ui_queue：窗口还没映射，after 可能注册失败，
         # 被吞掉后泵就永不再排程。用 after_idle 推迟到事件循环就绪后启动。
         try:
