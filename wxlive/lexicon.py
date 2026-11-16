@@ -149,37 +149,132 @@ def build_prompt_hint(max_terms: int = 120) -> str:
 
 
 def correct_text(text: str) -> str:
-    """按实测错误表做纠正。长词优先，避免"省实"被"省"截断。"""
+    """按实测错误表做纠正。长词优先，避免"省实"被"省"截断。
+
+    数字保护：中文数字/阿拉伯数字紧邻时不做替换。
+    实测坑：CORRECTIONS 里有 "百六→白六"（白六中简称），
+    若不保护，"一百六十个人"会被改成"一白六十个人"、"三百六十五天"
+    变成"三白六十五天"。这类文本在讲分数、人数、天数时很常见。
+    """
     if not text:
         return text
     out = text
     for wrong in sorted(CORRECTIONS, key=len, reverse=True):
         right = CORRECTIONS[wrong]
-        if wrong != right and wrong in out:
-            out = out.replace(wrong, right)
+        if wrong == right or wrong not in out:
+            continue
+        out = _replace_guarded(out, wrong, right)
     return _num_jia_fix(out)
+
+
+# 中文数字与阿拉伯数字。仅当替换词**首字符或尾字符本身是数字**时才做邻接检查，
+# 避免 "白六"(尾字"六"是数字) 被无谓跳过。
+_DIGIT_CHARS = "0123456789零一二三四五六七八九十百千万亿两"
+
+
+def _replace_guarded(text: str, wrong: str, right: str) -> str:
+    """替换 wrong→right，跳过夹在数字中间的匹配。
+
+    判据只看「替换词的两端」：
+      - 若 wrong 首字符是数字，且左侧紧邻也是数字 → 疑似数字串，跳过
+        （"一百六十" 里 "百六"，左邻 "一" → 跳过）
+      - 若 wrong 尾字符是数字，且右侧紧邻也是数字 → 跳过
+        （"六百七" 里 "百六"? 不成立，但 "六十" 右邻 "个" 是量词 → 不跳过）
+    这样 "百六的课改班"（右邻"的"）能正常替换成 "白六的课改班"。
+    """
+    head_is_digit = wrong[0] in _DIGIT_CHARS
+    tail_is_digit = wrong[-1] in _DIGIT_CHARS
+    if not head_is_digit and not tail_is_digit:
+        return text.replace(wrong, right)
+
+    out = []
+    i = 0
+    n = len(wrong)
+    hit = False
+    while True:
+        j = text.find(wrong, i)
+        if j < 0:
+            out.append(text[i:])
+            break
+        left = text[j - 1] if j > 0 else ""
+        right_ch = text[j + n] if j + n < len(text) else ""
+        # 必须显式判空："" in "0123…" 恒为 True（空串是任何字符串的子串），
+        # 漏了这一步会把所有句首/句尾的词都误判成"紧邻数字"而永不替换。
+        skip = ((head_is_digit and left and left in _DIGIT_CHARS)
+                or (tail_is_digit and right_ch and right_ch in _DIGIT_CHARS))
+        if skip:
+            out.append(text[i:j + n])
+        else:
+            out.append(text[i:j])
+            out.append(right)
+            hit = True
+        i = j + n
+    return "".join(out) if hit else text
 
 
 def expand_codes(text: str, keep_original: bool = True) -> str:
     """把暗语展开成正式校名，便于后续 LLM 理解和检索。
 
     keep_original=True 时输出 `暗语（正式名）`，保留原文可追溯。
+
+    实现要点（2026-11-16 实测踩坑后重写）：
+    不能用「逐词全局 replace」，实测会产生三类错：
+      1. 括号嵌套：code 的正式名里也含 code（如 清实→清远实验（清实））
+         → 二次扫描会把括号里的又展开一遍，变成 `清实（清远实验（清实））`
+      2. 长短覆盖：先替换 `小金` 会破坏 `小金龙`，
+         变成 `小金（金广附）龙（金广附）`
+      3. 重复展开：替换出来的正式名若含别的 code，又被匹配一次
+
+    正确做法：**单次从左到右扫描**，在最左位置优先匹配最长的 code，
+    替换后跳过整段（含括号），不再回头处理已展开内容。
     """
     if not text:
         return text
-    out = text
-    for code in sorted(CODES, key=len, reverse=True):
-        if code.isascii():
+
+    # 按长度降序，保证"最左最长优先"
+    codes = sorted(CODES, key=len, reverse=True)
+    n = len(text)
+    out: list[str] = []
+    i = 0
+    while i < n:
+        matched: str | None = None
+        for code in codes:
+            if not text.startswith(code, i):
+                continue
             # 纯字母代码要求词边界，避免 "SS" 误伤其他英文
-            pattern = re.compile(rf"(?<![A-Za-z]){re.escape(code)}(?![A-Za-z])")
-        else:
-            pattern = re.compile(re.escape(code))
-        if not pattern.search(out):
+            if code.isascii():
+                prev_ch = text[i - 1] if i > 0 else ""
+                next_ch = text[i + len(code)] if i + len(code) < n else ""
+                if prev_ch.isascii() and prev_ch.isalpha():
+                    continue
+                if next_ch.isascii() and next_ch.isalpha():
+                    continue
+            matched = code
+            break
+
+        if matched is None:
+            out.append(text[i])
+            i += 1
             continue
-        target = CODES[code]
-        repl = f"{code}（{target}）" if keep_original else target
-        out = pattern.sub(repl, out)
-    return out
+
+        target = CODES[matched]
+        # 正式名里若还含自身 code，去掉重复的括号注释，避免嵌套
+        if matched in target:
+            target = target.replace(f"（{matched}）", "").strip()
+
+        # 幂等保护：源文本若已是 `code（正式名）` 形式，直接原样保留，
+        # 不再追加一层。实测坑：转录稿反复过词表会变成
+        # `小金龙（金广附）（金广附）`，句子越跑越脏。
+        already = f"{matched}（{target}）"
+        if text.startswith(already, i):
+            out.append(already)
+            i += len(already)
+            continue
+
+        out.append(f"{matched}（{target}）" if keep_original else target)
+        i += len(matched)
+
+    return "".join(out)
 
 
 def load(path: Path | None = None) -> dict:
