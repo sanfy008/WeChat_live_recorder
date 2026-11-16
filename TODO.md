@@ -80,6 +80,7 @@
 | 超长/分段直播验证 | 只验证了单文件 MP4 回放，未测分片场景 |
 | 「只留正在播放的」过滤 | 判据是 JSBridge 播放进度上报，需 MITM 注入，成本远高于收益 |
 | 说话人分离 | `speaker` 字段已预留；CPU 上 pyannote 很慢，建议离线跑 |
+| pytest 偶发 `tk.tcl` 找不到 | **既有问题，与 2026-11-16 改动无关**（HEAD 未改代码同样复现）。全量跑约 1/3 概率有 1 个 GUI 用例在 fixture 里 `App()` 时抛 `TclError: Can't find a usable tk.tcl`，每次命中的用例不同、单跑必过。已确认 `tcl/tk8.6/entry.tcl` 文件存在、`TCL_LIBRARY` 路径正确，指向 pytest 多实例 Tk 初始化的竞态，未定位到具体触发条件 |
 
 ## 📚 文档索引
 
@@ -95,3 +96,4 @@
 | [词表演进记录](docs/词表演进记录.md) | 词表三轮演进与修复的 7 个 bug |
 | [性能优化实测](docs/性能优化实测.md) | 并发 vs 静音剔除 vs 压缩音频 |
 | [输出格式优化](docs/输出格式优化.md) | 为什么放弃秒级时间戳 |
+| [GUI黑框闪烁治理](docs/GUI黑框闪烁治理.md) | pythonw 下的控制台窗口、winreg 替代 reg query |
