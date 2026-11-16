@@ -14,13 +14,13 @@ from wxlive.gemini_asr import GeminiASR, to_simplified
 
 def test_empty_audio_returns_empty():
     """空输入必须早退，不能拿空音频去问模型。"""
-    g = GeminiASR(model="dummy")
+    g = GeminiASR(model="dummy", retry_delays=(0, 0, 0))
     assert g.transcribe(np.zeros(0, dtype=np.float32), 16000) == []
 
 
 def test_too_short_audio_returns_empty():
     """极短音频（0.1s）应早退，避免模型瞎猜。"""
-    g = GeminiASR(model="dummy")
+    g = GeminiASR(model="dummy", retry_delays=(0, 0, 0))
     assert g.transcribe(np.zeros(int(16000 * 0.1), dtype=np.float32), 16000) == []
 
 
@@ -60,7 +60,7 @@ class _FakeResp:
 
 def test_long_audio_is_chunked(monkeypatch):
     """超过 110s 必须自动切片，而不是整个塞给云端（云端单次上限 120s）。"""
-    g = GeminiASR(model="dummy")
+    g = GeminiASR(model="dummy", retry_delays=(0, 0, 0))
     calls = []
 
     # 真实直播 110s 块产出 580~670 字（密度约 5.5 字/秒）。
@@ -86,7 +86,7 @@ def test_long_audio_is_chunked(monkeypatch):
 
 
 def test_timestamps_are_monotonic(monkeypatch):
-    g = GeminiASR(model="dummy")
+    g = GeminiASR(model="dummy", retry_delays=(0, 0, 0))
     # 文本要够长，否则会被判为"长度异常"而触发重试，干扰本用例的断言
     long_text = "第一句话内容足够长一些\n第二句话内容更长一些也要够长"
     monkeypatch.setattr(g, "_call_once", lambda pcm: long_text)
@@ -135,7 +135,7 @@ def test_normal_speech_not_flagged():
 
 def test_hallucination_is_retried_then_recovered(monkeypatch):
     """检出幻觉 → 原样重试一次；重试正常则救回，不落占位。"""
-    g = GeminiASR(model="dummy")
+    g = GeminiASR(model="dummy", retry_delays=(0, 0, 0))
     good = (
         "好，下一个问题。西雅的岭南和十六中重点班怎么选，这个要说清楚一些，"
         "所以我把句子写得长一点，让它达到真实直播的平均语速密度，避免被长度检查误判。"
@@ -159,7 +159,7 @@ def test_hallucination_is_retried_then_recovered(monkeypatch):
 
 def test_hallucination_bisects_when_retry_also_fails(monkeypatch):
     """两次都幻觉 → 二分重切，且二分后能拿到真实内容。"""
-    g = GeminiASR(model="dummy")
+    g = GeminiASR(model="dummy", retry_delays=(0, 0, 0))
     calls = {"n": 0}
 
     def fake_call(pcm):
@@ -180,7 +180,7 @@ def test_hallucination_bisects_when_retry_also_fails(monkeypatch):
 
 def test_placeholder_when_recovery_exhausted(monkeypatch):
     """怎么都救不回来 → 落可见占位，不静默丢弃。"""
-    g = GeminiASR(model="dummy")
+    g = GeminiASR(model="dummy", retry_delays=(0, 0, 0))
     monkeypatch.setattr(
         g, "_call_once",
         lambda pcm: "抱歉，我无法访问您提到的音频文件 `[attachment audio/wav]`。",
@@ -199,7 +199,7 @@ def test_placeholder_covers_whole_chunk_not_fragments(monkeypatch):
 
     否则 1 个 110 秒缺口会被渲染成 7 个 15 秒占位，读者无法判断缺口有多大。
     """
-    g = GeminiASR(model="dummy")
+    g = GeminiASR(model="dummy", retry_delays=(0, 0, 0))
     monkeypatch.setattr(
         g, "_call_once",
         lambda pcm: "抱歉，我无法访问您提到的音频文件 `[attachment audio/wav]`。",
@@ -221,7 +221,7 @@ def test_recovery_offsets_boundary_for_normal_audio(monkeypatch):
     真实案例：越秀区那份录音 1540s 处的 56 秒音频 RMS 0.132、内容正常，
     旧逻辑因碎片跌破 40s 门槛而直接放弃，白丢内容。
     """
-    g = GeminiASR(model="dummy")
+    g = GeminiASR(model="dummy", retry_delays=(0, 0, 0))
     seen_sizes = []
     good = (
         "这一段是主播正常在讲的内容，学校名字和班型都说得很清楚，"
@@ -243,9 +243,61 @@ def test_recovery_offsets_boundary_for_normal_audio(monkeypatch):
     assert all("attachment" not in s["text"] for s in out)
 
 
+def test_hallucination_retries_same_chunk_before_splitting(monkeypatch):
+    """幻觉优先**原样重试**，不要立刻二分。
+
+    实测依据：整份重跑时出现一个 80 秒块连切 3 层、8 次调用全幻觉、
+    烧 175 秒（RTF 2.19）最后落占位。事后单测同一块：先 3/3 全幻觉，
+    隔一会儿 8 次并发 0/8 —— 幻觉是网关端批次性抖动，与音频内容和
+    切片边界都无关。切分只会让请求数翻倍，在抖动期放大失败面。
+    """
+    g = GeminiASR(model="dummy", retry_delays=(0, 0, 0))
+    calls = []
+    # 80 秒真实直播约有 430 字（5.4 字/秒）。桩文本必须达到这个量级，
+    # 否则会被"长度异常"再拦一次，测不出我们想验证的退避路径。
+    line = "好，下一个问题，西雅的岭南跟十六中重点班怎么选，这个要说清楚一些才不会有歧义"
+    good = "\n".join([line] * 6)
+
+    def fake_call(pcm):
+        calls.append(len(pcm))
+        # 前两次幻觉，第三次（退避重试第 2 次）恢复
+        if len(calls) <= 2:
+            return "抱歉，我无法访问您提到的音频文件 `[attachment audio/wav]`。"
+        return good
+
+    monkeypatch.setattr(g, "_call_once", fake_call)
+    audio = np.zeros(16000 * 80, dtype=np.float32)
+    out = g.transcribe(audio, 16000)
+
+    # 关键断言：所有调用都是**整块**长度，说明靠退避重试救回，没有切分
+    assert len(set(calls)) == 1, f"不应发生切分，实际请求长度: {calls}"
+    assert not g._failed_chunks
+    assert all("attachment" not in s["text"] for s in out)
+
+
+def test_retry_delays_are_actually_slept(monkeypatch):
+    """退避确实生效（用替换 sleep 记录，不真等）。"""
+    import wxlive.gemini_asr as ga
+
+    slept = []
+    monkeypatch.setattr(ga.time, "sleep", lambda s: slept.append(s))
+
+    g = GeminiASR(model="dummy", retry_delays=(1.0, 4.0, 8.0))
+    monkeypatch.setattr(
+        g, "_call_once",
+        lambda pcm: "抱歉，我无法访问您提到的音频文件 `[attachment audio/wav]`。",
+    )
+    audio = np.zeros(16000 * 80, dtype=np.float32)
+    g.transcribe(audio, 16000)
+
+    # 80 秒块先整块退避三轮；仍失败才会三分，子块各自再退避。
+    # 这里只断言**第一轮**退避序列正确（整块层面的策略）。
+    assert slept[:3] == [1.0, 4.0, 8.0], f"整块退避序列不对: {slept[:3]}"
+
+
 def test_short_output_not_bisected(monkeypatch):
     """长度异常只重试、不二分——避免把真实短内容切碎成幻觉。"""
-    g = GeminiASR(model="dummy")
+    g = GeminiASR(model="dummy", retry_delays=(0, 0, 0))
     monkeypatch.setattr(g, "_call_once", lambda pcm: "嗯。")
     audio = np.zeros(16000 * 110, dtype=np.float32)
     out = g.transcribe(audio, 16000)
@@ -259,7 +311,7 @@ def test_short_output_not_bisected(monkeypatch):
 
 def test_ts_source_marks_estimated(monkeypatch):
     """句级时间戳是估算的，必须显式标注，不能让下游当精确值。"""
-    g = GeminiASR(model="dummy")
+    g = GeminiASR(model="dummy", retry_delays=(0, 0, 0))
     monkeypatch.setattr(g, "_call_once", lambda pcm: "第一句话够长的内容\n第二句话也够长的内容")
     audio = np.zeros(16000 * 60, dtype=np.float32)
     out = g.transcribe(audio, 16000)

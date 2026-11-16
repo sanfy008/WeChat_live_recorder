@@ -173,9 +173,24 @@ def test_real_transcript_no_loss():
     import json
     from pathlib import Path
 
-    p = Path("output/transcripts/20261116_170553_广州x升初鸡头凤尾如何选.json")
-    if not p.exists():
-        pytest.skip("真实转录样本不存在")
+    # 不绑定具体 session id —— 产物会随每场直播增删，
+    # 硬编码某个文件名会让这条最有价值的测试悄悄变成"永远跳过"。
+    # 改为扫描任意一份足够长的真实转录。
+    candidates = sorted(
+        Path("output/transcripts").glob("*.json"),
+        key=lambda x: x.stat().st_size, reverse=True,
+    )
+    p = None
+    for cand in candidates:
+        try:
+            d0 = json.loads(cand.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            continue
+        if len(d0.get("segments") or []) >= 300:
+            p = cand
+            break
+    if p is None:
+        pytest.skip("没有足够长的真实转录样本（需 >= 300 句）")
 
     d = json.loads(p.read_text(encoding="utf-8"))
     segs = d["segments"]

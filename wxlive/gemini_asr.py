@@ -38,6 +38,10 @@ MAX_RECOVER_DEPTH = 3
 # 小于这个时长不再切分。12s 已低于云端 min_segment 的合理粒度，
 # 再切下去单次 HTTP 的固定开销会盖过收益。
 MIN_SPLIT_SECONDS = 12.0
+# 幻觉重试的等待序列（秒）。实测幻觉是网关端的批次性抖动：
+# 同一块先 3/3 全幻觉，隔一会儿 8 次并发 0/8。所以"等一等再问"比"切碎了再问"有效。
+# 退避 1s → 4s → 8s，总等待 13s，比二分切分（请求数翻倍 + 可能全失败）更划算。
+HALLUCINATION_RETRY_DELAYS = (1.0, 4.0, 8.0)
 
 
 class _PieceFailed(Exception):
@@ -104,11 +108,18 @@ class GeminiASR:
         lexicon_hint: str = "",
         correct_after: bool = True,
         workers: int = 1,
+        retry_delays: tuple[float, ...] | None = None,
     ) -> None:
         self.model = model
         # 并发路数。实测 4 路最优（2.04x），8 路反而因争抢回落到 1.59x。
         # 默认 1 = 串行，保持原有行为。
         self.workers = max(1, int(workers))
+        # 幻觉重试的退避序列。做成可注入，是为了让测试不必真的 sleep 13 秒
+        # （实测：写死后 16 个用例从 0.3s 涨到 118s）。
+        self.retry_delays = (
+            tuple(retry_delays) if retry_delays is not None
+            else HALLUCINATION_RETRY_DELAYS
+        )
         self.endpoint = endpoint
         self.api_key = api_key
         self.reasoning_effort = reasoning_effort
@@ -273,23 +284,40 @@ class GeminiASR:
 
                 self._bad_detected += 1
                 hallucinated = quality.is_hallucination(first)
-                kind = "幻觉" if hallucinated else "长度异常"
-                # 第 2 步：原样重试一次
-                text2, err2 = _call_safe(pcm)
-                if err2 is None and text2 and not quality.is_bad_output(text2, dur):
-                    self._recovered += 1
-                    print(f"[gemini-asr] {kind}已通过原样重试救回（{dur:.0f}s 块）")
-                    return _finalize(text2, dur, pcm)
 
-                # 第 3 步：二分**只针对幻觉**。
-                # 幻觉是确定性的错误（模型在解释自己没收到音频），二分能救，
-                # 实测错开边界就能拿到正常内容。
-                # 而"长度异常"可能本来就是真实情况（这块真的没说话），
-                # 二分只会让碎片更碎、反而更容易触发幻觉 —— 所以不动它。
                 if not hallucinated:
+                    # 长度异常：重试一次，仍短就照实保留。
+                    # 短可能本来就是真实情况（这块真没说话），
+                    # 二分只会让碎片更碎、反而更容易触发幻觉。
+                    text2, err2 = _call_safe(pcm)
+                    if err2 is None and text2 and not quality.is_bad_output(text2, dur):
+                        self._recovered += 1
+                        print(f"[gemini-asr] 长度异常已通过重试救回（{dur:.0f}s 块）")
+                        return _finalize(text2, dur, pcm)
                     self._suspect_chunks.append((round(base, 2), round(base + dur, 2)))
                     print(f"[gemini-asr] ⚠ {base:.0f}s 起的 {dur:.0f}s 块输出异常短，照实保留")
                     return _finalize(text2 or first, dur, pcm)
+
+                # 幻觉：优先带间隔重试，而不是立刻二分。
+                #
+                # 这个顺序是实测纠正过来的。原先我按"幻觉集中在切片边界"的观察
+                # 先二分，结果整份重跑时出现一个 80 秒块连切 3 层、8 次调用全幻觉、
+                # 白白烧 175 秒（RTF 2.19）最后落占位。事后单测同一块：
+                # 先 3/3 全幻觉，隔一会儿 8 次并发 0/8 —— 说明幻觉是**网关端的
+                # 批次性抖动**，与音频内容和切片边界都无关。
+                # 那么正确策略就是"等一等再问"，而不是"切碎了再问"：
+                # 切分会让请求数翻倍，抖动期反而放大失败面。
+                for i, delay in enumerate(self.retry_delays):
+                    if delay:
+                        time.sleep(delay)
+                    text2, err2 = _call_safe(pcm)
+                    if err2 is None and text2 and not quality.is_bad_output(text2, dur):
+                        self._recovered += 1
+                        print(
+                            f"[gemini-asr] 幻觉已通过间隔重试救回"
+                            f"（第 {i + 1} 次，等 {delay}s，{dur:.0f}s 块）"
+                        )
+                        return _finalize(text2, dur, pcm)
 
             # 第 3 步：三分再试 —— 把两个边界都挪到块内部。
             # 实测这一步很关键：幻觉集中在 110s 切片边界上，而二分到 28s 碎片时
