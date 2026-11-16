@@ -27,6 +27,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import winproc
 from .sphdecrypt import open_decrypted, probe_encryption
 
 DEFAULT_API = "http://127.0.0.1:2022"
@@ -419,8 +420,10 @@ def extract_audio(video: Path, wav: Path | None = None,
         "-vn", "-ac", "1", "-ar", str(sample_rate),
         "-c:a", "pcm_s16le", str(wav),
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True,
-                       encoding="utf-8", errors="replace")
+    # 必须隐藏窗口：GUI 从 pythonw 启动时没有控制台，
+    # 每起一个 console 程序系统都会新开一个黑框闪一下。
+    r = winproc.run(cmd, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace")
     if r.returncode != 0 or not wav.exists() or wav.stat().st_size == 0:
         tail = (r.stderr or "").strip()[-400:]
         raise FetchError(f"\u62BD\u97F3\u9891\u5931\u8D25\uFF08rc={r.returncode}\uFF09\uFF1A{tail}")
@@ -435,8 +438,8 @@ def probe_media(path: Path) -> tuple[float, bool]:
     cmd = [exe, "-v", "error", "-show_entries", "format=duration",
            "-show_entries", "stream=codec_type",
            "-of", "default=noprint_wrappers=1", str(path)]
-    r = subprocess.run(cmd, capture_output=True, text=True,
-                       encoding="utf-8", errors="replace")
+    r = winproc.run(cmd, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace")
     dur = 0.0
     has_audio = False
     for line in (r.stdout or "").splitlines():

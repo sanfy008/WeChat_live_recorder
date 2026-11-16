@@ -299,15 +299,17 @@ class FetchTabMixin:
     def _fetch_refresh_proxy(self) -> None:
         """读一次系统代理状态，写进状态条。
 
-        纯注册表读取，很快（~30ms），放主线程没问题。
-        但为了不阻塞界面，仍然用后台线程 + 队列回投。
+        ``read()`` 走 winreg 直读（~1ms、零子进程），``describe`` 与
+        ``diagnose`` 共用同一份状态，所以整轮只开一次注册表项。
+        仍然丢给后台线程，纯粹是为了不跟 Tk 主线程抢那 1ms。
         """
         from . import systemproxy
 
         def work() -> None:
             try:
-                text = systemproxy.describe()
-                diag = systemproxy.diagnose()
+                st = systemproxy.read()
+                text = systemproxy.describe(st)
+                diag = systemproxy.diagnose(st)
             except Exception as exc:  # noqa: BLE001
                 text = f"系统代理：读取失败（{type(exc).__name__}）"
                 diag = ""
@@ -336,12 +338,26 @@ class FetchTabMixin:
         抓流工具可能在后台被关掉/崩溃，而系统代理还指着它的 2023 端口 ——
         这时用户会突然发现"上不了网"，却不知道原因。
         定时检查能在 1 分钟内主动发现并提示。
+
+        两个省电/省事的细节：
+        - **窗口不可见时跳过自检**（最小化到托盘、被隐藏）。用户看不见状态条，
+          查了也没人看；等窗口重新显示时立刻补一次。
+        - 自检本身零子进程（见 ``systemproxy`` 模块文档），所以就算每分钟都跑
+          也不会有黑框闪烁 —— 这里跳过只是省那 1ms 和一次后台线程。
         """
         try:
-            self._fetch_refresh_proxy()
+            if self._fetch_view_visible():
+                self._fetch_refresh_proxy()
             self._fetch_proxy_after = self.after(60000, self._fetch_proxy_poll)
         except Exception:  # noqa: BLE001
             self._fetch_proxy_after = None
+
+    def _fetch_view_visible(self) -> bool:
+        """当前下载页是否真的显示在屏幕上。判断不出来时按"可见"处理。"""
+        try:
+            return bool(self.winfo_viewable())
+        except Exception:  # noqa: BLE001
+            return True
 
     def _fetch_restore_proxy(self) -> None:
         """一键把系统代理还原成本机固定出口 10808。"""
@@ -910,9 +926,9 @@ class FetchTabMixin:
 
     def _fetch_open_dir(self) -> None:
         import os
-        import subprocess
         import sys
 
+        from . import winproc
         from .config import RECORDINGS_DIR
 
         path = str(RECORDINGS_DIR)
@@ -920,9 +936,9 @@ class FetchTabMixin:
             if sys.platform == "win32":
                 os.startfile(path)  # noqa: S606
             elif sys.platform == "darwin":
-                subprocess.run(["open", path], check=False)
+                winproc.run(["open", path], check=False)
             else:
-                subprocess.run(["xdg-open", path], check=False)
+                winproc.run(["xdg-open", path], check=False)
         except Exception as exc:  # noqa: BLE001
             messagebox.showinfo("打不开", f"目录：{path}\n错误：{exc}")
 

@@ -22,12 +22,21 @@
     不常驻监控、不自动改注册表（除了用户显式点按钮）。
     提供一个"备份/还原"对，让还原指向已知的固定值 10808 而不是"恢复某次快照" ——
     快照方案在多次进出抓流状态后会失真（备份可能本身就是 2023）。
+
+**读走 winreg，不走 reg.exe（2026-11-16 修）**
+    旧实现用 ``subprocess.run(["reg", "query", ...])`` 读，一次 ``read()`` 跑 3 个
+    子进程，``describe()`` + ``diagnose()`` 就是 6 个。而 GUI 从 ``pythonw.exe``
+    启动、自身没有控制台，Windows 会给每个 console 子进程**新分配一个窗口** ——
+    下载页 60 秒自检一次，于是每分钟黑框闪 6 下。
+    改成 ``winreg`` 直读：同进程内完成，实测 **0.94ms**、零子进程、零闪烁。
+    写入仍用 ``reg add``（要 ``/f`` 强制覆盖，且我们只在用户点按钮时做一次）。
 """
 
 from __future__ import annotations
 
-import subprocess
 import sys
+
+from . import winproc
 
 # 本机固定出口代理（MEMORY.md 记录：长期不变）
 FIXED_PROXY = "127.0.0.1:10808"
@@ -35,30 +44,67 @@ FIXED_PROXY = "127.0.0.1:10808"
 TOOL_PROXY = "127.0.0.1:2023"
 
 _REG_PATH = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+# winreg 用的相对路径（不含 HKEY_CURRENT_USER 前缀）
+_REG_SUBKEY = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
 
 
 def _reg_query(name: str) -> str | None:
-    """读一个注册表值；读不到返回 None。"""
+    """读一个注册表值；读不到返回 None。
+
+    走 ``winreg`` 直读，不起子进程 —— 见模块文档「读走 winreg」。
+    """
     try:
-        r = subprocess.run(["reg", "query", _REG_PATH, "/v", name],
-                           capture_output=True, text=True, timeout=10)
-    except Exception:  # noqa: BLE001
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _REG_SUBKEY) as key:
+            value, _kind = winreg.QueryValueEx(key, name)
+    except (FileNotFoundError, OSError, ImportError):
         return None
-    if r.returncode != 0:
+    if value is None:
         return None
-    for line in (r.stdout or "").splitlines():
-        parts = line.split()
-        # 形如：    ProxyServer    REG_SZ    127.0.0.1:2023
-        if len(parts) >= 3 and parts[0] == name:
-            return parts[-1]
-    return None
+    return str(value)
+
+
+def read_all() -> dict:
+    """一次打开注册表项读全部三个值。
+
+    比连续三次 ``read()`` 快得多，也避免"读到一半被别人改了"的中间态。
+    """
+    wanted = ("ProxyEnable", "ProxyServer", "ProxyOverride")
+    found: dict[str, str] = {}
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _REG_SUBKEY) as key:
+            for name in wanted:
+                try:
+                    value, _kind = winreg.QueryValueEx(key, name)
+                except FileNotFoundError:
+                    continue
+                if value is not None:
+                    found[name] = str(value)
+    except (FileNotFoundError, OSError, ImportError):
+        found = {}
+
+    enabled_raw = found.get("ProxyEnable")
+    enabled = False
+    if enabled_raw:
+        try:
+            enabled = int(enabled_raw, 0) == 1
+        except ValueError:
+            enabled = enabled_raw.strip() == "1"
+    return {
+        "enabled": enabled,
+        "server": found.get("ProxyServer") or "",
+        "override": found.get("ProxyOverride") or "",
+    }
 
 
 def _reg_set(name: str, value: str, kind: str = "REG_SZ") -> bool:
     try:
-        r = subprocess.run(["reg", "add", _REG_PATH, "/v", name,
-                            "/t", kind, "/d", str(value), "/f"],
-                           capture_output=True, text=True, timeout=10)
+        r = winproc.run(["reg", "add", _REG_PATH, "/v", name,
+                         "/t", kind, "/d", str(value), "/f"],
+                        capture_output=True, text=True, timeout=10)
         return r.returncode == 0
     except Exception:  # noqa: BLE001
         return False
@@ -93,18 +139,7 @@ def read() -> dict:
         server   ProxyServer 字符串（如 "127.0.0.1:2023"）
         override ProxyOverride 字符串
     """
-    enabled_raw = _reg_query("ProxyEnable")
-    enabled = False
-    if enabled_raw:
-        try:
-            enabled = int(enabled_raw, 0) == 1
-        except ValueError:
-            enabled = enabled_raw.strip() == "1"
-    return {
-        "enabled": enabled,
-        "server": _reg_query("ProxyServer") or "",
-        "override": _reg_query("ProxyOverride") or "",
-    }
+    return read_all()
 
 
 def is_tool_takeover() -> bool:
@@ -119,9 +154,14 @@ def is_fixed_proxy() -> bool:
     return bool(st["enabled"]) and FIXED_PROXY in (st["server"] or "")
 
 
-def describe() -> str:
-    """给用户看的一行状态描述。"""
-    st = read()
+def describe(st: dict | None = None) -> str:
+    """给用户看的一行状态描述。
+
+    ``st`` 可由调用方传入，省掉重复读注册表（状态条要同时拿 describe +
+    diagnose，传同一个 st 即可只读一次）。
+    """
+    if st is None:
+        st = read()
     if not st["enabled"]:
         return "系统代理：已关闭（直连）"
     server = st["server"] or "?"
@@ -164,9 +204,13 @@ def tool_still_running() -> bool:
         return False
 
 
-def diagnose() -> str:
-    """体检用：一句话说清现在该不该动手。"""
-    st = read()
+def diagnose(st: dict | None = None) -> str:
+    """体检用：一句话说清现在该不该动手。
+
+    ``st`` 同 :func:`describe`，可复用同一份状态。
+    """
+    if st is None:
+        st = read()
     if not st["enabled"]:
         return "系统代理已关闭，微信流量不会经过抓流工具，抓不到内容"
     server = st["server"] or ""

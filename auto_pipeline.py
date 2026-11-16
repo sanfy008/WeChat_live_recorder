@@ -23,7 +23,7 @@ from wxlive.config import RECORDINGS_DIR, TRANSCRIPTS_DIR, Config, ensure_dirs
 from wxlive.pipeline import build_engine
 from wxlive.resample import StreamResampler
 from wxlive.session import Session
-from wxlive import lexicon, postprocess
+from wxlive import lexicon, postprocess, winproc
 
 LOG = Path("output/auto_pipeline.log")
 WATCH_PREFIX = "回放130min"
@@ -40,9 +40,8 @@ def log(msg: str) -> None:
 
 def recorder_alive() -> bool:
     """检查是否还有 record_only.py 在跑。"""
-    import subprocess
     try:
-        r = subprocess.run(
+        r = winproc.run(
             ["powershell", "-NoProfile", "-Command",
              "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
              "Where-Object { $_.CommandLine -like '*record_only.py*' } | "

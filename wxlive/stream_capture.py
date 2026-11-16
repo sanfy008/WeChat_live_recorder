@@ -27,6 +27,8 @@ import threading
 import time
 from pathlib import Path
 
+from . import winproc
+
 AUDIO_EXTS = (".wav", ".m4a", ".mp3", ".aac", ".flac", ".ogg", ".opus")
 
 
@@ -75,8 +77,8 @@ def probe_url(url: str, timeout: int = 20) -> dict:
            "-of", "default=noprint_wrappers=1",
            "-i", url]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=timeout, encoding="utf-8", errors="replace")
+        r = winproc.run(cmd, capture_output=True, text=True,
+                        timeout=timeout, encoding="utf-8", errors="replace")
         if r.returncode != 0:
             err = (r.stderr or "").strip().splitlines()
             return {"ok": False, "error": (err[-1] if err else "探测失败")[:200]}
@@ -173,10 +175,10 @@ class StreamRecorder:
         self._log(f"[stream] 启动 ffmpeg 拉流 → {self.out_path.name}")
         self._log(f"[stream] 命令: {' '.join(cmd[:6])} … -i {self.url[:60]}…")
 
-        creation = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        self._proc = subprocess.Popen(
+        # ffmpeg 是 console 程序，GUI（pythonw）下不隐藏就会闪黑框。
+        # 统一走 winproc，别在这里手写 creationflags —— 漏一处就闪一次。
+        self._proc = winproc.popen(
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-            creationflags=creation,
         )
         self._thread = threading.Thread(target=self._monitor, daemon=True)
         self._thread.start()
