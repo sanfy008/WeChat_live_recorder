@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -140,7 +140,7 @@ class Session:
             "session_id": self.id,
             "started_at": self.started_at.isoformat(timespec="seconds"),
             "ended_at": ended_at.isoformat(timespec="seconds"),
-            "duration_seconds": round((ended_at - self.started_at).total_seconds(), 1),
+            "duration_seconds": _audio_duration(ended_at - self.started_at, self.segments),
             "audio_file": self._audio_name(),
             "segments": self.segments,
             "full_text": "".join(s["text"] for s in self.segments),
@@ -165,3 +165,22 @@ class Session:
             encoding="utf-8",
         )
         return doc
+
+def _audio_duration(wall: "timedelta", segments: list[dict]) -> float:
+    """音频时长（秒），而非墙钟耗时。
+
+    墙钟差包含转写/纠错所花的时间，用它当"时长"会严重偏小
+    （实测 66.5 分钟音频被记成 33.7 分钟）。优先取末段 end；
+    无分段时退回墙钟差。
+    """
+    if segments:
+        last_end = 0.0
+        for seg in segments:
+            try:
+                last_end = max(last_end, float(seg.get("end") or 0.0))
+            except (TypeError, ValueError):
+                continue
+        if last_end > 0:
+            return round(last_end, 1)
+    return round(wall.total_seconds(), 1)
+

@@ -1,60 +1,33 @@
 # 待办事项
 
-## 🔥 现在可以做（流地址直录已打通）
+## ✅ 已完成
 
-### 0. 微信里取流地址 → 接 pipeline
-**状态**：工具和链路已验证，等你在微信里实际操作一次
+### 1. 130 分钟回放全量转录（2026-11-16 12:54 完成）
+- 音频：`output/recordings/20261116_111300_回放130min.wav`（66.5 分钟 @ 2倍速 = 约 133 分钟内容，365MB）
+- 转写：1561 句，用时 9.1 分钟（RTF≈0.14，Gemini hydrogen）
+- 纠错：修正 195 处（DeepSeek，22 分钟）
+- 要点：已生成结构化整理（话题/学校评价/建议/存疑点）
+- 产物：`output/transcripts/20261116_122111_*.{md,json,jsonl}`
+- 关键结论：**2 倍速播放不影响转写质量**，无需速度矫正
 
-工具已在后台跑着（如已退出，重新启动）：
-```bash
-cd /d/File/01_Vibe_Coding/14-WeChat_live/tools/wxcd
-./wx_video_download.exe            # 注意：不要加 server 子命令！
-```
+### 2. 清理老虚拟环境 `.venv`（已回收约 1.3G）
+- 原 1.6G，元凶是 FunASR 实验残留（torch 552M / transformers 123M 等）
+- 主代码完全不用这些包（grep 验证）
+- 现只保留 `.venv-trim`（316M），84 个测试全通过
+- 启动脚本已优先指向 `.venv-trim`
 
-然后：微信 PC 端 → 进直播 → "更多"按钮多出**下载图标** → 点它选清晰度
-→ 自动复制 ffmpeg 命令 → 把 URL 抠出来：
+### 3. 代码推到 GitHub
+- 仓库：https://github.com/sanfy008/WeChat_live_recorder
+- 43 个文件，6225 行
+- 已排除：output/、.venv、tools/wxcd（第三方运行时）、测试音频
 
-```bash
-.venv-trim/Scripts/python.exe -m wxlive stream "<URL>" --name 直播名
-```
+## 📋 待办
 
-完整说明见 `docs/抓流操作手册.md`。
+### 1. 抓流自动化（可选）
+- 目前需手动用抓包工具拿流地址
+- 参见 `docs/抓流操作手册.md`（已实测记录 UA 伪装无效、必须走 JSBridge 注入）
+- 若要自动化，需集成 mitmproxy + 注入脚本
 
-**待验证**：
-- [ ] 微信里是否真的出现下载按钮
-- [ ] 拿到的 FLV 地址 ffmpeg 能否直拉（txSecret 时效/UA 限制未知）
-
----
-
-## ✅ 已完成（2026-11-16 12:36）
-
-### A. 回放 66.5 分钟全量转写
-- 音频：`output/recordings/20261116_111300_回放130min.wav`（365 MB，48k）
-- 产物：`output/transcripts/20261116_122111_...回放130min.{md,jsonl}`
-- **1561 句**，转写 9.1 分钟完成（130 分钟回放 @2 倍速 → 66.5 分钟音频）
-- 质量抽查：暗语展开生效，如 `烧鸡（白云华赋）择高`
-- LLM 纠错仍在跑（40 批 × 23 秒 ≈ 15 分钟），**不影响主产物可用**
-
-### B. 老环境 `.venv` 清理完成：1.6G → 5K
-- 确认无进程占用后执行（录音进程 4104 已于 12:19 退出）
-- 根目录因被系统句柄锁定无法删除，仅清空内容，保留了空的 `.venv/`
-- `启动.bat` 已优先使用 `.venv-trim`，无需改动
-- 回收约 **1.6 GB**
-
----
-
-## 📚 本次调研结论（2026-11-16 12:00-12:20）
-
-### UA 伪装不可行（已实测证伪）
-网传"F12 改手机 UA 就能看视频号直播"对**取流**无效：
-1. 检测要求 UA 同时含 `MicroMessenger` + `WindowsWechat`（PC 微信专用标记）
-2. 真正取流靠 `WeixinPrefecherJSBridge.invoke` / `wxNative.webTransfer` 原生桥，
-   Chrome 里是 `undefined`
-3. 实测未登录 POST `live/join_live` → `errCode 300330`（`MinNeedLogin`）
-
-### 正确路线：本地 MITM + 脚本注入
-- 工具：`tools/wxcd/wx_video_download.exe` v261106
-- 关键配置：`proxy.upstreamProxy: http://127.0.0.1:10808`（否则断网）
-- **大坑**：`server` 子命令硬编码 `proxy.enabled=false`，必须用根命令启动
-- 已验证：双端口监听 / 上游透传正常 / MITM 解密 1.16MB / 注入标齐全 /
-  系统代理未被改动 / 录音未受影响
+### 2. 词表持续维护
+- 每场直播后把读不准的地方补进 `lexicon/xsc.json`
+- 跑两三场后准确率会明显稳定
