@@ -20,6 +20,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from . import _force_utf8  # noqa: F401
+from .gui_fetch import FetchTabMixin
 from .config import OUTPUT_DIR, RECORDINGS_DIR, TRANSCRIPTS_DIR, Config
 from . import model_discovery, postprocess, userconfig
 
@@ -27,7 +28,7 @@ APP_TITLE = "微信直播录音转写"
 APP_VER = "1.0"
 
 
-class App(tk.Tk):
+class App(FetchTabMixin, tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(f"{APP_TITLE} v{APP_VER}")
@@ -47,7 +48,11 @@ class App(tk.Tk):
         self._load_settings_into_ui()
         self._poll_log()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        threading.Thread(target=self._discover_models, daemon=True).start()
+        # Tk 变量只能在主线程读取，先取值再交给后台线程
+        _m_base = self.api_url_var.get()
+        _m_key = self.api_key_var.get()
+        threading.Thread(target=self._discover_models,
+                         args=(_m_base, _m_key), daemon=True).start()
 
     # ================= 外观 =================
 
@@ -69,15 +74,18 @@ class App(tk.Tk):
         nb.pack(fill="both", expand=True, padx=10, pady=(10, 6))
 
         self.tab_record = ttk.Frame(nb)
+        self.tab_fetch = ttk.Frame(nb)
         self.tab_trans = ttk.Frame(nb)
         self.tab_settings = ttk.Frame(nb)
         self.tab_log = ttk.Frame(nb)
         nb.add(self.tab_record, text="  录制  ")
+        nb.add(self.tab_fetch, text="  视频号下载  ")
         nb.add(self.tab_trans, text="  转写与整理  ")
         nb.add(self.tab_settings, text="  设置  ")
         nb.add(self.tab_log, text="  运行日志  ")
 
         self._build_record_tab()
+        self._build_fetch_tab()
         self._build_transcribe_tab()
         self._build_settings_tab()
         self._build_log_tab()
@@ -241,7 +249,7 @@ class App(tk.Tk):
                     self.stream_status.configure(text="✗ 无法拉流", style="Warn.TLabel")
                     self._log(f"[流探测] 失败: {r.get('error')}")
                     messagebox.showerror("探测失败", r.get("error", "未知错误"))
-            self.after(0, apply)
+            self._ui(apply)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -523,24 +531,32 @@ class App(tk.Tk):
 
     # ================= 模型发现 =================
 
-    def _discover_models(self) -> None:
-        base = self.api_url_var.get() or "http://127.0.0.1:3425/v1"
-        key = self.api_key_var.get() or "magpie-alma"
+    def _discover_models(self, base_url: str = "", api_key: str = "") -> None:
+        """后台线程：拉模型列表。不碰任何 Tk 对象。"""
+        base = base_url or "http://127.0.0.1:3425/v1"
+        key = api_key or "magpie-alma"
         found = model_discovery.fetch_models(base, key)
         self.discovered_models = found
         asr_ids = [o[0] for o in model_discovery.merge_asr_options(found)]
         text_ids = [o[0] for o in model_discovery.merge_text_options(found)]
-        self.after(0, lambda: self._apply_model_options(asr_ids, text_ids))
-        if found:
-            self.after(0, lambda: self.api_status.configure(
-                text=f"✓ 发现 {len(found)} 个模型", style="Ok.TLabel"))
-        else:
-            self.after(0, lambda: self.api_status.configure(
-                text="未连上网关，使用内置列表", style="Warn.TLabel"))
+
+        def apply():
+            self._apply_model_options(asr_ids, text_ids)
+            if found:
+                self.api_status.configure(
+                    text=f"✓ 发现 {len(found)} 个模型", style="Ok.TLabel")
+            else:
+                self.api_status.configure(
+                    text="未连上网关，使用内置列表", style="Warn.TLabel")
+
+        self._ui(apply)
 
     def _test_and_discover(self) -> None:
         self.api_status.configure(text="测试中…", style="Hint.TLabel")
-        threading.Thread(target=self._discover_models, daemon=True).start()
+        base = self.api_url_var.get()
+        key = self.api_key_var.get()
+        threading.Thread(target=self._discover_models,
+                         args=(base, key), daemon=True).start()
 
     # ================= 设备 =================
 
@@ -568,7 +584,8 @@ class App(tk.Tk):
                 else:
                     self._set_devices(names, default)
 
-            self.after(0, apply)
+            # 后台线程里不能直接 self.after（Tk 只允许主线程），走队列
+            self._ui(apply)
 
         threading.Thread(target=work, daemon=True).start()
 
