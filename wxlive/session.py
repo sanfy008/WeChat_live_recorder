@@ -166,6 +166,7 @@ class Session:
         )
         return doc
 
+
 def _audio_duration(wall: "timedelta", segments: list[dict]) -> float:
     """音频时长（秒），而非墙钟耗时。
 
