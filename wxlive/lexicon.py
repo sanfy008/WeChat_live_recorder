@@ -49,7 +49,11 @@ CODES: dict[str, str] = {
     "2J": "二基", "YY": "二中应元", "ZDF": "中大附", "LG": "六改",
     # 谐音/联想类
     "景观房": "金广附", "香鸡腿": "铁一", "石榴姐妹": "十六中",
-    "小金龙": "金广附", "龙哥": "六改", "八姨": "八一实验", "二叔": "二中苏元",
+    # 注意：小金龙 = 番禺祈福新邨（QFXC/XL），**不是金广附**。
+    # 金广附是位于白云区金沙洲的广大附中实验学校。2026-11-16 King 订正。
+    "小金龙": "祈福新邨", "QFXC": "祈福新邨", "XL": "祈福新邨",
+    "清湾": "清湾", "QW": "清湾", "QHFZ": "清湾",
+    "龙哥": "六改", "八姨": "八一实验", "二叔": "二中苏元",
     "银元": "二中应元", "银店": "二中应元", "金店": "中大附", "周大福": "中大附",
     "浴室": "育才实验", "育实": "育才实验",
     # 食物类
@@ -212,6 +216,28 @@ def _replace_guarded(text: str, wrong: str, right: str) -> str:
     return "".join(out) if hit else text
 
 
+# 这些代号/proper name 已是通用叫法，展开成括号纯属噪音，反而影响可读性
+_NO_EXPAND = {
+    "金广附", "省实", "华附", "二中", "广雅", "执信", "铁一", "六中",
+    "广大附", "培英", "培正", "真光", "南武", "五中", "七中", "四中", "三中", "一中",
+    "白云省实", "白云广雅", "白云六中", "白云铁一", "白云华赋",
+    "天河省实", "荔湾省实", "荔湾广雅", "西关广雅", "花都广雅",
+    "黄埔广附", "花都广附", "增城广附", "南沙广附",
+    "二中苏元", "二中应元", "二中天元", "二中开元", "二中会元",
+    "十六中", "十六中实验", "八十六中", "九十七中", "十三中", "一一三中学",
+    "华侨外国语", "西关外国语", "天河外国语", "江南外国语", "海珠实验",
+    "中大附中", "育才实验", "育才中学", "八一实验", "名德实验",
+    "祈福新邨", "祈福英校", "番禺华附", "番禺铁一", "亚运城铁一",
+    "华附奥校", "广州外国语", "广州中学", "广州实验中学", "天河中学",
+    "清湾", "黄埔华实", "黄埔军校", "黄埔铁英", "培文外国语",
+    "东江外国语", "荔广实验", "云城培英", "白云华赋", "华美实验",
+}
+
+
+# 这些短代码容易被更长的词"吃掉"一部分，需检查左侧是否构成更长词
+_SUFFIX_GUARDED = {"金奥", "小奥", "大奥", "奥班", "龙哥", "白省", "白雅", "白六"}
+
+
 def expand_codes(text: str, keep_original: bool = True) -> str:
     """把暗语展开成正式校名，便于后续 LLM 理解和检索。
 
@@ -231,8 +257,10 @@ def expand_codes(text: str, keep_original: bool = True) -> str:
     if not text:
         return text
 
-    # 按长度降序，保证"最左最长优先"
-    codes = sorted(CODES, key=len, reverse=True)
+    # 按长度降序，保证"最左最长优先"。
+    # 跳过"已经是通用叫法"的条目：如 金广附→金广实验学校、省实→广东实验中学，
+    # 这些叫法本身就足够清楚，展开成括号只会增加噪音。
+    codes = sorted((c for c in CODES if c not in _NO_EXPAND), key=len, reverse=True)
     n = len(text)
     out: list[str] = []
     i = 0
@@ -249,6 +277,16 @@ def expand_codes(text: str, keep_original: bool = True) -> str:
                     continue
                 if next_ch.isascii() and next_ch.isalpha():
                     continue
+            # 后缀冲突保护：`金奥` 不能吃掉 `小金奥班` 里的 `金奥`。
+            # 判据：左侧紧邻字符与 code 拼起来，若能构成词表里某个词的
+            # 前缀（如 "小"+"金奥" 是 "小金奥班" 的前缀），说明我们切在词中间。
+            if code in _SUFFIX_GUARDED:
+                prev_ch = text[i - 1] if i > 0 else ""
+                if prev_ch:
+                    head = prev_ch + code
+                    if any(w.startswith(head) and len(w) > len(head)
+                           for w in CODES):
+                        continue
             matched = code
             break
 
@@ -277,6 +315,25 @@ def expand_codes(text: str, keep_original: bool = True) -> str:
     return "".join(out)
 
 
+def _clean_map(d: dict) -> dict:
+    """过滤掉分组标记与空值。
+
+    词表里允许用 `"分组名": null` 或 `"_说明": ...` 做可读性分隔，
+    但这些不是真实映射，必须剔除，否则会参与匹配、甚至在
+    `sorted(CODES, key=len)` 时因 None 崩溃。
+    """
+    out = {}
+    for k, v in (d or {}).items():
+        if not isinstance(k, str):
+            continue
+        if k.startswith("_") or v is None:
+            continue
+        if not isinstance(v, str) or not v.strip():
+            continue
+        out[k] = v
+    return out
+
+
 def load(path: Path | None = None) -> dict:
     """加载外部词表（优先），与内置表合并。"""
     p = path or DEFAULT_PATH
@@ -287,8 +344,8 @@ def load(path: Path | None = None) -> dict:
             ext = json.loads(p.read_text(encoding="utf-8"))
             data["schools"] = list(dict.fromkeys(data["schools"] + ext.get("schools", [])))
             data["terms"] = list(dict.fromkeys(data["terms"] + ext.get("terms", [])))
-            data["codes"].update(ext.get("codes", {}))
-            data["corrections"].update(ext.get("corrections", {}))
+            data["codes"].update(_clean_map(ext.get("codes", {})))
+            data["corrections"].update(_clean_map(ext.get("corrections", {})))
             print(f"[lexicon] 已加载外部词表 {p.name}（+{len(ext.get('schools', []))} 校名）")
         except Exception as e:  # noqa: BLE001
             print(f"[lexicon] 外部词表加载失败，用内置表: {e}")

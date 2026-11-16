@@ -156,15 +156,37 @@ def test_xsc_json_loads_and_merges():
 
 
 def test_xsc_json_has_no_placeholder_leak():
-    """词表里的推测项不能混进可用于替换的字段。"""
+    """词表里的推测项不能混进可用于替换的字段。
+
+    允许 `"分组名": null` 或 `_说明` 这类可读性标记，
+    但它们必须被 load() 过滤掉（见 test_clean_map_drops_group_markers）。
+    """
     import json
     from pathlib import Path
     p = Path(__file__).resolve().parent.parent / "lexicon" / "xsc.json"
     d = json.loads(p.read_text(encoding="utf-8"))
     for key in ("codes", "corrections"):
         for k, v in d.get(key, {}).items():
-            assert k and v, f"{key} 里有空键值: {k!r}->{v!r}"
-            assert "存疑" not in v, f"corrections 不应含存疑标注: {k}->{v}"
+            if k.startswith("_") or v is None:
+                continue  # 分组标记，合法
+            assert isinstance(v, str) and v.strip(), f"{key} 有空值: {k!r}->{v!r}"
+            assert "存疑" not in v, f"{key} 不应含存疑标注: {k}->{v}"
+
+
+def test_clean_map_drops_group_markers():
+    """分组标记必须被过滤，否则会参与匹配甚至排序时崩溃。"""
+    from wxlive.lexicon import _clean_map
+    raw = {"_A级": None, "_说明": "文字", "normal": "正常值", "空": "", "None值": None}
+    got = _clean_map(raw)
+    assert got == {"normal": "正常值"}, got
+
+
+def test_load_with_group_markers_does_not_crash():
+    """真实词表含分组标记时，加载与展开都不能崩。"""
+    from wxlive import lexicon
+    lexicon.apply_loaded(lexicon.load())
+    assert all(isinstance(v, str) for v in lexicon.CODES.values())
+    lexicon.expand_codes("小金龙跟清实怎么选")
 
 
 # ================= 暗语展开（2026-11-16 实测重写） =================
@@ -181,15 +203,38 @@ def test_expand_no_nested_parentheses():
 
 
 def test_expand_longest_match_wins():
-    """"小金龙"不能被"小金"先吃掉。
+    """"小金龙"不能被更短的词先吃掉。
 
     实测坑：曾输出 "小金（金广附）龙（金广附）"。
+    另注：小金龙 = 祈福新邨（QFXC/XL），不是金广附（2026-11-16 King 订正）。
     """
-    from wxlive.lexicon import expand_codes
-    out = expand_codes("小金龙零班")
-    assert out == "小金龙（金广附）零班", out
+    from wxlive import lexicon
+    lexicon.apply_loaded(lexicon.load())
+    out = lexicon.expand_codes("小金龙零班")
+    assert out == "小金龙（祈福新邨）零班", out
     # 关键：不能出现 "小金（" —— 说明被短词先吃掉了
     assert "小金（" not in out, f"短词抢先匹配: {out}"
+
+
+def test_xiaojinlong_is_qifu_not_jinguangfu():
+    """硬错误回归：小金龙是番禺祈福新邨，不是白云区金沙洲的金广附。"""
+    from wxlive import lexicon
+    lexicon.apply_loaded(lexicon.load())
+    assert lexicon.CODES["小金龙"] == "祈福新邨"
+    assert lexicon.CODES["QFXC"] == "祈福新邨"
+    # 金广附的官方代码是 JGF / 景观房
+    assert lexicon.CODES["JGF"] == "金广实验学校"
+    assert lexicon.CODES["景观房"] == "金广实验学校"
+
+
+def test_qingwan_mapping():
+    """清湾 = 清华附中湾区学校（QW/QHFZ），与"清实"不是一回事。"""
+    from wxlive import lexicon
+    lexicon.apply_loaded(lexicon.load())
+    assert lexicon.CODES["QW"] == "清湾"
+    assert lexicon.CODES["QHFZ"] == "清湾"
+    # 直播口语"清实"归到清湾（B 级推断，图谱未载）
+    assert lexicon.CODES.get("清实") == "清湾"
 
 
 def test_expand_does_not_rescan_expanded_text():
@@ -247,3 +292,68 @@ def test_full_real_transcript_no_artifacts():
         if "（（" in e or "（）" in e:
             bad.append(e[:60])
     assert not bad, f"出现嵌套/空括号 {len(bad)} 处: {bad[:3]}"
+
+
+# ========== 2026-11-16 King 人工订正（官方暗语图谱 OCR 校准） ==========
+
+def test_banxing_codes_from_official_chart():
+    """官方特色班(ZDB)解码表必须齐全。"""
+    from wxlive import lexicon
+    lexicon.apply_loaded(lexicon.load())
+    expect = {
+        "EH": "二中火箭班", "纪念堂": "二中火箭班",
+        "EJ": "二中基地班",
+        "QH": "二中苏元启航班",
+        "NS": "省实南山班", "SSNS": "省实南山班", "咖啡": "省实南山班",
+        "BSNS": "白省南山班",
+        "HHL": "广大附黄华路课改班",
+        "大奥": "广大附大学城奥班",
+        "小奥": "南沙广附实验小奥",
+        "LG": "六中课改班", "龙哥": "六中课改班",
+        "HSYSB": "海实院士班",
+        "ZA": "执信奥班",
+        "金奥": "金广附奥班",
+        "XC": "广中小创班",
+        "ZG": "择高班",
+        "DC": "真光大成智慧班",
+    }
+    merged = lexicon.load()
+    for k, v in expect.items():
+        got = merged["codes"].get(k)
+        assert got == v, f"{k} 应为 {v}，实为 {got}"
+
+
+def test_zeigao_is_class_not_school():
+    """"择高班"是班型代码(ZG)，不是某所学校。"""
+    from wxlive import lexicon
+    lexicon.apply_loaded(lexicon.load())
+    assert lexicon.CODES.get("ZG") == "择高班"
+    # "泽高"是"择高"的同音误写，不应绑定到具体学校
+    assert lexicon.CODES.get("泽高") is None, "泽高不应映射到学校"
+
+
+def test_key_schools_ocr_verified():
+    """官方图谱核对过的关键映射。"""
+    from wxlive import lexicon
+    lexicon.apply_loaded(lexicon.load())
+    expect = {
+        "QFXC": "祈福新邨", "XL": "祈福新邨",
+        "JGF": "金广实验学校", "景观房": "金广实验学校",
+        "BS": "白云省实", "白婶": "白云省实",
+        "BYGY": "白云广雅", "白鸭": "白云广雅",
+        "EZSY": "二中苏元", "二叔": "二中苏元",
+        "ZDF": "中大附中", "周大福": "中大附中", "金店": "中大附中",
+        "YCSY": "育才实验", "浴室": "育才实验",
+        "LZ": "六中", "芝麻鸡": "六中",
+        "TY": "铁一中学", "鸡腿": "铁一中学",
+        "BT": "白云铁一", "白切鸡": "白云铁一",
+        "BYHF": "白云华赋", "烧鸡": "白云华赋",
+        "HF": "华附奥校", "帮主": "华附奥校", "神学院": "华附奥校",
+        "PWWGY": "培文外国语", "培文": "培文外国语",
+        "HPHC": "黄埔华初", "华初": "黄埔华初",
+        "DJWGY": "东江外国语", "东江": "东江外国语",
+    }
+    merged = lexicon.load()
+    for k, v in expect.items():
+        got = merged["codes"].get(k)
+        assert got == v, f"{k} 应为 {v}，实为 {got}"
