@@ -15,7 +15,7 @@ Gemini 不返回真实时间戳，我们按字数比例估算，误差可达 ±1
     "有家长问…" / "下一个问题" / "来我们看一下" / "那接下来"
 
 在这些地方断段，比按固定 30 秒切更贴合内容：问答关系完整，可读性更好。
-只有在长时间没有转折信号时，才用长度兜底（默认 60 秒）强制断开，
+只有在长时间没有转折信号时，才用长度兜底（默认 40 秒）强制断开，
 避免出现几百字的巨型段落。
 
 ## 重要：不改变任何 ASR 输出
@@ -86,8 +86,8 @@ def _fmt_span(start: float, end: float) -> str:
 def group_segments(
     segments: list[dict],
     *,
-    max_seconds: float = 60.0,
-    max_chars: int = 400,
+    max_seconds: float = 40.0,
+    max_chars: int = 250,
     min_seconds: float = 8.0,
 ) -> list[dict]:
     """把逐句分段聚合成段落。
@@ -149,8 +149,8 @@ def group_segments(
 def render_paragraphs(
     segments: list[dict],
     *,
-    max_seconds: float = 60.0,
-    max_chars: int = 400,
+    max_seconds: float = 40.0,
+    max_chars: int = 250,
     min_seconds: float = 8.0,
 ) -> str:
     """渲染成 Markdown 段落文本。
