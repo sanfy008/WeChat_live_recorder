@@ -23,8 +23,12 @@ import urllib.error
 import urllib.request
 from typing import Callable
 
+from .config import DEFAULT_REASONING_EFFORT, DEFAULT_TEXT_MODEL, validate_reasoning_effort
+
 DEFAULT_ENDPOINT = "http://127.0.0.1:3425/v1/chat/completions"
-DEFAULT_MODEL = "group/deepseek"
+# 单一真相在 config.py（TextConfig 的默认值也取同一个常量）。
+DEFAULT_MODEL = DEFAULT_TEXT_MODEL
+DEFAULT_FIX_WORKERS = 12
 
 # 纠错分批的失败重试间隔（秒）。网关会瞬时抖动：实测串行复跑里出现
 # 23/40 行、1/40 行、HTTP 502/403，单独重试全部成功且行数正确。
@@ -34,15 +38,15 @@ FIX_RETRY_DELAYS = (1.0, 4.0)
 
 def _call(model: str, prompt: str, endpoint: str, api_key: str,
           max_tokens: int = 8000, timeout: int = 240,
-          reasoning_effort: str | None = "low") -> str:
+          reasoning_effort: str | None = DEFAULT_REASONING_EFFORT) -> str:
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
     }
-    # group/deepseek 的合法档位是 [low, high, max]，没有 medium：传 medium 虽返回
-    # 200 但行为不稳（实测 reasoning_tokens 2751/5559，同一批 33.7s/63.6s），
-    # max 直接 403。质量对比 40 行样本 low 改对 2 行、high 1 行，故取 low。
+    # 思考档位只在 VALID_REASONING_EFFORTS 里选。实测 group/deepseek 传 medium
+    # 虽返回 200 但行为不稳（reasoning_tokens 2751/5559，同一批 33.7s/63.6s），
+    # max 直接 403；质量对比 40 行样本 low 改对 2 行、high 1 行，故取 low。
     if reasoning_effort:
         payload["reasoning_effort"] = reasoning_effort
 
@@ -58,8 +62,10 @@ def fix_errors(lines: list[str], model: str = DEFAULT_MODEL,
                endpoint: str = DEFAULT_ENDPOINT, api_key: str = "magpie-alma",
                vocabulary: str = "", batch_size: int = 40,
                progress: Callable[[int, int], None] | None = None,
-               workers: int = 12,
-               retry_delays: tuple[float, ...] | None = None) -> list[str]:
+               workers: int = DEFAULT_FIX_WORKERS,
+               retry_delays: tuple[float, ...] | None = None,
+               reasoning_effort: str = DEFAULT_REASONING_EFFORT,
+               out_stats: dict | None = None) -> list[str]:
     """按领域词表纠正同音字。重试用尽的分批保留原文。
 
     workers > 1 时用线程池并发请求网关；结果按批下标拼回，顺序与输入一致。
@@ -68,15 +74,35 @@ def fix_errors(lines: list[str], model: str = DEFAULT_MODEL,
 
     retry_delays 是失败重试的等待序列（默认 1s/4s，共 3 次尝试）。
     HTTP 错误与行数不匹配都会重试；做成可注入是为了测试不必真 sleep。
+
+    out_stats 可选传入一个 dict：会把本次调用的参数与实际统计写进去
+    （batches / retry_count / failed_batches / workers / model /
+    reasoning_effort / elapsed_seconds），供产物 meta 追溯。
+    返回值仍为 list[str]，保持对既有调用方兼容。
     """
+    started = time.monotonic()
+    reasoning_effort = validate_reasoning_effort(reasoning_effort)
+    stats: dict = {
+        "model": model,
+        "reasoning_effort": reasoning_effort,
+        "workers": workers,
+        "batches": 0,
+        "retry_count": 0,
+        "failed_batches": [],
+        "elapsed_seconds": 0.0,
+    }
+
     if not lines:
+        if out_stats is not None:
+            out_stats.update(stats)
         return lines
 
     delays = tuple(retry_delays) if retry_delays is not None else FIX_RETRY_DELAYS
     total_batches = (len(lines) + batch_size - 1) // batch_size
     batches = [lines[i : i + batch_size] for i in range(0, len(lines), batch_size)]
+    stats["batches"] = total_batches
 
-    def process(bi: int, batch: list[str]) -> list[str]:
+    def process(bi: int, batch: list[str]) -> tuple[list[str], int, str]:
         numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(batch))
         prompt = (
             "你是中文 ASR 后处理专家。下面是一段升学规划直播的语音识别结果，存在同音字错误。\n"
@@ -89,33 +115,43 @@ def fix_errors(lines: list[str], model: str = DEFAULT_MODEL,
             f"待修正：\n{numbered}"
         )
         last_err = ""
+        retries = 0
         for attempt in range(len(delays) + 1):
             if attempt:
+                retries += 1
                 delay = delays[attempt - 1]
                 if delay:
                     time.sleep(delay)
             try:
-                res = _call(model, prompt, endpoint, api_key)
+                res = _call(model, prompt, endpoint, api_key,
+                            reasoning_effort=reasoning_effort)
                 fixed = [x.strip() for x in res.split("\n") if x.strip()]
                 # 行数不一致时不要用这批结果，避免错位
                 if len(fixed) == len(batch):
                     if attempt:
                         print(f"[post] 纠错批次 {bi+1} 重试第 {attempt} 次恢复")
-                    return fixed
+                    return fixed, retries, ""
                 last_err = f"行数不匹配（{len(fixed)}≠{len(batch)}）"
             except Exception as e:  # noqa: BLE001
                 last_err = str(e)[:120]
 
         print(f"[post] 纠错批次 {bi+1} 重试 {len(delays)} 次后仍失败"
               f"（{last_err}），保留原文")
-        return batch
+        return batch, retries, last_err or "未知失败"
 
     if workers <= 1:
         out: list[str] = []
         for bi, batch in enumerate(batches):
-            out.extend(process(bi, batch))
+            fixed, retries, err = process(bi, batch)
+            out.extend(fixed)
+            stats["retry_count"] += retries
+            if err:
+                stats["failed_batches"].append(bi + 1)
             if progress:
                 progress(bi + 1, total_batches)
+        stats["elapsed_seconds"] = round(time.monotonic() - started, 2)
+        if out_stats is not None:
+            out_stats.update(stats)
         return out
 
     results: list[list[str] | None] = [None] * total_batches
@@ -126,11 +162,16 @@ def fix_errors(lines: list[str], model: str = DEFAULT_MODEL,
         for fut in concurrent.futures.as_completed(futures):
             bi = futures[fut]
             try:
-                results[bi] = fut.result()
+                fixed, retries, err = fut.result()
+                results[bi] = fixed
+                stats["retry_count"] += retries
+                if err:
+                    stats["failed_batches"].append(bi + 1)
             except Exception as e:  # noqa: BLE001
                 # process 内部已兜底，这里只防意外；该批仍保留原文
                 print(f"[post] 纠错批次 {bi+1} 异常，保留原文: {str(e)[:120]}")
                 results[bi] = batches[bi]
+                stats["failed_batches"].append(bi + 1)
             done += 1
             # 并发时按完成数递增，不保证批次顺序
             if progress:
@@ -141,14 +182,21 @@ def fix_errors(lines: list[str], model: str = DEFAULT_MODEL,
         if batch is None:  # 理论上不会发生；兜底保留原文，绝不让行数变少
             print(f"[post] 纠错批次 {bi+1} 无结果，保留原文")
             batch = batches[bi]
+            stats["failed_batches"].append(bi + 1)
         final.extend(batch)
+    stats["failed_batches"] = sorted(set(stats["failed_batches"]))
+    stats["elapsed_seconds"] = round(time.monotonic() - started, 2)
+    if out_stats is not None:
+        out_stats.update(stats)
     return final
 
 
 def build_digest(segments: list[dict], model: str = DEFAULT_MODEL,
                  endpoint: str = DEFAULT_ENDPOINT, api_key: str = "magpie-alma",
                  title: str = "",
-                 group_seconds: float = 60.0) -> str:
+                 group_seconds: float = 60.0,
+                 reasoning_effort: str = DEFAULT_REASONING_EFFORT,
+                 out_stats: dict | None = None) -> str:
     """生成结构化要点。长文本超限时自动按段摘要再归并。
 
     ## 为什么按段落喂而不是逐句喂
@@ -169,6 +217,22 @@ def build_digest(segments: list[dict], model: str = DEFAULT_MODEL,
     """
     if not segments:
         return ""
+
+    started = time.monotonic()
+    reasoning_effort = validate_reasoning_effort(reasoning_effort)
+    stats: dict = {
+        "model": model,
+        "reasoning_effort": reasoning_effort,
+        "seconds": 0.0,
+        "ok": False,
+    }
+
+    def finish(text: str, ok: bool) -> str:
+        stats["seconds"] = round(time.monotonic() - started, 2)
+        stats["ok"] = ok
+        if out_stats is not None:
+            out_stats.update(stats)
+        return text
 
     from . import render as _render
 
@@ -197,7 +261,8 @@ def build_digest(segments: list[dict], model: str = DEFAULT_MODEL,
             p = (f"下面是直播的部分记录（第{i+1}/{len(chunks)}部分），请提炼要点，"
                  f"保留具体学校名、分数、建议，不要泛泛而谈：\n\n{c}")
             try:
-                partials.append(_call(model, p, endpoint, api_key, max_tokens=4000))
+                partials.append(_call(model, p, endpoint, api_key, max_tokens=4000,
+                                      reasoning_effort=reasoning_effort))
             except Exception as e:  # noqa: BLE001
                 partials.append(f"(第{i+1}部分摘要失败: {str(e)[:60]})")
         text = "\n\n".join(f"### 片段{i+1}\n{p}" for i, p in enumerate(partials))
@@ -215,9 +280,11 @@ def build_digest(segments: list[dict], model: str = DEFAULT_MODEL,
         f"{text}"
     )
     try:
-        return _call(model, prompt, endpoint, api_key, max_tokens=8000, timeout=300)
+        return finish(_call(model, prompt, endpoint, api_key, max_tokens=8000,
+                            timeout=300, reasoning_effort=reasoning_effort), True)
     except Exception as e:  # noqa: BLE001
-        return f"(要点整理失败: {str(e)[:150]})"
+        stats["error"] = str(e)[:150]
+        return finish(f"(要点整理失败: {str(e)[:150]})", False)
 
 
 def _ts(seconds: float) -> str:

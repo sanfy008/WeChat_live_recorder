@@ -21,7 +21,10 @@ from tkinter import filedialog, messagebox, ttk
 
 from . import _force_utf8  # noqa: F401
 from .gui_fetch import FetchTabMixin
-from .config import OUTPUT_DIR, RECORDINGS_DIR, TRANSCRIPTS_DIR, Config
+from .config import (
+    OUTPUT_DIR, RECORDINGS_DIR, TRANSCRIPTS_DIR, Config,
+    VALID_REASONING_EFFORTS, validate_reasoning_effort,
+)
 from . import model_discovery, postprocess, userconfig
 
 APP_TITLE = "微信直播录音转写"
@@ -298,11 +301,17 @@ class App(FetchTabMixin, tk.Tk):
         r4.pack(fill="x", padx=10, pady=(0, 8))
         ttk.Label(r4, text="整理模型：").pack(side="left")
         self.text_model_var = tk.StringVar()
-        self.text_cb = ttk.Combobox(r4, textvariable=self.text_model_var, width=44,
+        self.text_cb = ttk.Combobox(r4, textvariable=self.text_model_var, width=34,
                                     state="readonly")
         self.text_cb.pack(side="left", padx=6)
+        ttk.Label(r4, text="思考强度：").pack(side="left", padx=(10, 2))
+        self.reasoning_var = tk.StringVar()
+        self.reasoning_cb = ttk.Combobox(
+            r4, textvariable=self.reasoning_var, width=7, state="readonly",
+            values=list(VALID_REASONING_EFFORTS))
+        self.reasoning_cb.pack(side="left")
         ttk.Label(r4, text="（用 LLM 拿领域词表再校对一遍，能修掉专有名词错误）",
-                  style="Hint.TLabel").pack(side="left")
+                  style="Hint.TLabel").pack(side="left", padx=6)
 
         ctrl = ttk.Frame(f)
         ctrl.pack(fill="x", padx=12, pady=(4, 8))
@@ -378,10 +387,21 @@ class App(FetchTabMixin, tk.Tk):
         r = ttk.Frame(asrb)
         r.pack(fill="x", padx=10, pady=(0, 8))
         ttk.Label(r, text="默认整理模型：").pack(side="left")
-        self.def_text_var = tk.StringVar()
+        # 与转写页共用同一个变量：避免"设置页默认值"与"本次选择"各存一份再互相覆盖。
+        self.def_text_var = self.text_model_var
         ttk.Combobox(r, textvariable=self.def_text_var, width=42,
                      state="readonly").pack(side="left", padx=6)
         self.def_text_cb = r.winfo_children()[-1]
+
+        r = ttk.Frame(asrb)
+        r.pack(fill="x", padx=10, pady=(0, 8))
+        ttk.Label(r, text="默认思考强度：").pack(side="left")
+        self.def_reasoning_var = self.reasoning_var
+        ttk.Combobox(r, textvariable=self.def_reasoning_var, width=8,
+                     state="readonly",
+                     values=list(VALID_REASONING_EFFORTS)).pack(side="left", padx=6)
+        ttk.Label(r, text="仅有 none/low/high/max；非法档网关会静默接受但不稳",
+                  style="Hint.TLabel").pack(side="left", padx=6)
 
         r = ttk.Frame(asrb)
         r.pack(fill="x", padx=10, pady=(0, 8))
@@ -450,9 +470,15 @@ class App(FetchTabMixin, tk.Tk):
         self.api_url_var.set(c.asr.gemini_endpoint.replace("/chat/completions", ""))
         self.api_key_var.set(c.asr.gemini_api_key)
         self.def_asr_var.set(c.asr.gemini_model)
-        self.def_text_var.set(postprocess.DEFAULT_MODEL)
         self.asr_model_var.set(c.asr.gemini_model)
-        self.text_model_var.set(postprocess.DEFAULT_MODEL)
+        self.text_model_var.set(c.text.model or postprocess.DEFAULT_MODEL)
+        try:
+            effort = validate_reasoning_effort(c.text.reasoning_effort)
+        except ValueError as e:
+            # 配置文件里残留非法档：明确提示并退回默认，不静默接受。
+            self._log(f"[配置] {e}；已退回 low")
+            effort = "low"
+        self.reasoning_var.set(effort)
         self.engine_var.set(c.asr.engine)
         self.chunk_var.set("110")
         self.lexicon_var.set(c.asr.use_lexicon)
@@ -495,6 +521,11 @@ class App(FetchTabMixin, tk.Tk):
                 "gemini_api_key": self.api_key_var.get() or "magpie-alma",
                 "use_lexicon": bool(self.lexicon_var.get()),
                 "lexicon_path": self.lex_path_var.get(),
+            },
+            "text": {
+                "model": self.text_model_var.get() or postprocess.DEFAULT_MODEL,
+                # 非法档直接抛错，由保存/开始按钮提示，不静默写盘。
+                "reasoning_effort": validate_reasoning_effort(self.reasoning_var.get()),
             },
         }
 
@@ -814,6 +845,11 @@ class App(FetchTabMixin, tk.Tk):
         if self.worker and self.worker.is_alive():
             messagebox.showinfo("正在忙", "当前有任务在跑，先等它结束或中止")
             return
+        try:
+            validate_reasoning_effort(self.reasoning_var.get())
+        except ValueError as e:
+            messagebox.showerror("思考强度非法", str(e))
+            return
 
         self.stop_flag.clear()
         self.result.delete("1.0", "end")
@@ -861,8 +897,16 @@ class App(FetchTabMixin, tk.Tk):
         cfg.asr.gemini_model = self.asr_model_var.get() or cfg.asr.gemini_model
         engine = build_engine(cfg)
 
+        text_model = self.text_model_var.get() or cfg.text.model
+        try:
+            effort = validate_reasoning_effort(self.reasoning_var.get())
+        except ValueError as e:
+            raise ValueError(f"思考强度非法：{e}") from e
+
         TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
-        sess = Session(TRANSCRIPTS_DIR, name=src.stem, sample_rate=sr, record_audio=False)
+        fingerprint = f"w{postprocess.DEFAULT_FIX_WORKERS}_{effort}"
+        sess = Session(TRANSCRIPTS_DIR, name=src.stem, sample_rate=sr, record_audio=False,
+                       audio_stem=src.stem, fingerprint=fingerprint, audio_path=src)
         sess.source_audio_name = src.name
 
         rs = StreamResampler(in_rate=sr, out_rate=16000)
@@ -898,6 +942,7 @@ class App(FetchTabMixin, tk.Tk):
         self._log(f"转写完成：{len(sess.segments)} 句")
 
         # --- 后处理 ---
+        fix_stats: dict = {}
         lines = [s["text"] for s in sess.segments]
         if self.do_fix_var.get() and lines:
             self.after(0, lambda: self.status_var.set("LLM 纠错中…"))
@@ -909,25 +954,35 @@ class App(FetchTabMixin, tk.Tk):
             except Exception:
                 vocab = ""
             fixed = postprocess.fix_errors(
-                lines, model=self.text_model_var.get() or postprocess.DEFAULT_MODEL,
+                lines, model=text_model,
                 endpoint=cfg.asr.gemini_endpoint, api_key=cfg.asr.gemini_api_key,
-                vocabulary=vocab)
+                vocabulary=vocab, reasoning_effort=effort, out_stats=fix_stats)
             for seg, new in zip(sess.segments, fixed):
                 if new and new != seg["text"]:
                     seg["raw_text"] = seg["text"]
                     seg["text"] = new
-            self._log(f"   纠错 {sum(1 for a,b in zip(lines, fixed) if a!=b)} 处")
+            self._log(f"   纠错 {sum(1 for a,b in zip(lines, fixed) if a!=b)} 处"
+                      f"（重试 {fix_stats.get('retry_count', 0)} 次，"
+                      f"失败批次 {fix_stats.get('failed_batches', [])}）")
 
         digest = ""
+        digest_stats: dict = {}
         if self.do_digest_var.get() and sess.segments:
             self.after(0, lambda: self.status_var.set("生成要点中…"))
             self._log("→ 生成结构化要点")
             digest = postprocess.build_digest(
-                sess.segments, model=self.text_model_var.get() or postprocess.DEFAULT_MODEL,
+                sess.segments, model=text_model,
                 endpoint=cfg.asr.gemini_endpoint, api_key=cfg.asr.gemini_api_key,
-                title=src.stem)
+                title=src.stem, reasoning_effort=effort, out_stats=digest_stats)
 
-        doc = sess.close(extra_meta={"engine": "gui", "asr": getattr(engine, "stats", {})})
+        text_meta = {
+            "model": text_model,
+            "reasoning_effort": effort,
+            "fix": fix_stats,
+            "digest": digest_stats,
+        }
+        doc = sess.close(extra_meta={"engine": "gui", "asr": getattr(engine, "stats", {}),
+                                     "text": text_meta})
         if digest:
             md = sess.md_path
             md.write_text(md.read_text(encoding="utf-8") + "\n\n---\n\n"

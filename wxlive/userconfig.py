@@ -25,18 +25,20 @@ SAVEABLE = {
     "asr": ["engine", "gemini_model", "gemini_endpoint", "gemini_api_key",
             "model_size", "device", "compute_type", "language",
             "use_lexicon", "lexicon_path", "beam_size", "vad_filter"],
+    "text": ["model", "reasoning_effort"],
     "output": ["keep_audio"],
 }
 
 
 def default_config_dict() -> dict:
     """从 dataclass 里取出厂默认值。"""
-    from .config import AsrConfig, AudioConfig, OutputConfig, VadConfig
+    from .config import AsrConfig, AudioConfig, OutputConfig, TextConfig, VadConfig
 
     return {
         "audio": asdict(AudioConfig()),
         "vad": asdict(VadConfig()),
         "asr": asdict(AsrConfig()),
+        "text": asdict(TextConfig()),
         "output": asdict(OutputConfig()),
     }
 
@@ -69,7 +71,7 @@ def save_user_config(data: dict) -> None:
 
 def build_config_from_user(base=None):
     """把 user.json 叠加到出厂 Config 上，返回 Config 实例。"""
-    from .config import AsrConfig, AudioConfig, Config, OutputConfig, VadConfig
+    from .config import AsrConfig, AudioConfig, Config, OutputConfig, TextConfig, VadConfig
 
     cfg = base or Config()
     user = load_user_config()
@@ -88,6 +90,8 @@ def build_config_from_user(base=None):
     cfg.audio = _merge(cfg.audio if isinstance(cfg.audio, AudioConfig) else AudioConfig(), "audio")
     cfg.vad = _merge(cfg.vad if isinstance(cfg.vad, VadConfig) else VadConfig(), "vad")
     cfg.asr = _merge(cfg.asr if isinstance(cfg.asr, AsrConfig) else AsrConfig(), "asr")
+    # 向后兼容：老 user.json 没有 text 段时保留出厂默认值，不报错。
+    cfg.text = _merge(cfg.text if isinstance(cfg.text, TextConfig) else TextConfig(), "text")
     cfg.output = _merge(cfg.output if isinstance(cfg.output, OutputConfig) else OutputConfig(),
                         "output")
     return cfg

@@ -352,7 +352,9 @@ def cmd_transcribe(args: argparse.Namespace) -> int:
 
     ensure_dirs()
     # record_audio=False：源音频已存在，不再新建 WAV（否则会留下一个 44 字节空壳）
-    sess = Session(TRANSCRIPTS_DIR, name=src.stem, sample_rate=sr, record_audio=False)
+    sess = Session(TRANSCRIPTS_DIR, name=src.stem, sample_rate=sr, record_audio=False,
+                   audio_stem=src.stem, fingerprint=f"w{args.workers}",
+                   audio_path=src)
     sess.source_audio_name = src.name
 
     # 必须先重采样到 16kHz：whisper 只接受 16k，

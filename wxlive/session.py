@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from datetime import datetime, timedelta
@@ -26,6 +27,33 @@ def _ts(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
+def _safe_part(s: str, fallback: str = "wechat_live") -> str:
+    return "".join(c for c in (s or "") if c.isalnum() or c in "-_") or fallback
+
+
+def _file_fingerprint(path: Path) -> dict:
+    """音频身份指纹：sha1 + 字节数 + mtime。
+
+    sha1 用来判定"同一份音频的重跑"，比文件名可靠（文件名可能重名或被改）。
+    472MB 的 WAV 实测读取约 0.5s，相对整场转写可忽略。
+    """
+    h = hashlib.sha1()
+    size = 0
+    with path.open("rb") as f:
+        while True:
+            block = f.read(1024 * 1024)
+            if not block:
+                break
+            h.update(block)
+            size += len(block)
+    st = path.stat()
+    return {
+        "audio_sha1": h.hexdigest(),
+        "audio_bytes": size,
+        "audio_mtime": round(st.st_mtime, 3),
+    }
+
+
 class Session:
     def __init__(
         self,
@@ -33,20 +61,52 @@ class Session:
         name: str = "",
         sample_rate: int = 16000,
         record_audio: bool = True,
+        audio_stem: str | None = None,
+        fingerprint: str = "",
+        audio_path: Path | str | None = None,
     ) -> None:
         """record_audio=False 用于"转写已有音频"场景：不新建 WAV 文件，
-        避免产生一个 44 字节的空壳音频误导人。"""
+        避免产生一个 44 字节的空壳音频误导人。
+
+        audio_stem 非空时，产物写进 `<base_dir>/<audio_stem>/` 子目录，
+        文件名用 `<时间戳>_<fingerprint>`（如 `20261117_110000_w12_low`），
+        让同一份音频的多次重跑可区分。旧路径的产物不删除、不移动。
+        audio_path 用于计算音频指纹，并检测同一音频的历史产物（rerun_of）。
+        """
         self.sample_rate = sample_rate
         self.started_at = datetime.now()
         stamp = self.started_at.strftime("%Y%m%d_%H%M%S")
-        safe = "".join(c for c in (name or "wechat_live") if c.isalnum() or c in "-_") or "wechat_live"
-        self.id = f"{stamp}_{safe}"
+        safe = _safe_part(name)
 
         base_dir.mkdir(parents=True, exist_ok=True)
-        self.audio_path = base_dir / f"{self.id}.wav"
-        self.jsonl_path = base_dir / f"{self.id}.jsonl"
-        self.md_path = base_dir / f"{self.id}.md"
-        self.json_path = base_dir / f"{self.id}.json"
+        self._base_dir = base_dir
+        self.stem_dir = base_dir / _safe_part(audio_stem) if audio_stem else base_dir
+        if audio_stem:
+            self.stem_dir.mkdir(parents=True, exist_ok=True)
+
+        # 参数指纹（如 w12_low）优先；没有则退回会话名，保持旧行为。
+        suffix = _safe_part(fingerprint) if fingerprint else safe
+        self.id = f"{stamp}_{suffix}"
+        base_id, k = self.id, 2
+        while any((self.stem_dir / f"{self.id}{ext}").exists()
+                  for ext in (".json", ".jsonl", ".md")):
+            self.id = f"{base_id}_{k}"
+            k += 1
+
+        self.audio_path = self.stem_dir / f"{self.id}.wav"
+        self.jsonl_path = self.stem_dir / f"{self.id}.jsonl"
+        self.md_path = self.stem_dir / f"{self.id}.md"
+        self.json_path = self.stem_dir / f"{self.id}.json"
+
+        # 音频身份与重跑关系（仅在调用方提供 audio_path 时启用）
+        self.audio_meta: dict = {}
+        if audio_path is not None:
+            p = Path(audio_path)
+            if p.exists():
+                self.audio_meta = _file_fingerprint(p)
+                rerun_of = self._detect_rerun_of(p)
+                if rerun_of:
+                    self.audio_meta["rerun_of"] = rerun_of
 
         self._wav: sf.SoundFile | None = None
         if record_audio and not self.audio_path.exists():
@@ -64,6 +124,44 @@ class Session:
         self._jsonl = self.jsonl_path.open("a", encoding="utf-8")
         self._last_md_write = 0.0
         self._header_written = False
+
+    def _detect_rerun_of(self, audio_path: Path) -> str:
+        """查找同一音频的历史产物，返回其 session_id。
+
+        优先按 audio_sha1 精确匹配；老产物没有 sha1，则退回 audio_file 同名匹配。
+        只扫描当前子目录和旧的扁平目录，不递归，避免误伤其他音频。
+        """
+        mine = self.audio_meta.get("audio_sha1")
+        candidates = list(self.stem_dir.glob("*.json"))
+        if self.stem_dir != self._base_dir:
+            candidates += list(self._base_dir.glob("*.json"))
+
+        best: tuple[float, str] | None = None
+        for p in candidates:
+            if p == self.json_path:
+                continue
+            try:
+                d = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                continue
+            meta = d.get("meta") if isinstance(d, dict) else None
+            if not isinstance(meta, dict):
+                continue
+            prior_sha = meta.get("audio_sha1")
+            if mine and prior_sha:
+                same = prior_sha == mine
+            else:
+                # 老产物没有 sha1：audio_file 在顶层（doc["audio_file"]），
+                # 兼容历史上可能写在 meta 里的形态。
+                prior_name = d.get("audio_file") or meta.get("audio_file")
+                same = prior_name == audio_path.name
+            if not same:
+                continue
+            key = str(d.get("started_at") or "")
+            sid = str(d.get("session_id") or p.stem)
+            if best is None or key > best[0]:
+                best = (key, sid)
+        return best[1] if best else ""
 
     def _audio_name(self) -> str:
         """记录的音频：录制模式是本会话 WAV，转写模式是源文件名。"""
@@ -153,6 +251,7 @@ class Session:
             "meta": {
                 "sample_rate": self.sample_rate,
                 "segment_count": len(self.segments),
+                **self.audio_meta,
                 **(extra_meta or {}),
             },
         }

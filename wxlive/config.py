@@ -8,6 +8,27 @@ OUTPUT_DIR = ROOT / "output"
 RECORDINGS_DIR = OUTPUT_DIR / "recordings"
 TRANSCRIPTS_DIR = OUTPUT_DIR / "transcripts"
 
+# 文本整理（纠错 / 要点）的出厂默认值。
+# 模型选择的实测依据：workbuddy/deepseek-v4.1-flash 与 group/deepseek
+# 在 27 批纠错里都是 27/27，但 group/deepseek 会撞风控
+# （实测 HTTP 403/502、返回行数不符），故默认用前者。
+DEFAULT_TEXT_MODEL = "workbuddy/deepseek-v4.1-flash"
+DEFAULT_REASONING_EFFORT = "low"
+
+# workbuddy/deepseek-v4.1-flash 的合法思考档位。
+# 除这四档之外的取值会被网关静默接受，所以必须显式校验：
+# 实测 group/deepseek 传 medium 返回 200 但行为不稳，max 直接 403。
+VALID_REASONING_EFFORTS = ("none", "low", "high", "max")
+
+
+def validate_reasoning_effort(value: str | None) -> str:
+    """校验并归一化思考档位；非法值抛 ValueError（不静默接受）。"""
+    v = (value or "").strip().lower()
+    if v not in VALID_REASONING_EFFORTS:
+        raise ValueError(
+            f"非法思考强度 {value!r}，只支持 {'/'.join(VALID_REASONING_EFFORTS)}")
+    return v
+
 
 @dataclass
 class AudioConfig:
@@ -91,6 +112,16 @@ class AsrConfig:
 
 
 @dataclass
+class TextConfig:
+    """文本后处理参数（LLM 纠错 / 要点整理）。"""
+
+    model: str = DEFAULT_TEXT_MODEL
+    # 思考档位。见 VALID_REASONING_EFFORTS —— 只有这四档合法，
+    # 且必须显式校验，非法档会被网关静默接受（实测 medium 返回 200 但行为不稳）。
+    reasoning_effort: str = DEFAULT_REASONING_EFFORT
+
+
+@dataclass
 class OutputConfig:
     """输出参数。"""
 
@@ -105,6 +136,7 @@ class Config:
     audio: AudioConfig = field(default_factory=AudioConfig)
     vad: VadConfig = field(default_factory=VadConfig)
     asr: AsrConfig = field(default_factory=AsrConfig)
+    text: TextConfig = field(default_factory=TextConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
     session_name: str = ""
 
