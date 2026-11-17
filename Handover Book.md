@@ -30,34 +30,50 @@
 - 多引擎 ASR + 词表纠错，XSC 暗语词表 194 校名 / 123 术语 / 247 暗语 / 51 纠错
 - ASR 质量治理：幻觉拦截 + 分句修复 + `ts_source` 诚信标注（密度双向收敛 ≈5.46-5.47 字/秒）
 - 视频号下载：解密拉流 + GUI 列表/下载/解析 + 系统代理防断网
-- **GUI 子进程黑框闪烁已消除**（本轮，一次自检子进程 6 → 0）
+- GUI 子进程黑框闪烁已消除（S-20261116，一次自检子进程 6 → 0）
 - 环境精简 `.venv-trim`（316MB，启动脚本优先用）
+- **[S-20261117] 后处理从 615s 降到 51–80s（8–12 倍）**。真凶是串行 27 批，
+  不是思考强度；并发 + 退避重试后行数恒为 1048
+- **[S-20261117] 录音改 16k**（1.82MB/分钟，省 67%），消费侧软件重采样，
+  合成信号验证 440Hz → 440.0Hz / RMS 0.2121
+- **[S-20261117] 全流程真实录制 10 分钟跑通**：VAD 自适应、170 校名词表、
+  LLM 纠错 103 行 0 失败、meta 全可追溯
+- **[S-20261117] 产物与音频分目录**：WAV → `recordings/`，
+  md/json/jsonl → `transcripts/`，实际运行验证正确
 
 **🚧 Work In Progress（进行中）**
 
-- 无。本轮收口干净，工作区无未提交改动。
+- 无未提交改动（`git status` 干净）。
 
 **🧱 Active Blockers（当前阻塞）**
 
-- 无硬阻塞。一个未定位的既有问题见 A3 技术债务 DEBT-004。
+- 无硬阻塞。两个未定位/待观察项见 A3：DEBT-004（`tk.tcl` 偶发）、
+  DEBT-005（收尾超时在真实长直播下的实际触发率未知）。
 
 **🗂️ Latest Daily Review（最近一份日复盘）**
 
-- `docs/daily__pipeline_reviews/2026-11-16.md`（首次建立，2026-11-16 23:47）
+- `docs/daily__pipeline_reviews/2026-11-17.md`（S-20261117-1900）
 
 **🚀 Next Prompt Recommendations（下一轮建议 Prompt）**
 
-1. **继续排查 tk.tcl 偶发错误**
-   > "跑 pytest 全量到复现 `tk.tcl` 错误为止，然后在 App() 前后 dump
-   > sys.executable / TCL_LIBRARY / tkinter.Tcl().eval('info library')，
-   > 判断是 pytest 用例顺序还是 Tk 多实例初始化竞态。不要给用例加 skip 掩盖。"
-2. **全仓排查同类初始化顺序 bug**
+1. **验证 transcript_complete 在真实长直播下是否可靠**
+   > "下次真机跑一场 1 小时以上的直播。若出现 RTF 飙高或队列积压，
+   > 确认三件事：①日志有没有打 `[main][warn] 收尾超时`；
+   > ②产物 meta 里 `transcript_complete` 是否为 False；
+   > ③`output/spilled/` 有没有落下未转的片段。
+   > 三处对得上才算修复有效。"
+2. **字段精简（已分析，未实施）**
+   > "删掉 segments 里的 `speaker`（实测 0/1048 非空）和逐句 `ts_source`
+   > （1048/1048 全是常量 estimated，提到 meta 记一次）；
+   > `raw_text` 改为非空才写；json 写出从 `indent=2` 改 `separators`。
+   > 目标 336KB → 132KB。改完必须验证 1048 句一条不少。"
+3. **GUI「录制+转写」路径端到端实测**
+   > "用 GUI 点'录制+转写'跑一次短录制（5 分钟），验证产物落在 transcripts/、
+   > 音频落在 recordings/、'打开逐字稿'能打开。本轮只测了 CLI pipeline，
+   > GUI 那条 `_run_live` 路径还没真实点击验证过。"
+4. **全仓排查同类初始化顺序 bug（自 S-20261116 起挂起）**
    > "检查 wxlive/gui*.py 里所有 `_build_*_tab()` 方法，找出'方法体中段调用了
-   > 依赖后置字段的回调'的模式，列出风险点并给出修复。参考
-   > gui_fetch.py 的 `_ui_queue` 那个 bug。"
-3. **真机长跑验证**
-   > "用真实微信直播场景跑 30 分钟以上，确认 GUI 无任何黑框闪烁，
-   > 同时确认状态条每 60 秒确实在刷新（不是停在旧值）。"
+   > 依赖后置字段的回调'的模式。参考 gui_fetch.py 的 `_ui_queue` 那个 bug。"
 
 ### A3. 🔍 Quality & Gap Analysis（质量缺口）
 
@@ -69,11 +85,15 @@
 
 **当前缺口**
 
-- **真实长跑样本不足**。验证窗口普遍偏短（75 秒、10 轮模拟），
-  真机连续数小时的行为只有回放场景验证过。
+- **真实长跑样本不足**。验证窗口普遍偏短（75 秒、10 分钟），
+  真机连续数小时的行为只有回放场景验证过。**S-20261117 又验证一次这个缺口**：
+  10 分钟录制里就遇到网关 RTF 飙到 3.8 导致收尾截断，2.4 小时场景下概率更高。
 - **GUI 侧测试的环境依赖脆弱**。`tk.tcl` 偶发失败说明 Tk 测试环境不够稳。
 - **`README.md` 承担了双重职责**（GitHub 说明 + 事实上的唯一文档入口），
   但缺少面向"下一个接手者"的状态快照——本 Handover Book 是补充。
+- **[S-20261117 新增] 产物完整性缺自动校验。** 现在要靠人拿
+  `音频时长` vs `转写末句时间` 对比才能发现截断。
+  应加一条自动检查：两者差值 > 阈值就告警。
 
 **🏗️ 技术债务台账**
 
@@ -92,22 +112,56 @@
   - ⚡ Impact: Low。已明确标注，块级锚点可信
   - 💡 Suggested Fix: 不修。实测误差中位 19.3s/最大 59.0s，改成"精确"是伪精度
 
-- **[DEBT-004]** pytest 全量偶发 `TclError: Can't find a usable tk.tcl` | Introduced: 未知（早于本轮） | Status: `Open`
+- **[DEBT-004]** pytest 全量偶发 `TclError: Can't find a usable tk.tcl` | Introduced: 未知（早于 S-20261116） | Status: `Open`
   - 📍 Location: Tk 测试环境（`tests/test_gui_fetch.py` fixture）
   - ⚡ Impact: Low（不影响产品，只影响 CI 稳定性）。约 1/3 概率 1 个用例失败
-  - 💡 Suggested Fix: 见 A2 下一轮 Prompt #1。**注意：不要用 skip 掩盖**
+  - 💡 Suggested Fix: 单独开一轮专查。**注意：不要用 skip 掩盖**
+  - 🗓️ S-20261117 复查：**仍未定位**。本轮三种结果都出现过
+    （`277 passed,1 error` / `292 passed,1 error` / `293 passed`）。
+
+- **[DEBT-005]** 收尾超时的实际触发率未知 | Introduced: S-20261117 | Status: `Open`
+  - 📍 Location: `wxlive/pipeline.py`（`drain_timeout` / `transcript_complete`）
+  - ⚡ Impact: Medium。已知 10 分钟测试里会触发；真实 1–2.4 小时场景未测
+  - 💡 Suggested Fix: 收集 2–3 次真实长场次的 `meta.transcript_complete`，
+    若频繁为 False 则需要更激进的方案（如录制结束自动排队补转）
+
+- **[DEBT-006]** 看门狗只检测 stream 存活，不检测"活着但静音" | Introduced: S-20261117 | Status: `Open`（**有意不改**）
+  - 📍 Location: `wxlive/audio_capture.py::_guard_loop`
+  - ⚡ Impact: Medium。微信暂停/切设备时不会自动重连，只能靠静音自动停止兜底
+  - 💡 Suggested Fix: **先不改**。直播有正常静默期（念评论/喝水/看弹幕），
+    贸然重连会打断正常录制。现在有 `stop_reason` 可归因，
+    先收集 2–3 次真实 stop_reason 再决定
+
+- **[DEBT-007]** 字段冗余未清理 | Introduced: S-20261117 | Status: `Open`
+  - 📍 Location: `wxlive/session.py::add_segments`
+  - ⚡ Impact: Low。`speaker` 0/1048 非空、`ts_source` 全为常量；
+    json 336KB 可降到 132KB
+  - 💡 Suggested Fix: 删 `speaker`、`ts_source` 提 meta、`raw_text` 非空才写、
+    json 去 `indent=2`。**改完必须验证 1048 句一条不少**
+
+- **[DEBT-008]** `_run_live`（GUI 录制+转写）缺端到端实测 | Introduced: S-20261117 | Status: `Open`
+  - 📍 Location: `wxlive/gui.py::_run_live`
+  - ⚡ Impact: Medium。`audio_dir` 修复对它有效，但未经真实点击验证
+  - 💡 Suggested Fix: GUI 点一次 5 分钟录制，确认产物落点与"打开逐字稿"
 
 ### A4. 📊 Skill Dashboard（效用仪表板）
 
 | Skill 名称 | 累计触发 | 用户满意 | 用户纠正 | 效用评分 |
 |---|---|---|---|---|
 | king-workstyle | 多次（跨会话） | — | — | ⭐⭐⭐⭐⭐ |
-| project-save | 1 | — | — | — |
+| project-save | 2 | — | — | — |
 | wechat-live-recorder | 多次 | — | — | ⭐⭐⭐⭐⭐ |
 | windows-audio-capture | 多次 | — | — | ⭐⭐⭐⭐⭐ |
 | tkinter-gui-testing | 多次 | — | — | ⭐⭐⭐⭐⭐ |
+| herdr | 2（S-20261117 两次派工） | — | — | ⭐⭐⭐⭐ |
 
 > 本轮未触发的 Skill 保持空白由后续 session 补齐。满意度需用户显式反馈后才计分，不自行判定。
+>
+> **herdr 评四星的理由**：两次派工都一次做对（4 项改动 / 并发改造），
+> 且主动报告了自己测出的数字比预期差 —— 这是诚实的。
+> 但**它的端到端验证只跑 1 次，不能替代多次交叉验证**：
+> S-20261117 的失败批问题就是复跑才发现的。
+> → 验收惯例：**agent 的验证结果必须由我独立复跑一次才算数。**
 
 ### A5. 🧪 Experiment Log（实验日志）
 
@@ -118,6 +172,19 @@
 | 23:20 | — | 子进程 `sleep 1.2s` 后再枚举 + 改用 `GetConsoleWindow()` | **成功**：三组对照精确复现差异（python.exe/0 → False；pythonw/0 → True；pythonw/no-window → False） | keep |
 | 23:28 | — | 修复候选：给 `reg query` 加 `CREATE_NO_WINDOW` 即可 | **不彻底**：止住闪烁但仍每分钟起 6 个子进程，耗时 180ms | discard |
 | 23:30 | — | 修复方案：改 `winreg` 直读 + 统一 `winproc` 封装 | **采纳**：6 → 0 子进程，180ms → 0.94ms，且全部调用点收编 | keep |
+| 11:20 | — | 思考强度：直接信 `reasoning_effort="medium"` 生效 | **假象**：magpie 返回 200 但档位非法，两次跑 33.7s/63.6s 不稳；`max` 直接 403 | discard |
+| 11:25 | — | 思考强度：三档各跑 40 行做逐行 diff | **成功**：low 改对 2 行 > medium/high 各 1 行 → 退回 low | keep |
+| 12:40 | — | 格式压缩：各格式转写一次算相似度（86.6–92.1%） | **不可用**：没测 A/A 基线，噪声 ±3.8% 淹没差异（FAIL-004） | discard |
+| 13:00 | — | 格式压缩：同格式跑 6 次 + 格式 A×B 交叉 36 对 | **成功**：10 组全在 ±1pp 内 → 证明格式差异测不出来 | keep |
+| 14:00 | — | 格式选型：按体积最小选 Opus-24k（3%） | **否决**：崩溃后丢约 1 秒，直播最怕丢结论那句 | discard |
+| 14:05 | — | 格式选型：FLAC（无损） | **否决**：崩溃后 ffprobe duration=N/A，彻底损坏 | discard |
+| 14:10 | — | 格式选型：16k WAV（21%） | **采纳**：无损 + 崩溃 30s 完整可读 + 省 67% | keep |
+| 15:00 | — | 录制端直接以 16k 打开 WASAPI | **失败**：`[Errno -9997]`，只能原生率打开 | discard |
+| 15:05 | — | 消费侧 `StreamResampler` 软件重采样 | **采纳**：0.050ms/块，SNR 181dB，440Hz→440.0Hz 验证通过 | keep |
+| 15:40 | — | 用 PowerShell 播放器播测试音验证采集 | **假阴性**：录到自己 `[console]::beep` 的 523Hz（FAIL-005） | discard |
+| 15:45 | — | 合成信号直接走代码路径 | **成功**：绕开不确定的播放端 | keep |
+| 17:00 | — | 全流程实测：看到 md/jsonl 正常即认为跑通 | **错判**：音频 592s 而转写只到 404.9s，json 根本未生成 | discard |
+| 17:05 | — | 补转 405s 之后 + 重建完整产物 | **成功**：证实音频完好，问题在收尾被截断 | keep |
 
 ---
 
@@ -149,11 +216,82 @@
   - ❌ Alternatives: 只报不改（问题会被交接遗漏，而且"防断网"是 DEC 里明确要的中心能力，不能是假的）
   - 📌 Status: `Active`
 
+- **[DEC-005] 思考强度退回 `low`，不在 deepseek 上塞非法档位** | Session: S-20261117-1900 | 2026-11-17
+  - 🔍 Context: 用户把 `reasoning_effort` 改成 `medium` 想试效果，但 magpie 调用日志显示仍走 low
+  - ✅ Decision: 退回 `low`。`/v1/models` 声明 `group/deepseek` 只有 `["low","high","max"]`，
+    **没有 medium**；实测传 medium 返回 200 但行为不稳（33.7s/63.6s，reasoning 2751/5559），
+    传 max 直接 403。质量对比 40 行：low 改对 2 行、medium/high 各 1 行，**low 反而更准**
+  - ❌ Alternatives: ①继续用 medium（行为不保证，且更慢）；②换 `group/hydrogen`
+    （支持真 medium/xhigh，但 ASR 已在用它，混用会争抢）——若要更强推理应换模型而非塞非法档
+  - 📌 Status: `Active`。**判断档位合法性只看 `/v1/models` 的 `reasoning_levels`，
+    不要凭"传了不报错"当支持**
+
+- **[DEC-006] 后处理慢的根因是串行批处理，用并发 + 退避重试解决** | Session: S-20261117-1900 | 2026-11-17
+  - 🔍 Context: 用户问"22 分钟纠错是否必须"。时间线证明 10 分 15 秒全在后处理
+    （1048 行 ÷ 40 = 27 批串行 HTTP）
+  - ✅ Decision: `ThreadPoolExecutor` 并发（最终 12 路）+ `retry_delays=(1.0,4.0)` 退避重试
+  - ❌ Alternatives: ①减少行数/合并批（会降低纠错精度）；②换更快模型（质量未知）；
+    ③只并发不重试（实测会漏纠 4–12%）
+  - 📌 Status: `Active`。实测 615s → **51–80s**，行数恒 1048
+  - ⚠️ 关键教训：**并发改造会掩盖失败率问题**。原逻辑把网关瞬时抖动
+    （返回 23 行/40、HTTP 502/403）当永久失败整批丢弃，
+    表现是"纠错处数变少"而非报错。**改性能前必须先测失败率**
+
+- **[DEC-007] ASR 并发从 4 提到 8（推翻代码里的旧注释）** | Session: S-20261117-1900 | 2026-11-17
+  - 🔍 Context: `gemini_asr.py` 原注释写「实测 4 路最优（2.04x），**8 路反而因争抢回落到 1.59x**」
+  - ✅ Decision: 复测后提到 **8 路**。真实录音 2400s / 22 块，每档跑 2 次：
+    4 路 69.2s / **8 路 37.2s（1.86x）** / 12 路 37.5s（1.85x）
+  - ❌ Alternatives: 保持 4 路（慢一倍）；提到 12 路（无额外收益，块数不够跑满）
+  - 📌 Status: `Active`
+  - ⚠️ 教训：**代码注释里的"实测数据"会过期。** 那条注释可能是旧网关状态下的结论。
+    不能因为"注释说测过"就跳过复测。短音频（11 块）测不准，必须用长音频测
+
+- **[DEC-008] 录音改 16k，采用 16k WAV 而非 Opus/FLAC** | Session: S-20261117-1900 | 2026-11-17
+  - 🔍 Context: 用户问能否改 mp3/ogg 省空间。四层验证（确定性测量/噪声基线/交叉比对/工程可行性）
+  - ✅ Decision: 改 **16k WAV**（省 67%）
+  - ❌ Alternatives 及否决理由:
+    - **Opus-24k（3% 体积）**：崩溃后丢最后约 1 秒。直播最怕丢的正是结论那一句
+    - **FLAC**：**崩溃后彻底损坏**（ffprobe duration=N/A），长度写在头部未 close 就丢
+    - 保持 48k：上传前一律重采样 16k，48k 从未进模型，纯冗余
+  - 📌 Status: `Active`。实测 1.82MB/分钟，18MB / 9.9min
+  - ⚠️ **硬约束**：WASAPI loopback **无法直接以 16k 打开**
+    （实测 16000/32000/44100 全抛 `[Errno -9997]`），只能软件重采样，
+    且必须放消费侧而非 PortAudio 回调
+
+- **[DEC-009] 音频与文字产物分目录（Session.audio_dir）** | Session: S-20261117-1900 | 2026-11-17
+  - 🔍 Context: 体检发现 `pipeline.py` 给 Session 传了 `RECORDINGS_DIR`，
+    而 cli/gui/auto_pipeline 都传 `TRANSCRIPTS_DIR`。后果：产物混进 recordings/、
+    GUI「打开逐字稿」指向不存在的文件
+  - ✅ Decision: `Session` 新增 `audio_dir` 参数（默认等于 `base_dir` 保持兼容）；
+    pipeline 改 `TRANSCRIPTS_DIR + audio_dir=RECORDINGS_DIR`
+  - ❌ Alternatives: ①录完把 wav 移过去（多一步磁盘操作，且崩溃时两处都不完整）；
+    ②全部塞 transcripts/（音频和文字混在一起，语义混乱）
+  - 📌 Status: `Active`。实测产物进 transcripts/、音频进 recordings/，向后兼容
+
+- **[DEC-010] 收尾超时不能静默，必须留下"未完成"标记** | Session: S-20261117-1900 | 2026-11-17
+  - 🔍 Context: 10 分钟实测中网关 RTF 从 0.35 飙到 3.8，收尾时队列堆到 9，
+    进程被外部超时 kill → 音频 592s 但转写只到 404.9s，json 完全没生成，
+    **而 md/jsonl 看起来正常**
+  - ✅ Decision: `drain_timeout` 600 → 可配置 900；join 超时后 warn +
+    `meta.transcript_complete=False` + 结束时打印补转命令；队列 ≥5 提前 warn
+  - ❌ Alternatives: ①无限等（进程永远不退出）；②直接 kill ASR 线程
+    （线程无法安全终止，且会丢更多）
+  - 📌 Status: `Active`
+  - ⚠️ 教训：**这类问题最危险——产物看起来正常，只有对比音频时长才能发现少内容。**
+
 ### B2. 🎨 Style DNA（用户偏好档案）
 
 - `[S-20261116-2345]` **用户先提出自己的因果假设，但允许被推翻。** 本轮他说"是不是 GOI 调用了什么工具"，实际是工具在轮询自己的状态条。他接受纠正，关注点在"能不能优化"。→ 不要因为用户给了假设就顺着编解释，要独立验证。
 - `[S-20261116-2345]` **对"隔段时间闪一下"这类间歇现象，用户要的是根因 + 定量前后对比**，不是"已经修好了"的一句话。
 - `[S-20261116-2345]` 说"复盘总结沉淀经验教训"时，期待的是**带证据路径的结构化档案**，而不是聊天里的一段总结。
+- `[S-20261117-1900]` **会为"测不出来的差异"主动踩刹车。** 格式压缩能省 97% 体积，
+  但他说"验不出来先不改"——**判据立不住就不动**，这比他自己的直觉更优先。
+- `[S-20261117-1900]` **要求把"验证流程设计"本身当作交付物。**
+  不是说"跑个对比看看"，而是要设计出能穿透噪声的实验（四层验证法）。
+- `[S-20261117-1900]` **会追问"有没有必要"而不只是"能不能"。**
+  格式压缩一问里明确问了"多维度因素下你觉得有价值这么做吗"——期待的是判断，不是执行。
+- `[S-20261117-1900]` **给指令极简，且信任执行。** "可以"、"去完善项目"、
+  "改 16k 吧"——两三个字就放手，不逐步确认。
 - `[跨会话]` 偏好 GUI 操作技术工作流；技术讨论到代码/测试/系统配置级别。
 - `[跨会话]` 喜欢"双线赛马"——同一任务并行跑多个 AI 再对擂取优。
 - `[跨会话]` 说"go ahead"时期待直接从评审进入实现 + 配套回归测试。
@@ -175,6 +313,40 @@
   - 💥 Failure Reason: 定量的角度看这仍不对——每分钟仍起 6 个子进程、耗 180ms 去做一件 0.94ms 能完成的事。本质是"轮询方式选错了"，不是"调用姿势不对"
   - 💡 Lesson: **修到"现象消失"不够，要修到"这件事本来就不该这么做"。** 问一句"这个操作有没有零成本的替代实现"
 
+- **[FAIL-004] 格式压缩前后对比只跑一次，差点得出错误结论** | Session: S-20261117-1900 | 2026-11-17
+  - 🔧 Approach: 各格式转写一次，与原始 48k 的文本算相似度，得到 86.6–92.1%，看着"压缩掉了点质量"
+  - 💥 Failure Reason: **没有先测 A/A 基线。** 补测后同一份无损音频连跑 5–6 次，
+    组内两两相似度只有 92.14%–97.65%（均值 95.42%）—— **ASR 自身随机性比任何格式差异都大**。
+    原测法的 86.6–92.1% 完全落在噪声里，既证明不了"掉了"也证明不了"没掉"
+  - 💡 Lesson: **测 A/B 差异前必须先测 A/A 基线。**
+    和 FAIL-001/002 是同一类错误：验证一条链路前，必须先量化噪声/
+    确认激励源能体现差异
+
+- **[FAIL-005] 用 PowerShell 播放器播测试音，录到的是自己的蜂鸣声** | Session: S-20261117-1900 | 2026-11-17
+  - 🔧 Approach: 用 `MediaPlayer` / `SoundPlayer` 播 440Hz WAV，同时用 `LoopbackRecorder` 采集
+  - 💥 Failure Reason: 录到 RMS=0.027（测试音本身 0.212，真实直播 0.145），
+    主频 523Hz 而非 440Hz —— **那是我自己先前 `[console]::beep` 的蜂鸣声**，
+    测试音根本没通过 loopback 播出来。差点误判"重采样坏了"
+  - 💡 Lesson: 这是**第三次**踩同类坑（前两次：`Start-Process` 播 WAV 没发声、
+    探针子进程用 `pythonw`）。这台机器上 PowerShell 播放器对 WASAPI loopback 不可靠。
+    **可靠做法是绕过播放，直接用合成信号走代码路径** ——
+    能绕开不确定环节时，绕开比"确保它正确"更省事
+
+- **[FAIL-006] 静态扫描 import 出现次数，误判"未使用的导入"** | Session: S-20261117-1900 | 2026-11-17
+  - 🔧 Approach: 体检时用 grep 数 `timedelta` 等符号出现次数，判为未使用导入，写进体检报告
+  - 💥 Failure Reason: 复查发现 `time` / `timedelta` / `np` / `sf` **四个全在用**，
+    `timedelta` 用于 `_audio_duration` 的类型注解 —— 类型注解也算使用
+  - 💡 Lesson: **"出现次数少" ≠ "未使用"。** 静态扫描的结论必须人工复核才能写进报告。
+    已在体检报告里明确更正，没让错误待办留在项目里
+
+- **[FAIL-007] ASR 统计口径没考虑"降级不报错"** | Session: S-20261117-1900 | 2026-11-17
+  - 🔧 Approach: 依赖 `FallbackEngine` 的 `primary_ok` / `primary_fail` 判断转写健康度
+  - 💥 Failure Reason: 90 秒短测时 4 个片段**全部落占位符**，
+    但 stats 显示 `primary_ok=4 / primary_fail=0`。根因是 `gemini_asr` 内部
+    把「整块失败」吞成占位符**返回值**（不抛异常），上层看到的是"调用成功"
+  - 💡 Lesson: **凡是"降级不报错"的设计，都要单独检查统计口径是否还真实。**
+    已加 `failed_chunk_count` / `has_content_loss` 字段修正
+
 ### B4. 🏗️ Technical Debt Register
 
 见 Zone A3 的台账（DEBT-001 ~ DEBT-004）。此处不重复，保持单一事实来源。
@@ -182,6 +354,102 @@
 ---
 
 ## Zone C — Session Archive（冻结区，新快照在最上方）
+
+---
+
+### 📸 Session Snapshot: S-20261117-1900 | v0.2.0 | 2026-11-17 19:00
+
+**Session Summary**: 用户提了四个问题（思考强度档位 / 音频格式 / 字段冗余 / 纠错耗时），
+随后追加「设计验证流程跑格式对比」「改 16k」「完善项目」「跑一次全流程实测」「复盘」。
+
+三个最有价值的发现都不是从代码里读出来的，而是实测逼出来的：
+
+1. **22 分钟纠错耗时的真凶是串行批处理**（27 批），不是思考强度。
+   并发 + 退避重试后 **615s → 51–80s**。顺带发现原逻辑把网关瞬时抖动
+   当永久失败，导致 **4–12% 句子静默漏纠**。
+2. **格式压缩"省 97%"是个陷阱**。四层验证后发现 ASR 自身噪声（±3.8%）
+   比任何格式差异都大；而崩溃恢复测试中 **FLAC 彻底损坏、Opus 丢约 1 秒**。
+   结论是**不改压缩格式**，改 16k WAV（无损、崩溃安全、省 67%）。
+3. **全流程实测暴露「产物看起来正常但少了 3 分钟」**。网关 RTF 飙到 3.8 时
+   收尾被截断，json 完全没生成，而 md/jsonl 看起来分布正常。
+
+**Delta from Previous Save (增量变化)**
+
+- 📁 New files:
+  - `tests/test_output_layout.py`（11 条：分目录/兼容性/收尾落盘/停止原因/统计真实性）
+  - `tests/test_lexicon_path.py`（4 条：路径归一化）
+  - `docs/思考强度与后处理耗时实测.md`（436 行，四层验证法完整数据）
+  - `docs/项目体检-2026-11-17.md`（165 行，含 7 项发现 + 修复记录）
+  - `docs/全流程实测-2026-11-17.md`（130 行，10 分钟真实录制数据）
+  - `docs/daily__pipeline_reviews/2026-11-17.md`
+- ✏️ Modified files:
+  - `wxlive/postprocess.py`（并发 + 退避重试 + `out_stats` 可追溯）
+  - `wxlive/gemini_asr.py`（workers 4→8，推翻旧注释）
+  - `wxlive/audio_capture.py`（`out_rate` 消费侧重采样 + `stop(reason=)`）
+  - `wxlive/pipeline.py`（产物目录修正 + `_enqueue_tail` + `drain_timeout`）
+  - `wxlive/session.py`（`audio_dir` 支持）
+  - `wxlive/engine.py`（`failed_chunk_count` / `has_content_loss`）
+  - `wxlive/config.py` / `userconfig.py`（`TextConfig` + 词表路径归一化）
+  - `record_only.py` / `wxlive/gui.py` / `wxlive/cli.py`（16k + 停止原因）
+- 🗑️ Deleted: `output/recordings/20261116_100221_wechat_live_real.wav`（16.5MB，
+  零引用测试录音，用户批准）；6 个错位产物迁移到 `output/transcripts/`
+
+**📊 Metrics**
+
+| 指标 | 变化 |
+|---|---|
+| 测试数 | 277 → **293 passed** |
+| 后处理耗时（1048 行） | 615s → **51–80s**（8–12x） |
+| 录音体积 | 5.76 → **1.82 MB/分钟**（-67%） |
+| ASR 并发 | 4 → 8 路（1.86x） |
+| 提交数 | 10 个（`3260cab` → `6969cd4`） |
+
+**⚠️ Failed Attempts This Session**
+
+7 条，见 Zone B3 的 FAIL-004 ~ FAIL-007（本轮新增 4 条）。
+其中 3 条是同一类错误：**验证链路前没有先量化噪声/确认激励源**。
+
+**📋 Session Reflect Report**
+
+**R1 — 成功模式（Success Patterns）**
+
+- **`king-workstyle` 的"证据优先"规则在本轮价值最大。** 格式压缩那个任务，
+  如果直接按"省 97% 就改"执行，会引入「崩溃丢最后 1 秒」的故障模式而不自知。
+  正是因为坚持"先测噪声基线"，才发现 ASR 噪声比格式差异还大，
+  从而得出"测不出来就不该改"的正确结论。
+- **`wechat-live-recorder` 技能的"已确认实测结论"表避免了重复劳动。**
+  多次想重新验证"2 倍速是否影响质量"时被这张表拦住，直接引用既有结论。
+
+**R2 — 边界案例（Edge Cases）**
+
+- **「跑一次全流程」这个要求让我纠结过要不要报告失败。**
+  第一次跑 10 分钟，进程退出码 1、转写少 3 分钟、json 没生成。
+  当时有两个选择：①报告"跑通了"（因为音频完整、md 有内容）；
+  ②报告真实缺陷。选了 ②，并定位到根因是外部超时 + 收尾无告警。
+  **这个选择是对的还是靠"用户要求实测"这个外部约束推着走的** ——
+  如果用户只说"跑一下看看效果"，很可能就滑过去了。
+- **用户在格式压缩上明确问了"有没有价值做"，而我第一版分析给的是"技术可行"。**
+  这两者不是一回事：可行 ≠ 值得。补了工程维度（崩溃恢复）才回答问题。
+
+**R3 — 改进信号（Improvement Signals）**
+
+| 规则 | 本 Session 是否应触发 | 是否实际执行 |
+|---|---|---|
+| A1 先述计划 | Y（四个任务） | Y（先给 plan + AskUserQuestion） |
+| A4 先问后做 | Y（格式策略/字段兼容/落地范围/派活方式） | Y |
+| B1 强制核查 | Y（多处） | **部分 Y** —— 见下 |
+
+**漏触发项**：`B1 强制核查` 在"体检报告写 session.py 有未使用导入"时没做到。
+用 grep 数出现次数就下了结论，没做人工复核 → FAIL-006。
+这是本轮唯一的"未核查就下结论"。
+
+**需要细化的规则**：现有规则没覆盖「静态扫描结论的可信度」这一类 ——
+建议加一条：**任何基于 grep / 正则的自动化结论，写进报告前必须至少抽查一处原文。**
+
+**Skill 触发精度问题**：`herdr` 派工两次都成功（一次做对 4 项改动），
+但**它的端到端验证只跑 1 次，不能替代我的多次交叉验证** ——
+本轮失败批问题就是我复跑才发现的。这条应写进 herdr 派工的验收惯例：
+**要求 agent 的验证结果，必须由我独立复跑一次才算数。**
 
 ---
 
