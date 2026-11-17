@@ -84,9 +84,16 @@ class AsrConfig:
     gemini_model: str = "group/hydrogen"
     gemini_endpoint: str = "http://127.0.0.1:3425/v1/chat/completions"
     gemini_api_key: str = "magpie-alma"
-    # Gemini 并发路数。实测 4 路加速 2.6x，8 路因网关争抢反而回落到 1.6x。
-    # 1 = 串行（旧行为）。只对云端引擎生效，本地 whisper 走 CPU 并发无益。
-    gemini_workers: int = 4
+    # Gemini 并发路数。只对云端引擎生效，本地 whisper 走 CPU 并发无益。
+    #
+    # 实测（2026-11-17 复测，真实录音 2400s / 22 块，每档跑 2 次）：
+    #   4 路 69.2s / 8 路 37.2s（1.86x）/ 12 路 37.5s（1.85x）
+    # 8 路是拐点，12 路无额外收益。早期注释写「8 路因争抢回落到 1.6x」已被复测否定。
+    #
+    # 注意：af5e530 那次「默认 4 → 8」只改了 cli.py 的 argparse 默认值，
+    # 这里长期停留在 4，导致 GUI / Config() 路径（非 CLI）实际只跑 4 路。
+    # 现在统一到 8，避免两条路径行为不一致。
+    gemini_workers: int = 8
 
     # faster-whisper 模型：tiny/base/small/medium/large-v3
     # 中文场景 CPU 实时性优先选 small；有 GPU 可用 medium/large-v3
