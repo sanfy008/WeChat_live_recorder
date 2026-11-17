@@ -202,7 +202,8 @@ def cmd_record(args: argparse.Namespace) -> int:
     from .pipeline import run_pipeline
 
     cfg = Config(
-        audio=AudioConfig(device_hint=args.device or ""),
+        audio=AudioConfig(device_hint=args.device or "",
+                          sample_rate=getattr(args, "sample_rate", 16000)),
         vad=VadConfig(),
         asr=AsrConfig(
             engine=args.engine,
@@ -442,6 +443,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("record", help="开始录制并实时转写")
     sp.add_argument("--minutes", type=float, default=0, help="录制时长（分钟），0 表示一直录")
     sp.add_argument("--device", default="", help="设备名关键字，如 Realtek")
+    sp.add_argument("--sample-rate", type=int, default=16000,
+                    help="录制 WAV 的输出采样率（默认 16000；WASAPI 本身只能按原生率采集，"
+                         "这里在消费侧重采样）")
     sp.add_argument("--name", default="", help="会话名，会体现在文件名里")
     add_asr_opts(sp)
     sp.set_defaults(func=cmd_record)

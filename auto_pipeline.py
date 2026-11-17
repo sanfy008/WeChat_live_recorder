@@ -86,7 +86,12 @@ def wait_for_recording() -> Path | None:
 
         # 判定结束：进程不在 且 文件 60 秒无变化
         if not alive and time.time() - stable_since > 60:
-            secs = max(0, (size - 44)) / (48000 * 2)
+            # 采样率从文件头读，别硬编码 48000 —— 新录制是 16k，旧文件是 48k。
+            try:
+                sr = int(sf.info(str(target)).samplerate) or 48000
+            except Exception:
+                sr = 48000
+            secs = max(0, (size - 44)) / (sr * 2)
             log(f"✓ 录制结束：{target.name}  {size/1024/1024:.0f} MB  约 {secs/60:.1f} 分钟")
             return target
 

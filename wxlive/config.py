@@ -34,7 +34,9 @@ def validate_reasoning_effort(value: str | None) -> str:
 class AudioConfig:
     """采集参数。"""
 
-    # 目标采样率。ASR 统一用 16k，采集端直接降采样可省一半 IO。
+    # 录制输出的目标采样率。WASAPI loopback 只能按设备原生率（常见 48k）打开，
+    # 所以采集回调里保持原生率，在消费侧（LoopbackRecorder.read）重采样到该值。
+    # ASR 统一用 16k，16k WAV 体积是 48k 的 1/3，且崩溃后仍完整可读。
     sample_rate: int = 16000
     # 采集块大小（秒）。0.1s = 1600 samples，兼顾延迟与回调开销。
     chunk_seconds: float = 0.1

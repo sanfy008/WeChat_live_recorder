@@ -114,10 +114,14 @@ class Pipeline:
             device_hint=cfg.audio.device_hint,
             chunk_seconds=cfg.audio.chunk_seconds,
             mono=cfg.audio.mono,
+            out_rate=cfg.audio.sample_rate,
         )
-        # 设备原生采样率 → 16kHz。不做这一步，ASR 会把音频当慢放处理而编造内容。
+        # 重采样已在采集端（消费侧）完成，这里只是拿 recorder 的实际输出率
+        # 构造一遍，相等时 StreamResampler 走 passthrough —— 保证只重采样一次。
+        # 若两边相等却仍按 device.rate 构造，会把 16k 当 48k 再转一遍：
+        # 时长变 1/3、频率变 3 倍，ASR 输出全是幻觉。
         self.resampler = StreamResampler(
-            in_rate=self.recorder.device.rate, out_rate=cfg.audio.sample_rate
+            in_rate=self.recorder.out_rate, out_rate=cfg.audio.sample_rate
         )
         # 引擎在这里构造，支持本地/云端/自动降级三种模式
         self.transcriber = build_engine(cfg)
@@ -125,7 +129,7 @@ class Pipeline:
         from .config import RECORDINGS_DIR, TRANSCRIPTS_DIR
 
         self.session = Session(RECORDINGS_DIR, name=cfg.session_name,
-                               sample_rate=self.recorder.device.rate)
+                               sample_rate=self.recorder.out_rate)
         # 逐字稿放单独目录（软链/复制关系在 close 时处理）
         self._transcripts_dir = TRANSCRIPTS_DIR
 
@@ -202,10 +206,12 @@ class Pipeline:
                     continue
 
                 n_chunks += 1
-                # 原始音频立即落盘：即使 ASR 排不上队，声音不会丢
+                # 音频立即落盘：即使 ASR 排不上队，声音不会丢。
+                # chunk 已经是 recorder.out_rate（默认 16k），与 Session 一致。
                 self.session.write_audio(chunk)
 
-                # 送 ASR 前必须转成 16kHz（与会话音频分开，原始 WAV 保持设备原采样率）
+                # 兜底：recorder.out_rate 与目标率不同时这里才真正转换，
+                # 相同时是 passthrough（不会二次重采样）。
                 resampled = self.resampler.process(chunk)
                 for seg in self.segmenter.feed(resampled):
                     n_segments += 1
@@ -232,7 +238,24 @@ class Pipeline:
         except KeyboardInterrupt:
             print("\n[main] 收到中断信号，正在收尾…")
         finally:
-            # 收尾顺序很重要：先停采集 → 再 flush 残留 → 最后等 ASR 队列排空
+            # 收尾顺序很重要：先停采集（此后不会再有新块）→ 补写重采样器
+            # 冲出的尾部 → 再 flush 残留 → 最后等 ASR 队列排空
+            self.recorder.stop()
+            # stop() 会 flush 重采样器，把最后几十毫秒挂到 read() 的 _final 上；
+            # 主循环已经退出，这里主动 drain 出来补进 WAV，否则结尾会丢一截。
+            while True:
+                c = self.recorder.read(timeout=0.0)
+                if c is None:
+                    break
+                if len(c):
+                    self.session.write_audio(c)
+                    for seg in self.segmenter.feed(self.resampler.process(c)):
+                        n_segments += 1
+                        try:
+                            self._asr_queue.put(seg, timeout=5)
+                        except queue.Full:
+                            pass
+
             leftover = self.resampler.flush()
             if len(leftover):
                 for seg in self.segmenter.feed(leftover):

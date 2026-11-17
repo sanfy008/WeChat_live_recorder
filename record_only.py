@@ -30,13 +30,17 @@ def main() -> int:
     ap.add_argument("--device", default="", help="设备名关键字")
     ap.add_argument("--silence-stop", type=float, default=0,
                     help="连续静音超过 N 秒自动停止（0=不启用）。回放播完可以用它自动收工")
+    ap.add_argument("--sample-rate", type=int, default=16000,
+                    help="输出采样率（默认 16000，ASR 直接可吃；体积是 48k 的 1/3）")
     args = ap.parse_args()
 
     ensure_dirs()
-    rec = LoopbackRecorder(device_hint=args.device, chunk_seconds=0.1)
+    # WASAPI loopback 只能按设备原生率打开，降采样在 recorder 消费侧完成。
+    rec = LoopbackRecorder(device_hint=args.device, chunk_seconds=0.1,
+                           out_rate=args.sample_rate)
     rec.start()
 
-    sr = rec.device.rate
+    sr = rec.out_rate
     stamp = time.strftime("%Y%m%d_%H%M%S")
     safe = "".join(c for c in (args.name or "rec") if c.isalnum() or c in "-_") or "rec"
     out = RECORDINGS_DIR / f"{stamp}_{safe}.wav"
@@ -87,8 +91,18 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\n[record] 收到中断，正在收尾…")
     finally:
-        wav.close()
+        # 先停采集再 drain：stop() 会 flush 重采样器，最后几十毫秒挂到 read() 上，
+        # 不 drain 出来就会丢在 WAV 结尾。
         rec.stop()
+        while True:
+            tail = rec.read(timeout=0.0)
+            if tail is None:
+                break
+            if len(tail):
+                wav.write(np.clip(tail, -1.0, 1.0))
+                total_written += len(tail)
+                peak = max(peak, float(np.max(np.abs(tail))))
+        wav.close()
 
     dur = total_written / sr
     mb = total_written * 2 / 1024 / 1024

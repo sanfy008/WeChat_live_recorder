@@ -733,9 +733,12 @@ class App(FetchTabMixin, tk.Tk):
         from .audio_capture import LoopbackRecorder
 
         RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
-        rec = LoopbackRecorder(device_hint=device, chunk_seconds=0.1)
+        # WASAPI 只能按原生率打开，降采样在 recorder 消费侧完成（默认 16k，
+        # 体积省 67%，且 ASR 直接可用）。
+        rec = LoopbackRecorder(device_hint=device, chunk_seconds=0.1,
+                               out_rate=self.cfg.audio.sample_rate)
         rec.start()
-        sr = rec.device.rate
+        sr = rec.out_rate
         stamp = time.strftime("%Y%m%d_%H%M%S")
         safe = "".join(c for c in (name or "rec") if c.isalnum() or c in "-_") or "rec"
         out = RECORDINGS_DIR / f"{stamp}_{safe}.wav"
@@ -765,8 +768,18 @@ class App(FetchTabMixin, tk.Tk):
                     break
                 self.after(0, lambda e=el, w=written, p=peak: self._update_rec_status(e, w, p))
         finally:
-            wav.close()
+            # 先停再 drain：stop() flush 的尾部样本挂在 read() 上，
+            # 不取出来会在 WAV 结尾丢几十毫秒。
             rec.stop()
+            while True:
+                tail = rec.read(timeout=0.0)
+                if tail is None:
+                    break
+                if len(tail):
+                    wav.write(np.clip(tail, -1.0, 1.0))
+                    written += len(tail)
+                    peak = max(peak, float(np.max(np.abs(tail))))
+            wav.close()
 
         self.last_output = out
         self._log(f"[录制] 完成 {written/sr/60:.1f} 分钟, {written*2/1024/1024:.0f} MB")

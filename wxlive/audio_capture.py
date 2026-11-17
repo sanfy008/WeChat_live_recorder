@@ -1,8 +1,10 @@
 """WASAPI loopback 音频采集。
 
 设计要点：
-1. 以设备原生采样率采集，不做任何重采样 —— 避免质量损失，
-   重采样交给 faster-whisper 内部的 ffmpeg/av 完成（质量更好）。
+1. **打开**流必须用设备原生采样率（WASAPI loopback 不接受别的值，
+   实测传 16000/32000/44100 全部抛 -9997）。需要降采样时用 out_rate，
+   在**消费侧**（read()）用 StreamResampler 转换 —— 不在 PortAudio 回调里做，
+   回调里做重计算会有爆音/丢块风险。
 2. 采集在独立线程的回调里进行，回调内只做最小动作（追加到队列），
    绝不做 IO 或转写，否则会阻塞音频缓冲导致丢帧。
 3. 断流/设备切换时自动重连（对应调研文档里「断流是常态」的教训）。
@@ -18,6 +20,8 @@ from dataclasses import dataclass
 
 import numpy as np
 import pyaudiowpatch as pyaudio
+
+from .resample import StreamResampler
 
 
 @dataclass
@@ -94,7 +98,11 @@ class LoopbackRecorder:
         chunk_seconds: float = 0.1,
         mono: bool = True,
         max_queue_chunks: int = 3000,
+        out_rate: int | None = None,
     ) -> None:
+        """out_rate=None 保持旧行为（输出设备原生采样率）；
+        指定后 read() 返回的块是重采样后的 out_rate。
+        """
         self.device = device or pick_device(device_hint)
         self.chunk_seconds = chunk_seconds
         self.mono = mono
@@ -104,8 +112,44 @@ class LoopbackRecorder:
         self._stream = None
         self._running = False
         self._thread: threading.Thread | None = None
+        self._out_rate = out_rate
+        # frames_per_buffer 必须按原生率算：这是给 PortAudio 的采集参数，
+        # 与输出采样率无关，重采样只改变样本数，不改变时间轴。
         self._frames_per_buffer = int(self.device.rate * chunk_seconds)
         self.dropped_chunks = 0
+
+        self._resampler = self._make_resampler()
+        self._lock = threading.Lock()
+        self._final: list[np.ndarray] = []  # 结束时 flush 出的尾部样本
+        self._eof = False
+        self._stopping = False
+
+    # ---------- 采样率 ----------
+
+    @property
+    def out_rate(self) -> int:
+        """调用方实际会拿到的采样率（未指定 out_rate 时等于设备原生率）。"""
+        return self._out_rate if self._out_rate is not None else self.device.rate
+
+    def _make_resampler(self) -> StreamResampler | None:
+        if self._out_rate is None or self._out_rate == self.device.rate:
+            return None
+        return StreamResampler(self.device.rate, self._out_rate)
+
+    def _process(self, chunk: np.ndarray) -> np.ndarray:
+        rs = self._resampler
+        return chunk if rs is None else rs.process(chunk)
+
+    def _flush_resampler(self) -> np.ndarray:
+        """取出重采样器内部残余样本；幂等，重复调用返回空数组。
+
+        调用方必须持有 self._lock。
+        """
+        rs = self._resampler
+        if rs is None:
+            return np.zeros(0, dtype=np.float32)
+        self._resampler = None
+        return rs.flush()
 
     # ---------- 生命周期 ----------
 
@@ -118,7 +162,8 @@ class LoopbackRecorder:
         self._thread = threading.Thread(target=self._guard_loop, daemon=True, name="loopback-guard")
         self._thread.start()
         print(f"[audio] 开始采集: {self.device.name} @ {self.device.rate}Hz "
-              f"{self.device.channels}ch  块={self.chunk_seconds}s")
+              f"{self.device.channels}ch  块={self.chunk_seconds}s  "
+              f"输出={self.out_rate}Hz")
 
     def _open_stream(self) -> None:
         assert self._pa is not None
@@ -166,9 +211,14 @@ class LoopbackRecorder:
         except Exception:
             pass
         self._stream = None
+        old_rate = self.device.rate
         for attempt in range(5):
             try:
                 self.device = pick_device(self.device.name)
+                if self.device.rate != old_rate and self._out_rate is not None:
+                    # 换到了不同原生率的设备：重建重采样器（旧缓冲里的几十毫秒
+                    # 不追补，重连本身已容忍丢帧）。
+                    self._resampler = self._make_resampler()
                 self._open_stream()
                 print("[audio] 重连成功")
                 return
@@ -177,6 +227,9 @@ class LoopbackRecorder:
                 time.sleep(2)
 
     def stop(self) -> None:
+        if self._stopping:
+            return
+        self._stopping = True
         self._running = False
         try:
             if self._stream is not None:
@@ -186,17 +239,38 @@ class LoopbackRecorder:
             pass
         if self._pa is not None:
             self._pa.terminate()
+        # 注意：这里不能立刻 flush 重采样器 —— 队列里可能还有已采集、
+        # 尚未被 read() 消费的原始块，先 flush 会让它们绕过后面的重采样。
+        # 残余样本由 read() 遇到结束哨兵时统一 flush（见 read）。
+        with self._lock:
+            self._eof = True
         self.queue.put(None)  # 通知消费端结束
         print(f"[audio] 采集停止（丢弃块 {self.dropped_chunks}）")
 
     # ---------- 消费 ----------
 
     def read(self, timeout: float = 0.5) -> np.ndarray | None:
-        """取一个音频块。返回 None 表示采集已结束。"""
+        """取一个音频块（已按 out_rate 重采样）。返回 None 表示采集已结束。"""
+        with self._lock:
+            if self._final:
+                return self._final.pop(0)
+            eof = self._eof
         try:
-            return self.queue.get(timeout=timeout)
+            # 结束后仍有排队未取的原始块：用非阻塞方式取完再返回 None，
+            # 不能因为 _eof 就直接丢队列（stop 前回调已经放进去的音频要算数）。
+            item = self.queue.get_nowait() if eof else self.queue.get(timeout=timeout)
         except queue.Empty:
-            return np.zeros(0, dtype=np.float32)
+            return None if eof else np.zeros(0, dtype=np.float32)
+
+        with self._lock:
+            if item is None:
+                # 兜底 flush：stop() 已 flush 过的话这里返回空。
+                tail = self._flush_resampler()
+                if len(tail):
+                    self._final.append(tail)
+                self._eof = True
+                return self._final.pop(0) if self._final else None
+            return self._process(item)
 
     def __enter__(self):
         self.start()
