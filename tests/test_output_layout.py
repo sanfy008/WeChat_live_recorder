@@ -178,3 +178,95 @@ def test_stop_default_reason_when_not_given() -> None:
     rec = LoopbackRecorder(chunk_seconds=0.1, mono=True, out_rate=16000)
     rec.stop()
     assert rec.stop_reason  # 非空
+
+
+# ---------- 4. 收尾超时必须可发现，不能"看起来正常" ----------
+
+
+def test_drain_timeout_is_configurable_and_generous() -> None:
+    """收尾等待时间必须是可调属性，且不能太小。
+
+    背景（2026-11-17 实测）：10 分钟录制里网关两次 RTF 飙到 3.2/3.8，
+    收尾时队列堆到 9 个片段。若 drain 时间不够，进程会被外部超时截断，
+    json 不生成、转写比音频少 3 分钟，而产物看起来"正常"。
+    """
+    from wxlive.pipeline import Pipeline
+
+    assert hasattr(Pipeline, "drain_timeout")
+    assert Pipeline.drain_timeout >= 600, "收尾等待必须留足余量（抖动能落后几分钟）"
+
+
+def test_transcript_complete_flag_written_to_meta(tmp_path: Path) -> None:
+    """meta.transcript_complete 必须存在：False 表示产物可能缺尾部。"""
+    s = Session(tmp_path, name="flag_test", sample_rate=16000, record_audio=False)
+    doc = s.close(extra_meta={"transcript_complete": False})
+    assert doc["meta"]["transcript_complete"] is False
+
+    s2 = Session(tmp_path, name="flag_ok", sample_rate=16000, record_audio=False)
+    doc2 = s2.close(extra_meta={"transcript_complete": True})
+    assert doc2["meta"]["transcript_complete"] is True
+
+
+# ---------- 5. ASR 统计不能"假健康" ----------
+
+
+def test_stats_expose_content_loss_when_all_chunks_fail() -> None:
+    """块内全部失败时，stats 必须能看出内容丢失。
+
+    背景（2026-11-17 实测）：4 个音频块全部落占位符，但 stats 显示
+    primary_ok=4 / primary_fail=0 —— 因为 gemini_asr 内部把"整块失败"
+    吞成了占位符返回值，FallbackEngine 看到的是"调用成功"。
+    转写全废而监控全绿，是最危险的一类。
+    """
+    from wxlive.engine import FallbackEngine
+
+    class _Primary:
+        @property
+        def stats(self) -> dict:
+            return {
+                "engine": "fake",
+                "failed_chunks": [[0.0, 8.5], [0.0, 10.3]],
+                "bad_detected": 0,
+                "recovered": 0,
+                "unsplit_detected": 0,
+                "suspect_chunks": [],
+            }
+
+        def transcribe(self, audio, sample_rate):  # noqa: ARG002
+            return []
+
+        def close(self):
+            pass
+
+    eng = FallbackEngine(primary=_Primary(), fallback=None)
+    eng.transcribe(__import__("numpy").zeros(16000, dtype="float32"), 16000)
+    st = eng.stats
+
+    # 老字段仍是"看起来成功"，这正是盲区所在
+    assert st["primary_ok"] == 1
+    assert st["primary_fail"] == 0
+    # 新字段必须把真实损失暴露出来
+    assert st["failed_chunk_count"] == 2
+    assert st["has_content_loss"] is True
+
+
+def test_stats_report_no_loss_on_clean_run() -> None:
+    """正常情况下 has_content_loss 必须是 False，避免误报。"""
+    from wxlive.engine import FallbackEngine
+
+    class _Primary:
+        @property
+        def stats(self) -> dict:
+            return {"engine": "fake", "failed_chunks": []}
+
+        def transcribe(self, audio, sample_rate):  # noqa: ARG002
+            return []
+
+        def close(self):
+            pass
+
+    eng = FallbackEngine(primary=_Primary(), fallback=None)
+    eng.transcribe(__import__("numpy").zeros(16000, dtype="float32"), 16000)
+    st = eng.stats
+    assert st["failed_chunk_count"] == 0
+    assert st["has_content_loss"] is False

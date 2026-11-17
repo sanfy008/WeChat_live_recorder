@@ -101,6 +101,10 @@ def build_engine(cfg: Config):
 
 
 class Pipeline:
+    # 录制结束后等待 ASR 排空队列的最长时间（秒）。
+    # 给足够余量：2.4 小时直播遇到网关抖动时，落后 3-5 分钟是可能的。
+    drain_timeout: int = 900
+
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self.segmenter = Segmenter(
@@ -198,6 +202,7 @@ class Pipeline:
         n_segments = 0
 
         stop_reason = "用户停止"
+        incomplete = False
         try:
             while not self._stop.is_set():
                 if max_seconds and (time.time() - t_start) >= max_seconds:
@@ -234,12 +239,21 @@ class Pipeline:
                     # 不同引擎的 stats 结构不同（本地引擎有顶层 rtf，
                     # FallbackEngine 是嵌套的），这里统一容错，不能因为状态栏崩掉主循环。
                     rtf = _extract_rtf(self.transcriber.stats)
+                    qsize = self._asr_queue.qsize()
                     print(
                         f"\r[status] 已录 {el/60:.1f}min | 块 {n_chunks} | "
                         f"片段 {n_segments} | 已出句 {len(self.session.segments)} | "
-                        f"RTF {rtf:.2f} | 队列 {self._asr_queue.qsize()}",
+                        f"RTF {rtf:.2f} | 队列 {qsize}",
                         end="", flush=True,
                     )
+                    # 队列持续堆积 = 转写已经跟不上录制。不能等收尾才暴露：
+                    # 2026-11-17 实测网关 RTF 从 0.35 飙到 3.8 时，队列从 0 堆到 9，
+                    # 日志里只有数字变化，没有任何"你在落后"的提示。
+                    if qsize >= 5:
+                        print(f"\n[main][warn] 转写落后：队列已积压 {qsize} 个片段，"
+                              f"当前 RTF {rtf:.2f}（>1 表示比实时还慢）。"
+                              f"若持续下去，录制结束时可能还要等较久才能出完整稿。",
+                              flush=True)
                     last_report = now
 
         except KeyboardInterrupt:
@@ -272,9 +286,22 @@ class Pipeline:
             self.recorder.stop()
             self._asr_queue.put(None)
 
-            print("\n[main] 等待剩余片段转写完成…")
+            # 录制时长到了不等于活儿干完了：队列里可能还压着几分钟音频。
+            # 2026-11-17 实测：10 分钟录制里网关两次 RTF 飙到 3.2/3.8，
+            # 收尾时队列堆到 9 个片段，进程在收尾期间被外部超时截断，
+            # 结果 json 没生成、转写比音频少 187 秒，而产物看起来"正常"。
+            print(f"\n[main] 录制已结束，等待剩余转写"
+                  f"（队列 {self._asr_queue.qsize()} 个片段）…")
             if self._asr_thread is not None:
-                self._asr_thread.join(timeout=600)
+                self._asr_thread.join(timeout=self.drain_timeout)
+                if self._asr_thread.is_alive():
+                    # 不能静默继续：否则产物会"看起来正常但少了尾部"。
+                    incomplete = True
+                    left = max(0, self._asr_queue.qsize())
+                    print(f"[main][warn] 收尾超时（{self.drain_timeout}s），"
+                          f"仍有 {left} 个片段留在队列里。"
+                          f"音频已完整保存，可用 wxlive transcribe 补转。",
+                          flush=True)
 
         doc = self.session.close(extra_meta={
             "asr": self.transcriber.stats,
@@ -282,10 +309,18 @@ class Pipeline:
             # 不必再对着 WAV 尾部的静音时长猜（2026-11-16/17 都这么猜过）。
             "stop_reason": stop_reason,
             "dropped_chunks": getattr(self.recorder, "dropped_chunks", 0),
+            # 收尾是否跑完。False 表示产物可能缺尾部，需要人工补转。
+            "transcript_complete": not incomplete,
         })
         print(f"\n完成。逐字稿: {self.session.md_path}")
         print(f"      结构化: {self.session.json_path}")
         print(f"      音频  : {self.session.audio_path}")
+        if incomplete:
+            # 结论必须显眼：否则用户会拿着缺尾部的产物当完整稿用。
+            print("\n[!] 注意：本次转写未跑完（收尾超时）。")
+            print("    音频是完整的，缺的是后半段的文字。补转办法：")
+            print(f"    .venv-trim/Scripts/python.exe -m wxlive transcribe "
+                  f"\"{self.session.audio_path}\"")
         return doc
 
     def _enqueue_tail(self, seg, where: str) -> None:

@@ -77,4 +77,22 @@ class FallbackEngine:
         base["degraded"] = self._degraded
         base["primary_ok"] = self._primary_ok
         base["primary_fail"] = self._primary_fail
+
+        # ---- 不能只看 primary_ok/primary_fail ----
+        # 2026-11-17 实测踩到：4 个音频块**全部**转写失败（落的都是占位符），
+        # 但 stats 显示 primary_ok=4 / primary_fail=0。
+        # 原因：gemini_asr 在内部把"整块失败"吞掉了（返回占位符而非抛异常），
+        # 所以 FallbackEngine 层面看到的是"调用成功"。
+        # 结果：转写全废，监控指标却一片绿 —— 这类"假健康"最危险。
+        # 这里把下游记录的 failed_chunks 数并入统计，并给出一个直接可判的字段。
+        failed_chunks: list = []
+        try:
+            primary = base.get("primary") or {}
+            failed_chunks = primary.get("failed_chunks") or []
+        except Exception:
+            pass
+        base["failed_chunk_count"] = len(failed_chunks)
+        base["calls_with_failures"] = len(failed_chunks)
+        # 一眼可判：本次转写是否有内容真的丢了。
+        base["has_content_loss"] = bool(failed_chunks)
         return base
