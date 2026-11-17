@@ -94,7 +94,37 @@ def build_config_from_user(base=None):
     cfg.text = _merge(cfg.text if isinstance(cfg.text, TextConfig) else TextConfig(), "text")
     cfg.output = _merge(cfg.output if isinstance(cfg.output, OutputConfig) else OutputConfig(),
                         "output")
+    _normalize_lexicon_path(cfg)
     return cfg
+
+
+def _normalize_lexicon_path(cfg) -> None:
+    """把 lexicon_path 纠正成「能用的路径」。
+
+    背景：user.json 里曾写入过绝对路径（形如 D: + 项目目录 + lexicon/xsc.json），
+    项目一换位置就失效，而且失效是静默的 —— lexicon.load() 里
+    `if p.exists()` 不成立就悄悄回退内置表，用户不会发现外部词表没被用上。
+
+    规则（保守，不覆盖用户的真实自定义）：
+      1. 路径存在 → 原样保留。
+      2. 路径不存在 → 若同名文件在项目 lexicon/ 下存在，改用项目内那份。
+      3. 都没有 → 退回项目默认路径；再没有则置空，交给 lexicon.load()。
+    """
+    from .config import ROOT
+
+    raw = (getattr(cfg.asr, "lexicon_path", "") or "").strip()
+    default = ROOT / "lexicon" / "xsc.json"
+    if not raw:
+        cfg.asr.lexicon_path = str(default) if default.exists() else ""
+        return
+
+    p = Path(raw)
+    if p.exists():
+        return
+    if p.name and (ROOT / "lexicon" / p.name).exists():
+        cfg.asr.lexicon_path = str(ROOT / "lexicon" / p.name)
+        return
+    cfg.asr.lexicon_path = str(default) if default.exists() else ""
 
 
 def reset_user_config() -> None:

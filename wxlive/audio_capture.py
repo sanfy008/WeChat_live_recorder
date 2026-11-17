@@ -117,6 +117,8 @@ class LoopbackRecorder:
         # 与输出采样率无关，重采样只改变样本数，不改变时间轴。
         self._frames_per_buffer = int(self.device.rate * chunk_seconds)
         self.dropped_chunks = 0
+        # 停止原因（由 stop(reason=...) 写入），用于事后归因
+        self.stop_reason = ""
 
         self._resampler = self._make_resampler()
         self._lock = threading.Lock()
@@ -226,9 +228,17 @@ class LoopbackRecorder:
                 print(f"[audio] 重连失败({attempt + 1}/5): {e}", file=sys.stderr)
                 time.sleep(2)
 
-    def stop(self) -> None:
+    def stop(self, reason: str = "调用方请求") -> None:
+        """停止采集。
+
+        reason 用于事后归因：直播录制最常见的疑问是"为什么这里断了"——
+        是用户点的、静音超时自动停的、还是采集异常。以前没有记录，
+        只能对着 WAV 尾部的静音时长猜（2026-11-16/17 两段录音都遇到过）。
+        现在每次停止都留下明确原因，写进日志与产物 meta。
+        """
         if self._stopping:
             return
+        self.stop_reason = reason
         self._stopping = True
         self._running = False
         try:
@@ -245,7 +255,7 @@ class LoopbackRecorder:
         with self._lock:
             self._eof = True
         self.queue.put(None)  # 通知消费端结束
-        print(f"[audio] 采集停止（丢弃块 {self.dropped_chunks}）")
+        print(f"[audio] 采集停止（原因：{reason}，丢弃块 {self.dropped_chunks}）")
 
     # ---------- 消费 ----------
 

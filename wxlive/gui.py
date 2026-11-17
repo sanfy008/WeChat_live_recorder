@@ -746,15 +746,19 @@ class App(FetchTabMixin, tk.Tk):
 
         t0 = time.time()
         peak, silent_run, written = 0.0, 0.0, 0
+        # 停止原因：事后归因用，避免只能靠"WAV 尾部静音多久"去猜
+        stop_reason = "用户点击停止"
         self._log(f"[录制] 开始 → {out.name}")
         try:
             while not self.stop_flag.is_set():
                 el = time.time() - t0
                 if limit and el >= limit:
                     self._log("[录制] 到达设定时长，停止")
+                    stop_reason = "达到设定时长"
                     break
                 chunk = rec.read(timeout=0.5)
                 if chunk is None:
+                    stop_reason = "采集端已结束"
                     break
                 if len(chunk) == 0:
                     continue
@@ -765,12 +769,13 @@ class App(FetchTabMixin, tk.Tk):
                 silent_run = 0.0 if rms >= 0.002 else silent_run + len(chunk) / sr
                 if silence and silent_run >= silence:
                     self._log(f"[录制] 静音 {silent_run:.0f}s，自动停止")
+                    stop_reason = f"静音 {silent_run:.0f}s 自动停止"
                     break
                 self.after(0, lambda e=el, w=written, p=peak: self._update_rec_status(e, w, p))
         finally:
             # 先停再 drain：stop() flush 的尾部样本挂在 read() 上，
             # 不取出来会在 WAV 结尾丢几十毫秒。
-            rec.stop()
+            rec.stop(reason=stop_reason)
             while True:
                 tail = rec.read(timeout=0.0)
                 if tail is None:
@@ -811,7 +816,10 @@ class App(FetchTabMixin, tk.Tk):
         threading.Thread(target=hook, daemon=True).start()
         doc = p.run(max_seconds=limit)
         self._log(f"[实时转写] 完成，共 {len(doc['segments'])} 句")
-        self.last_output = Path(TRANSCRIPTS_DIR) / f"{p.session.id}.md"
+        # 用 session 自己的真实路径，而不是按 id 拼 —— 之前这里拼的是
+        # TRANSCRIPTS_DIR/<id>.md，但产物当时被写进了 RECORDINGS_DIR，
+        # 导致「打开逐字稿」打开一个不存在的文件。
+        self.last_output = p.session.md_path
         self.after(0, lambda: self.audio_path_var.set(str(p.session.audio_path)))
 
     def _update_rec_status(self, elapsed: float, written: int, peak: float) -> None:

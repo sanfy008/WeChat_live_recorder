@@ -51,6 +51,8 @@ def main() -> int:
     peak = 0.0
     silent_run = 0.0
     total_written = 0
+    # 停止原因：事后再也不用靠"WAV 尾部静音多久"去猜当时为什么断
+    stop_reason = "用户中断"
     next_report = 15.0
 
     print(f"[record] 输出 {out.name}  ({sr}Hz mono)")
@@ -62,10 +64,12 @@ def main() -> int:
             elapsed = time.time() - t0
             if limit and elapsed >= limit:
                 print(f"\n[record] 达到设定时长 {args.minutes} 分钟，停止")
+                stop_reason = f"达到设定时长 {args.minutes} 分钟"
                 break
 
             chunk = rec.read(timeout=0.5)
             if chunk is None:
+                stop_reason = "采集端已结束"
                 break
             if len(chunk) == 0:
                 continue
@@ -81,6 +85,7 @@ def main() -> int:
                 silent_run = 0.0
             if args.silence_stop and silent_run >= args.silence_stop:
                 print(f"\n[record] 已静音 {silent_run:.0f}s，判定播放结束，自动停止")
+                stop_reason = f"静音 {silent_run:.0f}s 自动停止"
                 break
 
             if elapsed >= next_report:
@@ -93,7 +98,7 @@ def main() -> int:
     finally:
         # 先停采集再 drain：stop() 会 flush 重采样器，最后几十毫秒挂到 read() 上，
         # 不 drain 出来就会丢在 WAV 结尾。
-        rec.stop()
+        rec.stop(reason=stop_reason)
         while True:
             tail = rec.read(timeout=0.0)
             if tail is None:

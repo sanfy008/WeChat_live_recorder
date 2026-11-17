@@ -128,10 +128,14 @@ class Pipeline:
 
         from .config import RECORDINGS_DIR, TRANSCRIPTS_DIR
 
-        self.session = Session(RECORDINGS_DIR, name=cfg.session_name,
-                               sample_rate=self.recorder.out_rate)
-        # 逐字稿放单独目录（软链/复制关系在 close 时处理）
-        self._transcripts_dir = TRANSCRIPTS_DIR
+        # 产物（json/jsonl/md）写 TRANSCRIPTS_DIR，音频写 RECORDINGS_DIR。
+        # 之前这里误传 RECORDINGS_DIR，导致逐字稿跟 WAV 混在 recordings/ 下，
+        # 而 gui 按 TRANSCRIPTS_DIR 拼路径去打开，必然找不到文件。
+        self.session = Session(
+            TRANSCRIPTS_DIR, name=cfg.session_name,
+            sample_rate=self.recorder.out_rate,
+            audio_dir=RECORDINGS_DIR,
+        )
 
         self._asr_queue: queue.Queue[Segment | None] = queue.Queue(maxsize=200)
         self._stop = threading.Event()
@@ -193,14 +197,17 @@ class Pipeline:
         n_chunks = 0
         n_segments = 0
 
+        stop_reason = "用户停止"
         try:
             while not self._stop.is_set():
                 if max_seconds and (time.time() - t_start) >= max_seconds:
                     print(f"\n[main] 达到设定时长 {max_seconds}s，停止。")
+                    stop_reason = f"达到设定时长 {max_seconds}s"
                     break
 
                 chunk = self.recorder.read(timeout=0.5)
                 if chunk is None:  # 采集端已结束
+                    stop_reason = self.recorder.stop_reason or "采集端已结束"
                     break
                 if len(chunk) == 0:
                     continue
@@ -240,7 +247,7 @@ class Pipeline:
         finally:
             # 收尾顺序很重要：先停采集（此后不会再有新块）→ 补写重采样器
             # 冲出的尾部 → 再 flush 残留 → 最后等 ASR 队列排空
-            self.recorder.stop()
+            self.recorder.stop(reason=stop_reason)
             # stop() 会 flush 重采样器，把最后几十毫秒挂到 read() 的 _final 上；
             # 主循环已经退出，这里主动 drain 出来补进 WAV，否则结尾会丢一截。
             while True:
@@ -251,25 +258,16 @@ class Pipeline:
                     self.session.write_audio(c)
                     for seg in self.segmenter.feed(self.resampler.process(c)):
                         n_segments += 1
-                        try:
-                            self._asr_queue.put(seg, timeout=5)
-                        except queue.Full:
-                            pass
+                        self._enqueue_tail(seg, "收尾 drain")
 
             leftover = self.resampler.flush()
             if len(leftover):
                 for seg in self.segmenter.feed(leftover):
-                    try:
-                        self._asr_queue.put(seg, timeout=5)
-                    except queue.Full:
-                        pass
+                    self._enqueue_tail(seg, "重采样器残余")
 
             tail = self.segmenter.flush()
             if tail:
-                try:
-                    self._asr_queue.put(tail, timeout=5)
-                except queue.Full:
-                    pass
+                self._enqueue_tail(tail, "切分器残余")
 
             self.recorder.stop()
             self._asr_queue.put(None)
@@ -278,11 +276,51 @@ class Pipeline:
             if self._asr_thread is not None:
                 self._asr_thread.join(timeout=600)
 
-        doc = self.session.close(extra_meta={"asr": self.transcriber.stats})
+        doc = self.session.close(extra_meta={
+            "asr": self.transcriber.stats,
+            # 停止原因进产物：以后想知道"这场为什么断在这"，查 meta 即可，
+            # 不必再对着 WAV 尾部的静音时长猜（2026-11-16/17 都这么猜过）。
+            "stop_reason": stop_reason,
+            "dropped_chunks": getattr(self.recorder, "dropped_chunks", 0),
+        })
         print(f"\n完成。逐字稿: {self.session.md_path}")
         print(f"      结构化: {self.session.json_path}")
         print(f"      音频  : {self.session.audio_path}")
         return doc
+
+    def _enqueue_tail(self, seg, where: str) -> None:
+        """收尾阶段投递片段到 ASR 队列。
+
+        为什么单独抽出来：收尾（drain / resampler.flush / segmenter.flush）
+        投递的是整场**最后**的音频，恰恰最可能含结论。队列满时不能像主循环那样
+        静默 pass —— 那会让最后几十秒内容凭空消失且无任何痕迹。
+        这里改为：等待 → 仍失败则落盘到丢失清单，并在日志里明确报出来。
+        """
+        try:
+            self._asr_queue.put(seg, timeout=5)
+            return
+        except queue.Full:
+            pass
+        # 队列满且 5 秒内没腾出空间：不能丢，先把这一段的音频存成独立 WAV，
+        # 事后至少可以手工补转，不会"消失得无声无息"。
+        try:
+            self._spill_audio(seg, where)
+        except Exception as e:  # noqa: BLE001
+            print(f"[asr][error] 收尾片段落盘也失败（{where}）: {e}", flush=True)
+
+    def _spill_audio(self, seg, where: str) -> None:
+        """把未能入队的片段音频单独存盘，避免静默丢失。"""
+        from .config import OUTPUT_DIR
+
+        spill_dir = OUTPUT_DIR / "spilled"
+        spill_dir.mkdir(parents=True, exist_ok=True)
+        name = f"{self.session.id}_{seg.start_ts:.1f}s.wav"
+        path = spill_dir / name
+        import soundfile as sf
+
+        sf.write(str(path), seg.audio, self.cfg.audio.sample_rate, subtype="PCM_16")
+        print(f"[asr][warn] 转写队列满（{where}），该片段音频已另存: {path}",
+              flush=True)
 
     def stop(self) -> None:
         self._stop.set()

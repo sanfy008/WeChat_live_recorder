@@ -64,6 +64,7 @@ class Session:
         audio_stem: str | None = None,
         fingerprint: str = "",
         audio_path: Path | str | None = None,
+        audio_dir: Path | str | None = None,
     ) -> None:
         """record_audio=False 用于"转写已有音频"场景：不新建 WAV 文件，
         避免产生一个 44 字节的空壳音频误导人。
@@ -72,6 +73,12 @@ class Session:
         文件名用 `<时间戳>_<fingerprint>`（如 `20261117_110000_w12_low`），
         让同一份音频的多次重跑可区分。旧路径的产物不删除、不移动。
         audio_path 用于计算音频指纹，并检测同一音频的历史产物（rerun_of）。
+
+        audio_dir 用于"音频与文字产物分开放"的场景（实时录制）：
+        默认与 base_dir 相同（旧行为）；显式给出时，WAV 写进
+        `<audio_dir>/<音频stem>/`，而 json/jsonl/md 仍写进 base_dir。
+        背景：录制时 WAV 属于 RECORDINGS_DIR，逐字稿属于 TRANSCRIPTS_DIR，
+        两者不该混在同一个目录里。
         """
         self.sample_rate = sample_rate
         self.started_at = datetime.now()
@@ -93,7 +100,18 @@ class Session:
             self.id = f"{base_id}_{k}"
             k += 1
 
-        self.audio_path = self.stem_dir / f"{self.id}.wav"
+        # 音频目录：默认与产物同目录（旧行为），实时录制时单独给出
+        if audio_dir is not None:
+            _ad = Path(audio_dir)
+            _ad.mkdir(parents=True, exist_ok=True)
+            # 音频也按 stem 分目录，便于"一条直播 = 一个文件夹"的归档习惯
+            self.audio_dir = _ad / _safe_part(audio_stem) if audio_stem else _ad
+        else:
+            self.audio_dir = self.stem_dir
+        if self.audio_dir != self.stem_dir:
+            self.audio_dir.mkdir(parents=True, exist_ok=True)
+
+        self.audio_path = self.audio_dir / f"{self.id}.wav"
         self.jsonl_path = self.stem_dir / f"{self.id}.jsonl"
         self.md_path = self.stem_dir / f"{self.id}.md"
         self.json_path = self.stem_dir / f"{self.id}.json"
