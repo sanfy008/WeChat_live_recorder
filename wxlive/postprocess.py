@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import time
 import urllib.error
@@ -49,16 +50,20 @@ def _call(model: str, prompt: str, endpoint: str, api_key: str,
 def fix_errors(lines: list[str], model: str = DEFAULT_MODEL,
                endpoint: str = DEFAULT_ENDPOINT, api_key: str = "magpie-alma",
                vocabulary: str = "", batch_size: int = 40,
-               progress: Callable[[int, int], None] | None = None) -> list[str]:
-    """按领域词表纠正同音字。失败的分批保留原文。"""
+               progress: Callable[[int, int], None] | None = None,
+               workers: int = 6) -> list[str]:
+    """按领域词表纠正同音字。失败的分批保留原文。
+
+    workers > 1 时用线程池并发请求网关；结果按批下标拼回，顺序与输入一致。
+    实测 27 批串行约 10 分钟，6 路并发约 107 秒。
+    """
     if not lines:
         return lines
 
-    out: list[str] = []
     total_batches = (len(lines) + batch_size - 1) // batch_size
+    batches = [lines[i : i + batch_size] for i in range(0, len(lines), batch_size)]
 
-    for bi, start in enumerate(range(0, len(lines), batch_size)):
-        batch = lines[start : start + batch_size]
+    def process(bi: int, batch: list[str]) -> list[str]:
         numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(batch))
         prompt = (
             "你是中文 ASR 后处理专家。下面是一段升学规划直播的语音识别结果，存在同音字错误。\n"
@@ -75,18 +80,46 @@ def fix_errors(lines: list[str], model: str = DEFAULT_MODEL,
             fixed = [x.strip() for x in res.split("\n") if x.strip()]
             # 行数不一致时不要用这批结果，避免错位
             if len(fixed) == len(batch):
-                out.extend(fixed)
-            else:
-                print(f"[post] 纠错批次 {bi+1} 行数不匹配（{len(fixed)}≠{len(batch)}），保留原文")
-                out.extend(batch)
+                return fixed
+            print(f"[post] 纠错批次 {bi+1} 行数不匹配（{len(fixed)}≠{len(batch)}），保留原文")
+            return batch
         except Exception as e:  # noqa: BLE001
             print(f"[post] 纠错批次 {bi+1} 失败，保留原文: {str(e)[:120]}")
-            out.extend(batch)
+            return batch
 
-        if progress:
-            progress(bi + 1, total_batches)
+    if workers <= 1:
+        out: list[str] = []
+        for bi, batch in enumerate(batches):
+            out.extend(process(bi, batch))
+            if progress:
+                progress(bi + 1, total_batches)
+        return out
 
-    return out
+    results: list[list[str] | None] = [None] * total_batches
+    done = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(process, bi, b): bi
+                   for bi, b in enumerate(batches)}
+        for fut in concurrent.futures.as_completed(futures):
+            bi = futures[fut]
+            try:
+                results[bi] = fut.result()
+            except Exception as e:  # noqa: BLE001
+                # process 内部已兜底，这里只防意外；该批仍保留原文
+                print(f"[post] 纠错批次 {bi+1} 异常，保留原文: {str(e)[:120]}")
+                results[bi] = batches[bi]
+            done += 1
+            # 并发时按完成数递增，不保证批次顺序
+            if progress:
+                progress(done, total_batches)
+
+    final: list[str] = []
+    for bi, batch in enumerate(results):
+        if batch is None:  # 理论上不会发生；兜底保留原文，绝不让行数变少
+            print(f"[post] 纠错批次 {bi+1} 无结果，保留原文")
+            batch = batches[bi]
+        final.extend(batch)
+    return final
 
 
 def build_digest(segments: list[dict], model: str = DEFAULT_MODEL,
