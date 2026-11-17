@@ -24,18 +24,25 @@ import urllib.request
 from typing import Callable
 
 DEFAULT_ENDPOINT = "http://127.0.0.1:3425/v1/chat/completions"
-DEFAULT_MODEL = "workbuddy/deepseek-v4.1-flash"
+DEFAULT_MODEL = "group/deepseek"
+
+# 纠错分批的失败重试间隔（秒）。网关会瞬时抖动：实测串行复跑里出现
+# 23/40 行、1/40 行、HTTP 502/403，单独重试全部成功且行数正确。
+# 默认重试 2 次（共 3 次尝试），总等待 5s，避免把整场耗时拖长。
+FIX_RETRY_DELAYS = (1.0, 4.0)
 
 
 def _call(model: str, prompt: str, endpoint: str, api_key: str,
           max_tokens: int = 8000, timeout: int = 240,
-          reasoning_effort: str | None = "minimal") -> str:
+          reasoning_effort: str | None = "low") -> str:
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
     }
-    # 关键：不压低思考强度会把 token 全烧在 reasoning 上导致空输出
+    # group/deepseek 的合法档位是 [low, high, max]，没有 medium：传 medium 虽返回
+    # 200 但行为不稳（实测 reasoning_tokens 2751/5559，同一批 33.7s/63.6s），
+    # max 直接 403。质量对比 40 行样本 low 改对 2 行、high 1 行，故取 low。
     if reasoning_effort:
         payload["reasoning_effort"] = reasoning_effort
 
@@ -51,15 +58,21 @@ def fix_errors(lines: list[str], model: str = DEFAULT_MODEL,
                endpoint: str = DEFAULT_ENDPOINT, api_key: str = "magpie-alma",
                vocabulary: str = "", batch_size: int = 40,
                progress: Callable[[int, int], None] | None = None,
-               workers: int = 6) -> list[str]:
-    """按领域词表纠正同音字。失败的分批保留原文。
+               workers: int = 12,
+               retry_delays: tuple[float, ...] | None = None) -> list[str]:
+    """按领域词表纠正同音字。重试用尽的分批保留原文。
 
     workers > 1 时用线程池并发请求网关；结果按批下标拼回，顺序与输入一致。
-    实测 27 批串行约 10 分钟，6 路并发约 107 秒。
+    实测同一份 12 批：并发 3 路 83.7s，并发 12 路 35.4s，网关可横向扩展；
+    27 批全量串行约 10 分钟，6 路并发约 102 秒。
+
+    retry_delays 是失败重试的等待序列（默认 1s/4s，共 3 次尝试）。
+    HTTP 错误与行数不匹配都会重试；做成可注入是为了测试不必真 sleep。
     """
     if not lines:
         return lines
 
+    delays = tuple(retry_delays) if retry_delays is not None else FIX_RETRY_DELAYS
     total_batches = (len(lines) + batch_size - 1) // batch_size
     batches = [lines[i : i + batch_size] for i in range(0, len(lines), batch_size)]
 
@@ -75,17 +88,27 @@ def fix_errors(lines: list[str], model: str = DEFAULT_MODEL,
             "- 输出格式：每行只输出修正后的文本，不要序号、不要解释\n\n"
             f"待修正：\n{numbered}"
         )
-        try:
-            res = _call(model, prompt, endpoint, api_key)
-            fixed = [x.strip() for x in res.split("\n") if x.strip()]
-            # 行数不一致时不要用这批结果，避免错位
-            if len(fixed) == len(batch):
-                return fixed
-            print(f"[post] 纠错批次 {bi+1} 行数不匹配（{len(fixed)}≠{len(batch)}），保留原文")
-            return batch
-        except Exception as e:  # noqa: BLE001
-            print(f"[post] 纠错批次 {bi+1} 失败，保留原文: {str(e)[:120]}")
-            return batch
+        last_err = ""
+        for attempt in range(len(delays) + 1):
+            if attempt:
+                delay = delays[attempt - 1]
+                if delay:
+                    time.sleep(delay)
+            try:
+                res = _call(model, prompt, endpoint, api_key)
+                fixed = [x.strip() for x in res.split("\n") if x.strip()]
+                # 行数不一致时不要用这批结果，避免错位
+                if len(fixed) == len(batch):
+                    if attempt:
+                        print(f"[post] 纠错批次 {bi+1} 重试第 {attempt} 次恢复")
+                    return fixed
+                last_err = f"行数不匹配（{len(fixed)}≠{len(batch)}）"
+            except Exception as e:  # noqa: BLE001
+                last_err = str(e)[:120]
+
+        print(f"[post] 纠错批次 {bi+1} 重试 {len(delays)} 次后仍失败"
+              f"（{last_err}），保留原文")
+        return batch
 
     if workers <= 1:
         out: list[str] = []
