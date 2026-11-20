@@ -26,6 +26,7 @@ import urllib.request
 import numpy as np
 
 from . import lexicon, quality
+from .lexicon import _TC2SC, to_simplified
 
 DEFAULT_ENDPOINT = "http://127.0.0.1:3425/v1/chat/completions"
 # 实测 120s 稳定通过，留 10s 余量防止边界抖动
@@ -73,26 +74,6 @@ def build_prompt(lexicon_hint: str = "") -> str:
     if not lexicon_hint:
         return PROMPT
     return f"{PROMPT}\n\n【领域参考】\n{lexicon_hint}"
-
-# 繁→简 常用字兜底表（覆盖实测出现的高频字）
-_TC2SC = str.maketrans(
-    "個們這來說時會後裡麼為與對開關實現點線樣區問間還進過發現當從學經濟這樣沒電話"
-    "讓給帶東車長門見覺聽講讀寫買賣價錢銀藝術動員員國圖書畫筆記億萬歲歷經歷",
-    "个们这来说时会后里么为与对开关实现点线样区问间还进过发现当从学经济这样没电话"
-    "让给带东车长门见觉听讲读写买卖价钱银艺术动员员国图书画笔记亿万岁历经历",
-)
-
-
-def to_simplified(text: str) -> str:
-    """繁转简。优先用 opencc，缺失时用内置映射兜底。"""
-    if not text:
-        return text
-    try:
-        from opencc import OpenCC
-
-        return OpenCC("t2s").convert(text)
-    except Exception:
-        return text.translate(_TC2SC)
 
 
 class GeminiASR:
@@ -281,6 +262,30 @@ class GeminiASR:
             返回行列表；彻底失败时返回占位行。
             """
             text, err = _call_safe(pcm)
+            if err is not None:
+                is_rate_limit = "HTTP 429" in err
+                for i, delay in enumerate(self.retry_delays):
+                    wait = max(delay, 3.0 * (i + 1)) if is_rate_limit else delay
+                    if wait:
+                        time.sleep(wait)
+                    text2, err2 = _call_safe(pcm)
+                    if err2 is None and text2:
+                        self._recovered += 1
+                        print(
+                            f"[gemini-asr] 请求异常({err[:40]})已通过重试救回"
+                            f"（第 {i + 1} 次，{dur:.0f}s 块）"
+                        )
+                        text, err = text2, None
+                        break
+                    if err2 is not None:
+                        err = err2
+                        is_rate_limit = is_rate_limit or ("HTTP 429" in err2)
+                if err is not None:
+                    print(f"[gemini-asr] {dur:.0f}s 块请求失败: {err}")
+                    if is_rate_limit:
+                        # 限流错误切分只会倍增请求数，直接放弃由外层落占位
+                        raise RuntimeError(err)
+
             if err is None and text:
                 first = text
                 # 第一次判定

@@ -323,6 +323,20 @@ def test_banxing_codes_from_official_chart():
         assert got == v, f"{k} 应为 {v}，实为 {got}"
 
 
+def test_20261120_xsc_terms_and_safe_corrections():
+    """2026-11-20 实测新增词条与纠错：修准专有名词，同时不误伤"公平/境界"等正常词。"""
+    from wxlive import lexicon
+    lexicon.apply_loaded(lexicon.load())
+
+    assert lexicon.correct_text("大家好我是张扑玉，亮宅老师和彪书也在") == "大家好我是张璞玉，亮仔老师和彪叔也在"
+    assert lexicon.correct_text("六年级A加班和创新A架，在公平扣出来") == "六年级A+班和创新A+，在公屏扣出来"
+    assert lexicon.correct_text("了解境界和咱们境界的课程") == "了解进阶和咱们进阶的课程"
+    # 正常语义的"公平""境界"不得被误改
+    assert lexicon.correct_text("电脑摇号这件事情它公平吗？公平。") == "电脑摇号这件事情它公平吗？公平。"
+    assert lexicon.correct_text("提升思维境界") == "提升思维境界"
+
+
+
 def test_ranking_chart_classes_and_codes():
     """重点班排行表增补的班型术语与区属简称。"""
     from wxlive import lexicon

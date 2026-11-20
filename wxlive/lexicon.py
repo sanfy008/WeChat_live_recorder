@@ -128,6 +128,35 @@ CORRECTIONS: dict[str, str] = {
 # 所以只在数字后紧跟"家"时替换
 _RE_NUM_JIA = re.compile(r"(\d{3})\s*家")
 
+# 繁→简 常用字兜底表（覆盖实测出现的高频字，opencc 缺失时启用）
+_TC2SC = str.maketrans(
+    "個們這來說時會後裡麼為與對開關實現點線樣區問間還進過發現當從學經濟這樣沒電話"
+    "讓給帶東車長門見覺聽講讀寫買賣價錢銀藝術動員員國圖書畫筆記億萬歲歷經歷",
+    "个们这来说时会后里么为与对开关实现点线样区问间还进过发现当从学经济这样没电话"
+    "让给带东车长门见觉听讲读写买卖价钱银艺术动员员国图书画笔记亿万岁历经历",
+)
+_OPENCC_T2S = None
+_OPENCC_TRIED = False
+
+
+def to_simplified(text: str) -> str:
+    """繁转简。优先用 opencc（缓存实例），缺失时用内置映射兜底。"""
+    if not text:
+        return text
+    global _OPENCC_T2S, _OPENCC_TRIED
+    if not _OPENCC_TRIED:
+        _OPENCC_TRIED = True
+        try:
+            from opencc import OpenCC
+
+            _OPENCC_T2S = OpenCC("t2s")
+        except Exception:
+            _OPENCC_T2S = None
+    if _OPENCC_T2S is not None:
+        return _OPENCC_T2S.convert(text)
+    return text.translate(_TC2SC)
+
+
 DEFAULT_PATH = Path(__file__).resolve().parent.parent / "lexicon" / "xsc.json"
 
 
