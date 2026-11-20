@@ -26,14 +26,27 @@ class FallbackEngine:
         primary=None,
         fallback=None,
         max_consecutive_failures: int = 3,
+        fallback_factory=None,
     ) -> None:
         self.primary = primary
-        self.fallback = fallback
+        self._fallback = fallback
+        self._fallback_factory = fallback_factory
         self.max_failures = max_consecutive_failures
         self._failures = 0
         self._degraded = False
         self._primary_ok = 0
         self._primary_fail = 0
+
+    @property
+    def fallback(self):
+        """惰性获取备引擎：只有真正需要降级时才实例化本地模型，避免主引擎正常时白占内存。"""
+        if self._fallback is None and self._fallback_factory is not None:
+            self._fallback = self._fallback_factory()
+        return self._fallback
+
+    @fallback.setter
+    def fallback(self, value) -> None:
+        self._fallback = value
 
     def transcribe(self, audio: np.ndarray, sample_rate: int = 16000) -> list[dict]:
         # 已降级或没有主引擎 → 直接走本地
@@ -65,8 +78,9 @@ class FallbackEngine:
     def stats(self) -> dict:
         base = {}
         try:
-            if self.fallback is not None:
-                base["fallback"] = self.fallback.stats
+            # 未触发降级时不访问 self.fallback，避免为了取统计而误加载本地模型
+            if self._fallback is not None:
+                base["fallback"] = self._fallback.stats
         except Exception:
             pass
         try:

@@ -106,3 +106,25 @@ def test_no_fallback_returns_empty_not_crash():
     p = FakeEngine("primary", fail=True)
     e = FallbackEngine(primary=p, fallback=None)
     assert e.transcribe(audio()) == []
+
+
+def test_fallback_factory_is_lazy_until_needed():
+    """主引擎正常时，fallback_factory 不应被调用（避免白加载本地模型）。"""
+    created = []
+
+    def make_fb():
+        fb = FakeEngine("fallback", text="本地")
+        created.append(fb)
+        return fb
+
+    p = FakeEngine("primary", text="云端")
+    e = FallbackEngine(primary=p, fallback_factory=make_fb)
+    assert e.transcribe(audio())[0]["text"] == "云端"
+    assert created == []
+    assert "fallback" not in e.stats
+
+    # 主引擎失败后才真正实例化备引擎
+    p.fail = True
+    assert e.transcribe(audio())[0]["text"] == "本地"
+    assert len(created) == 1
+    assert "fallback" in e.stats

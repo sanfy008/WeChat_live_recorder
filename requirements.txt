@@ -6,9 +6,9 @@ soundfile>=0.14
 soxr>=1.1
 # 数值计算
 numpy>=2.0
-# 本地 ASR 引擎
+# 本地 ASR 引擎（SenseVoice-Small INT8 首选 + faster-whisper 兼容）
+sherpa-onnx>=1.12
+huggingface_hub>=0.24
 faster-whisper>=1.2
-# 繁转简（Gemini 偶尔输出繁体）
+# 繁转简（Gemini / Whisper 偶尔输出繁体）
 opencc-python-reimplemented>=0.1.7
-# 可选：FunASR / SenseVoice（未接入主链路，仅供实验）
-# funasr>=1.4

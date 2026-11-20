@@ -94,12 +94,18 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         ok = False
 
     # 3. 本地 ASR
-    print(f"\n[3/5] 本地转写引擎（tiny 自检，配置 {args.model}）")
+    local_backend = getattr(args, "local_backend", "sensevoice")
+    print(f"\n[3/5] 本地转写引擎（默认 {local_backend}）")
     try:
-        from .transcriber import Transcriber
-
         t0 = time.time()
-        Transcriber(model_size="tiny", device="cpu", compute_type="int8")
+        if local_backend == "sensevoice":
+            from .sensevoice import SenseVoiceTranscriber
+
+            SenseVoiceTranscriber(num_threads=getattr(args, "local_threads", 2))
+        else:
+            from .transcriber import Transcriber
+
+            Transcriber(model_size="tiny", device="cpu", compute_type="int8")
         print(f"       OK  模型可加载（{time.time() - t0:.1f}s）")
     except Exception as e:  # noqa: BLE001
         print(f"       FAIL {e}")
@@ -198,24 +204,32 @@ def cmd_stream(args: argparse.Namespace) -> int:
 
 
 
+def _asr_config_from_args(args: argparse.Namespace) -> AsrConfig:
+    """从 CLI 参数构造 AsrConfig（record / transcribe / fetch 共用）。"""
+    return AsrConfig(
+        engine=args.engine,
+        local_backend=getattr(args, "local_backend", "sensevoice"),
+        local_threads=getattr(args, "local_threads", 2),
+        gemini_model=args.gemini_model,
+        use_lexicon=not args.no_lexicon,
+        lexicon_path=args.lexicon_path,
+        model_size=args.model,
+        device=args.device_type,
+        compute_type=args.compute_type,
+        language=args.language,
+        gemini_workers=getattr(args, "workers", 8),
+    )
+
+
 def cmd_record(args: argparse.Namespace) -> int:
     from .pipeline import run_pipeline
 
+    asr_cfg = _asr_config_from_args(args)
     cfg = Config(
         audio=AudioConfig(device_hint=args.device or "",
                           sample_rate=getattr(args, "sample_rate", 16000)),
         vad=VadConfig(),
-        asr=AsrConfig(
-            engine=args.engine,
-            gemini_model=args.gemini_model,
-            use_lexicon=not args.no_lexicon,
-            lexicon_path=args.lexicon_path,
-            model_size=args.model,
-            device=args.device_type,
-            compute_type=args.compute_type,
-            language=args.language,
-            gemini_workers=getattr(args, "workers", 8),
-        ),
+        asr=asr_cfg,
     )
     cfg.session_name = args.name or ""
 
@@ -223,7 +237,12 @@ def cmd_record(args: argparse.Namespace) -> int:
     if args.minutes:
         max_seconds = args.minutes * 60
 
-    print(f"模型: {args.model} | 语言: {args.language} | "
+    local_desc = (
+        f"sensevoice(threads={asr_cfg.local_threads})"
+        if asr_cfg.local_backend == "sensevoice"
+        else f"whisper/{asr_cfg.model_size}"
+    )
+    print(f"引擎: {asr_cfg.engine} | 本地: {local_desc} | 语言: {args.language} | "
           f"时长: {'Ctrl+C 结束' if not max_seconds else f'{args.minutes} 分钟'}")
     doc = run_pipeline(cfg, max_seconds=max_seconds)
     print(f"\n共 {len(doc['segments'])} 句，时长 {doc['duration_seconds']}s")
@@ -305,6 +324,8 @@ def cmd_fetch(args: argparse.Namespace) -> int:
             print("\n开始转写…")
             ns = argparse.Namespace(
                 input=str(wav), engine=args.engine,
+                local_backend=getattr(args, "local_backend", "sensevoice"),
+                local_threads=getattr(args, "local_threads", 2),
                 gemini_model=args.gemini_model, no_lexicon=args.no_lexicon,
                 lexicon_path=args.lexicon_path, model=args.model,
                 device_type=args.device_type, compute_type=args.compute_type,
@@ -323,7 +344,6 @@ def cmd_transcribe(args: argparse.Namespace) -> int:
     import soundfile as sf
 
     from .session import Session
-    from .transcriber import Transcriber
 
     src = Path(args.input)
     if not src.exists():
@@ -340,16 +360,7 @@ def cmd_transcribe(args: argparse.Namespace) -> int:
     from .config import Config as _Cfg
     from .pipeline import build_engine
 
-    tr = build_engine(_Cfg(asr=AsrConfig(
-        engine=args.engine,
-        gemini_model=args.gemini_model,
-        use_lexicon=not args.no_lexicon,
-        lexicon_path=args.lexicon_path,
-        model_size=args.model,
-        device=args.device_type,
-        compute_type=args.compute_type,
-        language=args.language,
-    )))
+    tr = build_engine(_Cfg(asr=_asr_config_from_args(args)))
 
     ensure_dirs()
     # record_audio=False：源音频已存在，不再新建 WAV（否则会留下一个 44 字节空壳）
@@ -404,9 +415,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def add_asr_opts(sp: argparse.ArgumentParser) -> None:
-        sp.add_argument("--engine", default="auto", choices=["auto", "local", "gemini"],
-                        help="转写引擎：auto=Gemini优先失败降级本地(默认) / local=纯本地 / gemini=纯云端")
-        sp.add_argument("--gemini-model", default="group/hydrogen",
+        sp.add_argument("--engine", default="local", choices=["auto", "local", "gemini"],
+                        help="转写引擎：local=纯本地SenseVoice首选(默认) / auto=Gemini优先失败降级本地 / gemini=纯云端")
+        sp.add_argument("--local-backend", default="sensevoice", choices=["sensevoice", "whisper"],
+                        help="本地转写后端：sensevoice=SenseVoice-Small INT8(默认,快且省内存) / whisper=faster-whisper(兼容)")
+        sp.add_argument("--local-threads", type=int, default=2,
+                        help="本地推理线程数（默认 2，兼顾速度与多任务 CPU 余量）")
+        sp.add_argument("--gemini-model", default="gcp-ai/gemini-4-hydrogen",
                         help="Gemini 模型（4-hydrogen 最快(默认) / 4-argon 最准 / 3.8-flash 快但会串繁体）")
         sp.add_argument("--no-lexicon", action="store_true",
                         help="关闭 XSC 领域词表（默认开启：注入校名/术语 + 错字纠正 + 暗语展开）")
@@ -414,14 +429,13 @@ def build_parser() -> argparse.ArgumentParser:
                         help="自定义词表 JSON 路径（默认 lexicon/xsc.json）")
         sp.add_argument("--model", default="small",
                         choices=["tiny", "base", "small", "medium", "large-v3"],
-                        help="本地 whisper 模型（默认 small；CPU 上 medium 会明显变慢）")
+                        help="本地 whisper 模型（仅 --local-backend whisper 时生效）")
         sp.add_argument("--device-type", default="cpu", choices=["cpu", "cuda"])
         sp.add_argument("--compute-type", default="int8",
                         choices=["int8", "int8_float16", "float16", "float32"])
         sp.add_argument("--language", default="zh")
         sp.add_argument("--workers", type=int, default=8,
-                        help="Gemini 并发路数（默认 4，实测 2.6x；8 路因争抢反而慢）。"
-                             "设 1 可强制串行")
+                        help="Gemini 并发路数（默认 8）。设 1 可强制串行")
 
     sp = sub.add_parser("gui", help="打开图形界面（推荐）")
     sp.set_defaults(func=cmd_gui)
@@ -431,8 +445,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("doctor", help="环境自检")
     sp.add_argument("--device", default="", help="设备名关键字")
+    sp.add_argument("--local-backend", default="sensevoice", choices=["sensevoice", "whisper"])
+    sp.add_argument("--local-threads", type=int, default=2)
     sp.add_argument("--model", default="small")
-    sp.add_argument("--gemini-model", default="group/hydrogen")
+    sp.add_argument("--gemini-model", default="gcp-ai/gemini-4-hydrogen")
     sp.set_defaults(func=cmd_doctor)
 
     sp = sub.add_parser("stream", help="流地址直录（拿到直播流地址时用，音质最好）")

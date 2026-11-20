@@ -21,6 +21,9 @@ import time
 
 import numpy as np
 
+from . import lexicon
+from .lexicon import to_simplified
+
 
 def _collapse_repeats(text: str, min_phrase: int = 6, max_rounds: int = 8) -> str:
     """压制 whisper 在长音频上的重复循环。
@@ -65,6 +68,7 @@ class Transcriber:
         beam_size: int = 5,
         vad_filter: bool = True,
         initial_prompt: str = "",
+        correct_after: bool = True,
     ) -> None:
         # 国内网络访问 HuggingFace 常被阻断，默认走镜像
         os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
@@ -75,6 +79,7 @@ class Transcriber:
         self.beam_size = beam_size
         self.vad_filter = vad_filter
         self.initial_prompt = initial_prompt
+        self.correct_after = correct_after
 
         t0 = time.time()
         print(f"[asr] 加载模型 faster-whisper/{model_size} ({device}/{compute_type})…")
@@ -118,7 +123,10 @@ class Transcriber:
             text = (s.text or "").strip()
             if not text:
                 continue
+            text = to_simplified(text)
             text = _collapse_repeats(text)
+            if self.correct_after:
+                text = lexicon.correct_text(text)
             if not text:
                 continue
             out.append(

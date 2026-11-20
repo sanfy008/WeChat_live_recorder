@@ -73,15 +73,21 @@ class AsrConfig:
     """转写参数。"""
 
     # 引擎选择：
-    #   "local"  = 纯本地 faster-whisper（隐私安全、永不失效，质量中等）
-    #   "gemini" = magpie 网关调 Gemini（质量高、快，但依赖网络+云端额度）
-    #   "auto"   = Gemini 优先，失败自动熔断降级到本地（推荐）
+    #   "local"  = 纯本地（默认 SenseVoice-Small INT8，隐私安全、快且零幻觉）
+    #   "gemini" = magpie 网关调 Gemini（依赖网络+云端额度）
+    #   "auto"   = Gemini 优先，失败自动熔断降级到本地
     #
-    # 实测：Gemini 中文准确率显著高于 whisper，RTF 0.07-0.14 vs 0.41；
-    # 但有 120s 单次上限和内容安全过滤风险，所以必须有本地兜底。
-    engine: str = "auto"
+    # 2026-11-20 i7-6700 真机实测：SenseVoice-Small INT8 (2t) RTF 0.08、
+    # 峰值内存 ~473MB、无自回归幻觉，日常直接用本地最稳；云端改为按需手切。
+    engine: str = "local"
+    # 本地 ASR 后端：
+    #   "sensevoice" = sherpa-onnx SenseVoice-Small INT8（默认首选）
+    #   "whisper"    = faster-whisper（兼容备选）
+    local_backend: str = "sensevoice"
+    sensevoice_model: str = "csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
+    local_threads: int = 2
     # Gemini 模型。实测质量排序：4-argon（最准）> 3.8-flash（快，但会串繁体）≈ 4-hydrogen（最快）
-    gemini_model: str = "group/hydrogen"
+    gemini_model: str = "gcp-ai/gemini-4-hydrogen"
     gemini_endpoint: str = "http://127.0.0.1:3425/v1/chat/completions"
     gemini_api_key: str = "magpie-alma"
     # Gemini 并发路数。只对云端引擎生效，本地 whisper 走 CPU 并发无益。

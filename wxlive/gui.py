@@ -282,8 +282,8 @@ class App(FetchTabMixin, tk.Tk):
         ttk.Label(r2, text="引擎：").pack(side="left", padx=(14, 2))
         self.engine_var = tk.StringVar()
         ttk.Combobox(r2, textvariable=self.engine_var, width=8, state="readonly",
-                     values=["auto", "gemini", "local"]).pack(side="left")
-        ttk.Label(r2, text="auto=云端优先，失败自动切本地",
+                     values=["local", "auto", "gemini"]).pack(side="left")
+        ttk.Label(r2, text="local=本地SenseVoice首选；auto=云端优先失败切本地",
                   style="Hint.TLabel").pack(side="left", padx=6)
 
         box3 = ttk.LabelFrame(f, text="文字整理（可选，推荐开启）")
@@ -469,8 +469,9 @@ class App(FetchTabMixin, tk.Tk):
         c = self.cfg
         self.api_url_var.set(c.asr.gemini_endpoint.replace("/chat/completions", ""))
         self.api_key_var.set(c.asr.gemini_api_key)
-        self.def_asr_var.set(c.asr.gemini_model)
-        self.asr_model_var.set(c.asr.gemini_model)
+        shown_asr = model_discovery.display_asr_model(c.asr)
+        self.def_asr_var.set(shown_asr)
+        self.asr_model_var.set(shown_asr)
         self.text_model_var.set(c.text.model or postprocess.DEFAULT_MODEL)
         try:
             effort = validate_reasoning_effort(c.text.reasoning_effort)
@@ -490,8 +491,7 @@ class App(FetchTabMixin, tk.Tk):
         self._sync_source_mode()
         self._sync_mode()
         self._refresh_devices()
-        self._apply_model_options([o[0] for o in model_discovery.KNOWN_ASR]
-                                  + [o[0] for o in model_discovery.LOCAL_WHISPER],
+        self._apply_model_options([o[0] for o in model_discovery.merge_asr_options([])],
                                   [o[0] for o in model_discovery.KNOWN_TEXT])
 
     def _apply_model_options(self, asr_ids: list[str], text_ids: list[str]) -> None:
@@ -504,6 +504,23 @@ class App(FetchTabMixin, tk.Tk):
             pass
 
     def _collect_settings(self) -> dict:
+        asr_fields = model_discovery.resolve_asr_model_fields(
+            self.def_asr_var.get(),
+            {
+                "engine": self.engine_var.get() or "local",
+                "local_backend": self.cfg.asr.local_backend,
+                "sensevoice_model": self.cfg.asr.sensevoice_model,
+                "local_threads": self.cfg.asr.local_threads,
+                "gemini_model": self.cfg.asr.gemini_model,
+                "gemini_endpoint": (self.api_url_var.get().rstrip("/")
+                                    + "/chat/completions"),
+                "gemini_api_key": self.api_key_var.get() or "magpie-alma",
+                "gemini_workers": self.cfg.asr.gemini_workers,
+                "model_size": self.cfg.asr.model_size,
+                "use_lexicon": bool(self.lexicon_var.get()),
+                "lexicon_path": self.lex_path_var.get(),
+            },
+        )
         return {
             "audio": {
                 "device_hint": self.cfg.audio.device_hint,
@@ -513,15 +530,7 @@ class App(FetchTabMixin, tk.Tk):
                 "min_silence_seconds": _f(self.minsil_var.get(), 0.7),
                 "cloud_min_segment_seconds": _f(self.cloudmin_var.get(), 8.0),
             },
-            "asr": {
-                "engine": self.engine_var.get() or "auto",
-                "gemini_model": self.def_asr_var.get() or "google-vertex/gemini-4-hydrogen",
-                "gemini_endpoint": (self.api_url_var.get().rstrip("/")
-                                    + "/chat/completions"),
-                "gemini_api_key": self.api_key_var.get() or "magpie-alma",
-                "use_lexicon": bool(self.lexicon_var.get()),
-                "lexicon_path": self.lex_path_var.get(),
-            },
+            "asr": asr_fields,
             "text": {
                 "model": self.text_model_var.get() or postprocess.DEFAULT_MODEL,
                 # 非法档直接抛错，由保存/开始按钮提示，不静默写盘。
@@ -790,13 +799,27 @@ class App(FetchTabMixin, tk.Tk):
         self._log(f"[录制] 完成 {written/sr/60:.1f} 分钟, {written*2/1024/1024:.0f} MB")
         self.after(0, lambda: self.audio_path_var.set(str(out)))
 
+    def _build_runtime_cfg(self) -> Config:
+        cfg = userconfig.build_config_from_user(Config())
+        cfg.asr.engine = self.engine_var.get() or "local"
+        resolved = model_discovery.resolve_asr_model_fields(
+            self.asr_model_var.get(),
+            {
+                "local_backend": cfg.asr.local_backend,
+                "model_size": cfg.asr.model_size,
+                "gemini_model": cfg.asr.gemini_model,
+            },
+        )
+        cfg.asr.local_backend = resolved["local_backend"]
+        cfg.asr.model_size = resolved["model_size"]
+        cfg.asr.gemini_model = resolved["gemini_model"]
+        return cfg
+
     def _run_live(self, name: str, limit: float, silence: float, device: str) -> None:
         """录制 + 实时转写。"""
         from .pipeline import Pipeline
 
-        cfg = userconfig.build_config_from_user(Config())
-        cfg.asr.engine = self.engine_var.get() or "auto"
-        cfg.asr.gemini_model = self.asr_model_var.get() or cfg.asr.gemini_model
+        cfg = self._build_runtime_cfg()
         cfg.audio.device_hint = device
         cfg.session_name = name
         p = Pipeline(cfg)
@@ -907,15 +930,17 @@ class App(FetchTabMixin, tk.Tk):
         self._log(f"===== 开始处理 {src.name} =====")
         t_all = time.time()
 
-        audio, sr = sf.read(str(src), dtype="float32", always_2d=False)
-        if audio.ndim > 1:
-            audio = audio.mean(axis=1)
-        dur = len(audio) / sr
+        info = sf.info(str(src))
+        sr = info.samplerate
+        total = info.frames
+        dur = total / sr if sr else 0.0
         self._log(f"音频 {dur/60:.1f} 分钟，{sr}Hz")
 
-        cfg = userconfig.build_config_from_user(Config())
-        cfg.asr.engine = self.engine_var.get() or "auto"
-        cfg.asr.gemini_model = self.asr_model_var.get() or cfg.asr.gemini_model
+        cfg = self._build_runtime_cfg()
+        self._log(
+            f"ASR 引擎={cfg.asr.engine} | 本地={cfg.asr.local_backend}"
+            f"(threads={cfg.asr.local_threads}) | 云端={cfg.asr.gemini_model}"
+        )
         engine = build_engine(cfg)
 
         text_model = self.text_model_var.get() or cfg.text.model
@@ -932,26 +957,31 @@ class App(FetchTabMixin, tk.Tk):
 
         rs = StreamResampler(in_rate=sr, out_rate=16000)
         block = sr * 300
-        total = len(audio)
         n_blocks = (total + block - 1) // block
 
-        for bi, i in enumerate(range(0, total, block)):
-            if self.stop_flag.is_set():
-                self._log("[中止] 用户中断转写")
-                break
-            piece = audio[i : i + block]
-            pct = int(bi / max(1, n_blocks) * 100)
-            self.after(0, lambda p=pct, b=bi: (
-                self.progress.configure(mode="determinate", value=p),
-                self.status_var.set(f"转写中… {p}%  (第 {b+1}/{n_blocks} 块)")))
-            pcm = rs.process(piece)
-            if len(pcm) == 0:
-                continue
-            res = engine.transcribe(pcm, 16000)
-            if res:
-                sess.add_segments(res, offset=i / sr,
-                                  expand_codes=self.lexicon_var.get())
-            self._log(f"  块 {bi+1}/{n_blocks} 完成，累计 {len(sess.segments)} 句")
+        # 按 300s 块流式读取，避免整段音频一次性解码成 float32 常驻内存
+        with sf.SoundFile(str(src)) as audio_file:
+            for bi in range(n_blocks):
+                if self.stop_flag.is_set():
+                    self._log("[中止] 用户中断转写")
+                    break
+                piece = audio_file.read(frames=block, dtype="float32", always_2d=False)
+                if len(piece) == 0:
+                    break
+                if getattr(piece, "ndim", 1) > 1:
+                    piece = piece.mean(axis=1)
+                pct = int(bi / max(1, n_blocks) * 100)
+                self.after(0, lambda p=pct, b=bi: (
+                    self.progress.configure(mode="determinate", value=p),
+                    self.status_var.set(f"转写中… {p}%  (第 {b+1}/{n_blocks} 块)")))
+                pcm = rs.process(piece)
+                if len(pcm) == 0:
+                    continue
+                res = engine.transcribe(pcm, 16000)
+                if res:
+                    sess.add_segments(res, offset=(bi * block) / sr,
+                                      expand_codes=self.lexicon_var.get())
+                self._log(f"  块 {bi+1}/{n_blocks} 完成，累计 {len(sess.segments)} 句")
 
         tail = rs.flush()
         if len(tail):
@@ -1045,6 +1075,14 @@ class App(FetchTabMixin, tk.Tk):
 
     def _log(self, msg: str) -> None:
         self.log_queue.put(msg)
+        try:
+            log_dir = OUTPUT_DIR / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_file = log_dir / f"gui_{time.strftime('%Y%m%d')}.log"
+            with log_file.open("a", encoding="utf-8") as f:
+                f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+        except Exception:  # noqa: BLE001
+            pass
 
     def _poll_log(self) -> None:
         try:

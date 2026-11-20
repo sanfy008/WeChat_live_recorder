@@ -55,17 +55,32 @@ def build_engine(cfg: Config):
     def _local():
         nonlocal local
         if local is None:
-            # 本地引擎也吃词表：作为 initial_prompt 提供领域偏置。
-            # 措辞刻意写成陈述句而非"以下是……"，避免 whisper 当上文复读。
-            local = Transcriber(
-                model_size=cfg.asr.model_size,
-                device=cfg.asr.device,
-                compute_type=cfg.asr.compute_type,
-                language=cfg.asr.language,
-                beam_size=cfg.asr.beam_size,
-                vad_filter=cfg.asr.vad_filter,
-                initial_prompt=cfg.asr.initial_prompt or hint,
-            )
+            backend = (getattr(cfg.asr, "local_backend", "sensevoice") or "sensevoice").strip().lower()
+            if backend == "sensevoice":
+                from .sensevoice import SenseVoiceTranscriber
+
+                local = SenseVoiceTranscriber(
+                    model_repo_or_dir=getattr(
+                        cfg.asr, "sensevoice_model",
+                        "csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
+                    ),
+                    num_threads=getattr(cfg.asr, "local_threads", 2),
+                    language="auto" if cfg.asr.language == "zh" else cfg.asr.language,
+                    correct_after=cfg.asr.use_lexicon,
+                )
+            else:
+                # 本地 whisper 也吃词表：作为 initial_prompt 提供领域偏置。
+                # 措辞刻意写成陈述句而非"以下是……"，避免 whisper 当上文复读。
+                local = Transcriber(
+                    model_size=cfg.asr.model_size,
+                    device=cfg.asr.device,
+                    compute_type=cfg.asr.compute_type,
+                    language=cfg.asr.language,
+                    beam_size=cfg.asr.beam_size,
+                    vad_filter=cfg.asr.vad_filter,
+                    initial_prompt=cfg.asr.initial_prompt or hint,
+                    correct_after=cfg.asr.use_lexicon,
+                )
         return local
 
     # 领域词表：注入 prompt + 转写后错字纠正，能明显改善专有名词识别
@@ -92,11 +107,11 @@ def build_engine(cfg: Config):
     kind = (cfg.asr.engine or "auto").lower()
 
     if kind == "auto":
-        return FallbackEngine(primary=_gemini(), fallback=_local())
+        return FallbackEngine(primary=_gemini(), fallback_factory=_local)
     if kind == "gemini":
         # 纯 gemini：仍包一层 FallbackEngine，但主引擎失败时没有本地兜底，
         # 保留包装是为了 stats 结构一致；如需纯云端可设 --engine gemini。
-        return FallbackEngine(primary=_gemini(), fallback=_local())
+        return FallbackEngine(primary=_gemini(), fallback_factory=_local)
     return _local()
 
 

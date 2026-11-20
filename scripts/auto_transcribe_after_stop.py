@@ -63,6 +63,10 @@ def main() -> int:
     ap.add_argument("--stable", type=float, default=90, help="文件大小稳定多少秒算停止")
     ap.add_argument("--max-hours", type=float, default=6.0)
     ap.add_argument("--poll", type=float, default=15)
+    ap.add_argument("--engine", choices=["auto", "gemini", "local"], default=None,
+                    help="覆盖 user.json 中的 ASR 引擎选择")
+    ap.add_argument("--local-backend", choices=["sensevoice", "whisper"], default=None,
+                    help="覆盖本地 ASR 后端（默认 sensevoice）")
     args = ap.parse_args()
 
     src = Path(args.wav)
@@ -114,13 +118,32 @@ def main() -> int:
 
     # ---------- 2. 转写 ----------
     try:
-        return _transcribe(src, log)
+        return _transcribe(src, log, engine_override=args.engine,
+                           local_backend_override=args.local_backend)
     except Exception:
         log("转写异常：\n" + traceback.format_exc())
         return 1
 
 
-def _transcribe(src: Path, log) -> int:
+def format_asr_summary(cfg) -> str:
+    """按实际生效的 engine 格式化 ASR 启动日志，避免 local 模式仍打印 Gemini 模型名。"""
+    kind = (cfg.asr.engine or "local").strip().lower()
+    backend = (getattr(cfg.asr, "local_backend", "sensevoice") or "sensevoice").strip().lower()
+    if backend == "sensevoice":
+        threads = getattr(cfg.asr, "local_threads", 2)
+        local_desc = f"sensevoice-small-int8 (cpu/int8, {threads}t)"
+    else:
+        local_desc = f"faster-whisper/{cfg.asr.model_size} ({cfg.asr.device}/{cfg.asr.compute_type})"
+    if kind == "local":
+        return f"{local_desc} [engine=local]"
+    gemini_desc = f"{cfg.asr.gemini_model} / workers={cfg.asr.gemini_workers}"
+    if kind == "gemini":
+        return f"{gemini_desc} [engine=gemini]"
+    return f"{gemini_desc}（兜底 {local_desc}） [engine={kind}]"
+
+
+def _transcribe(src: Path, log, engine_override: str | None = None,
+                local_backend_override: str | None = None) -> int:
     import soundfile as sf
 
     from wxlive import lexicon, postprocess, userconfig
@@ -137,19 +160,18 @@ def _transcribe(src: Path, log) -> int:
     log(f"音频 {dur/60:.1f} 分钟 @ {sr}Hz（{total} 帧）")
 
     cfg = userconfig.build_config_from_user(Config())
-    # ASR 并发显式设 8。config.AsrConfig.gemini_workers 仍是 4 ——
-    # af5e530 那次「默认 4 → 8」只改了 cli.py，config 没跟着改，
-    # 所以走 Config() 的路径（GUI / 本脚本）拿到的还是 4。
-    # 实测 2400s/22 块：4 路 69.2s vs 8 路 37.2s（1.86x）。
-    cfg.asr.gemini_workers = 8
+    if engine_override:
+        cfg.asr.engine = engine_override
+    if local_backend_override:
+        cfg.asr.local_backend = local_backend_override
+    # 尊重 user.json 中的 gemini_workers（未配置时默认沿用 AsrConfig.gemini_workers）。
     try:
         effort = validate_reasoning_effort(cfg.text.reasoning_effort)
     except ValueError as e:
         log(f"配置思考强度非法（{e}），退回 low")
         effort = "low"
     text_model = cfg.text.model
-    log(f"ASR 模型 {cfg.asr.gemini_model} / workers={cfg.asr.gemini_workers}；"
-        f"文本模型 {text_model} / effort={effort}")
+    log(f"ASR 模型 {format_asr_summary(cfg)}；文本模型 {text_model} / effort={effort}")
 
     engine = build_engine(cfg)
 
