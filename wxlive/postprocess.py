@@ -35,13 +35,35 @@ DEFAULT_FIX_WORKERS = 12
 # 默认重试 2 次（共 3 次尝试），总等待 5s，避免把整场耗时拖长。
 FIX_RETRY_DELAYS = (1.0, 4.0)
 
+# 要点终稿的 token 预算与续写上限。网关把 reasoning_tokens 计入 max_tokens，
+# 实测 8000 会在 3000 字左右触顶返回 finish_reason="length"。
+DIGEST_MAX_TOKENS = 16000
+DIGEST_MAX_CONTINUATIONS = 3
+
+
+CONTINUE_PROMPT = (
+    "上一条回复因长度上限被截断。请从中断处紧接着继续写，"
+    "不要重复已输出的内容，不要加任何说明或新标题。"
+)
+
 
 def _call(model: str, prompt: str, endpoint: str, api_key: str,
           max_tokens: int = 8000, timeout: int = 240,
-          reasoning_effort: str | None = DEFAULT_REASONING_EFFORT) -> str:
+          reasoning_effort: str | None = DEFAULT_REASONING_EFFORT,
+          messages: list[dict] | None = None,
+          out_meta: dict | None = None) -> str:
+    """单次网关调用，默认返回 content 文本（保持旧签名兼容）。
+
+    messages 非 None 时代替 prompt 作为对话历史（多轮续写用）；
+    out_meta 非 None 时写入 finish_reason 与 usage。
+
+    实测该网关（workbuddy/deepseek-v4.1-flash）把 reasoning_tokens 计入
+    completion_tokens/max_tokens，触顶时返回 finish_reason="length"、
+    content 被硬截断。调用方必须检查 finish_reason，不能只看有无内容。
+    """
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages if messages is not None else [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
     }
     # 思考档位只在 VALID_REASONING_EFFORTS 里选。实测 group/deepseek 传 medium
@@ -55,7 +77,59 @@ def _call(model: str, prompt: str, endpoint: str, api_key: str,
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:  # noqa: S310
         d = json.loads(r.read().decode())
-    return (d["choices"][0]["message"].get("content") or "").strip()
+    choice = d["choices"][0]
+    if out_meta is not None:
+        out_meta["finish_reason"] = choice.get("finish_reason")
+        out_meta["usage"] = d.get("usage")
+    return (choice["message"].get("content") or "").strip()
+
+
+def _merge_continuation(prev: str, piece: str) -> str:
+    """拼接续写片段，去掉与上一段结尾重复的前缀（模型偶尔会回吐几字）。"""
+    if not prev or not piece:
+        return prev + piece
+    for k in range(min(len(prev), len(piece), 500), 0, -1):
+        if prev.endswith(piece[:k]):
+            return prev + piece[k:]
+    return prev + piece
+
+
+def _complete_multi(messages: list[dict], *, model: str, endpoint: str,
+                    api_key: str, max_tokens: int, timeout: int,
+                    reasoning_effort: str,
+                    max_continuations: int = 3) -> tuple[str, dict]:
+    """调用网关；finish_reason=="length" 时自动多轮续写并拼接。
+
+    返回 (text, meta)。meta 字段：finish_reason（最后一轮）、
+    continuations（续写次数）、truncated（续写用尽后仍被截断）、usage。
+    """
+    convo = list(messages)
+    text = ""
+    cont = 0
+    meta: dict = {"finish_reason": None, "continuations": 0,
+                  "truncated": False, "usage": None}
+    while True:
+        call_meta: dict = {}
+        piece = _call(model, convo[0]["content"], endpoint, api_key,
+                      max_tokens=max_tokens, timeout=timeout,
+                      reasoning_effort=reasoning_effort,
+                      messages=convo, out_meta=call_meta)
+        text = _merge_continuation(text, piece)
+        meta["finish_reason"] = call_meta.get("finish_reason")
+        if call_meta.get("usage") is not None:
+            meta["usage"] = call_meta["usage"]
+        if meta["finish_reason"] != "length":
+            break
+        if cont >= max_continuations:
+            meta["truncated"] = True
+            break
+        cont += 1
+        meta["continuations"] = cont
+        convo = convo + [
+            {"role": "assistant", "content": text},
+            {"role": "user", "content": CONTINUE_PROMPT},
+        ]
+    return text, meta
 
 
 def fix_errors(lines: list[str], model: str = DEFAULT_MODEL,
@@ -123,8 +197,14 @@ def fix_errors(lines: list[str], model: str = DEFAULT_MODEL,
                 if delay:
                     time.sleep(delay)
             try:
+                call_meta: dict = {}
                 res = _call(model, prompt, endpoint, api_key,
-                            reasoning_effort=reasoning_effort)
+                            reasoning_effort=reasoning_effort,
+                            out_meta=call_meta)
+                # 输出被 max_tokens 截断：这批结果不完整，不可信任
+                if call_meta.get("finish_reason") == "length":
+                    last_err = "输出被截断（finish_reason=length）"
+                    continue
                 fixed = [x.strip() for x in res.split("\n") if x.strip()]
                 # 行数不一致时不要用这批结果，避免错位
                 if len(fixed) == len(batch):
@@ -257,16 +337,31 @@ def build_digest(segments: list[dict], model: str = DEFAULT_MODEL,
             chunks.append("\n".join(cur))
 
         partials = []
+        chunk_errors: list[str] = []
+        chunk_continuations = 0
         for i, c in enumerate(chunks):
             p = (f"下面是直播的部分记录（第{i+1}/{len(chunks)}部分），请提炼要点，"
                  f"保留具体学校名、分数、建议，不要泛泛而谈：\n\n{c}")
             try:
-                partials.append(_call(model, p, endpoint, api_key, max_tokens=4000,
-                                      reasoning_effort=reasoning_effort))
+                part, pmeta = _complete_multi(
+                    [{"role": "user", "content": p}], model=model,
+                    endpoint=endpoint, api_key=api_key, max_tokens=4000,
+                    timeout=240, reasoning_effort=reasoning_effort,
+                    max_continuations=2)
+                chunk_continuations += pmeta["continuations"]
+                if pmeta["truncated"]:
+                    chunk_errors.append(
+                        f"第{i+1}部分摘要续写 {pmeta['continuations']} 次后仍被截断")
+                partials.append(part)
             except Exception as e:  # noqa: BLE001
+                chunk_errors.append(f"第{i+1}部分摘要失败: {str(e)[:60]}")
                 partials.append(f"(第{i+1}部分摘要失败: {str(e)[:60]})")
+        stats["chunk_continuations"] = chunk_continuations
+        stats["failed_chunks"] = chunk_errors
         text = "\n\n".join(f"### 片段{i+1}\n{p}" for i, p in enumerate(partials))
         text = text[:60000]
+    else:
+        chunk_errors = []
 
     prompt = (
         f"下面是一场升学规划直播的完整记录{f'（{title}）' if title else ''}。\n"
@@ -279,12 +374,31 @@ def build_digest(segments: list[dict], model: str = DEFAULT_MODEL,
         "要求：保留具体数字和校名，不要编造，不要写客套话。\n\n"
         f"{text}"
     )
+    stats.setdefault("finish_reason", None)
+    stats.setdefault("continuations", 0)
+    stats.setdefault("truncated", False)
     try:
-        return finish(_call(model, prompt, endpoint, api_key, max_tokens=8000,
-                            timeout=300, reasoning_effort=reasoning_effort), True)
+        digest, dmeta = _complete_multi(
+            [{"role": "user", "content": prompt}], model=model,
+            endpoint=endpoint, api_key=api_key, max_tokens=DIGEST_MAX_TOKENS,
+            timeout=600, reasoning_effort=reasoning_effort,
+            max_continuations=DIGEST_MAX_CONTINUATIONS)
     except Exception as e:  # noqa: BLE001
         stats["error"] = str(e)[:150]
         return finish(f"(要点整理失败: {str(e)[:150]})", False)
+
+    stats["finish_reason"] = dmeta["finish_reason"]
+    stats["continuations"] = dmeta["continuations"]
+    stats["truncated"] = dmeta["truncated"]
+
+    errors = list(chunk_errors)
+    if dmeta["truncated"]:
+        errors.append(f"要点整理续写 {dmeta['continuations']} 次后仍被截断"
+                      f"（finish_reason=length），内容不完整")
+    if errors:
+        stats["error"] = "；".join(errors)[:300]
+        return finish(digest, False)
+    return finish(digest, True)
 
 
 def _ts(seconds: float) -> str:
