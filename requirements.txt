@@ -12,3 +12,10 @@ huggingface_hub>=0.24
 faster-whisper>=1.2
 # 繁转简（Gemini / Whisper 偶尔输出繁体）
 opencc-python-reimplemented>=0.1.7
+
+# ===== NAS 无头 Web 服务（wxlive serve / server.py）=====
+# 只有用到 `python -m wxlive serve` 或 GUI 里推送到 NAS 时才需要；
+# 纯本地录制/转写不依赖这些。
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
