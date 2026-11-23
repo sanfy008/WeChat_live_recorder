@@ -174,6 +174,8 @@ class FetchTabMixin:
         self.fetch_tree.column("state", width=150, anchor="center")
         self.fetch_tree.tag_configure("hidden", foreground="#999")
         self.fetch_tree.tag_configure("done", foreground="#1a7f37")
+        # 直播用醒目色：它需要「推 NAS」而不是「下载」，别让人点错
+        self.fetch_tree.tag_configure("live", foreground="#c2410c")
 
         sb = ttk.Scrollbar(mid, orient="vertical", command=self.fetch_tree.yview)
         self.fetch_tree.configure(yscrollcommand=sb.set)
@@ -460,21 +462,55 @@ class FetchTabMixin:
         self._run_bg(work)
 
     def _fetch_push_selected_to_nas(self) -> None:
-        """把列表里选中的条目直接推给 NAS 拉流（适合正在播的直播条目）。"""
-        from . import liveurl
+        """把列表里选中的条目推给 NAS 拉流。
 
+        直播项（url 为空）会**自动取址**：不用去微信重新点工具的下载按钮，
+        地址要么在工具详情里，要么已经躺在工具日志里（实测在微信里打开
+        直播间那一刻就记上了）。取到后还会探一次能不能真拉，避免把一个
+        「主播已下播」的过期地址交给 NAS，让它空转半小时。
+        """
         targets = self._fetch_selected_items()
         if not targets:
             messagebox.showinfo("请先选择", "请在列表里选中要推给 NAS 的条目。")
             return
-        if len(targets) > 1:
+        # 直播优先：同时选中回放和直播时，用户要的显然是那场正在播的
+        lives = [it for it in targets if getattr(it, "is_live", False)]
+        if lives:
+            it = lives[0]
+        else:
+            it = targets[0]
+        if len(targets) > 1 and not lives:
             if not messagebox.askyesno(
                     "推送多条",
-                    f"选中了 {len(targets)} 条，只推送第一条《{targets[0].title}》。继续？"):
+                    f"选中了 {len(targets)} 条，只推送第一条《{it.title}》。继续？"):
                 return
-        it = targets[0]
-        name = liveurl.format_live_title(it.author, it.title, fallback=it.title)
-        self._fetch_nas_push(it.url, name)
+
+        if not getattr(it, "is_live", False):
+            self._fetch_nas_push(it.url, it.title)
+            return
+
+        # ---- 直播：先取一个当下真的能拉的地址 ----
+        from . import fetch as F
+
+        api = self.fetch_api_var.get().strip() or "http://127.0.0.1:2022"
+        self._fetch_nas_set_status("直播取址中…")
+        self._log(f"[NAS] 《{it.title}》是直播，正在自动取流地址…")
+
+        def work() -> None:
+            try:
+                url, src, why = F.resolve_playable_stream(it, api=api)
+            except Exception as exc:  # noqa: BLE001
+                msg = str(exc)
+                self._ui(lambda: self._fetch_nas_set_status("取址失败", warn=True))
+                self._log(f"[NAS] 取址失败：{msg}")
+                self._ui(lambda m=msg: messagebox.showwarning(
+                    "这个直播取不到可用的流地址", m))
+                return
+            self._log(f"[NAS] 取址成功（{src}，{why}）")
+            self._ui(lambda s=src: self._fetch_nas_set_status(f"已取址（{s}）"))
+            self._fetch_nas_push(url, it.title)
+
+        self._run_bg(work)
 
     # ---------- 搜索 ----------
 
@@ -750,11 +786,19 @@ class FetchTabMixin:
                 "· 取消「只看未下载的」可以看已下载过的条目")
 
     def _fetch_add_row(self, it, is_hidden: bool) -> None:
-        """插入一行。状态列同时显示"已下载"与"待下载"。"""
+        """插入一行。状态列区分「直播中」与「待下载/已下载」。
+
+        直播为什么单列状态：直播项在工具库里 url 恒为空，点「下载」既下不了
+        （没有文件），也不该下（要的是推给 NAS 长时间录）。以前这类条目被
+        整个过滤掉，界面里根本看不到正在播的直播。
+        """
         rec = fetchstate.downloaded_info(self._fetch_state, it.content_id)
         if is_hidden:
             state_text = "已删除（隐藏）"
             tags = ("hidden",)
+        elif getattr(it, "is_live", False):
+            state_text = "直播中 → 推 NAS"
+            tags = ("live",)
         elif rec:
             dur = float(rec.get("duration") or 0.0)
             state_text = f"已下载 {dur/60:.0f} 分钟" if dur else "已下载"
@@ -967,6 +1011,23 @@ class FetchTabMixin:
         if not targets:
             messagebox.showinfo("请先选择", "请在列表里选中要下载的条目（可多选）。")
             return
+
+        # 直播不能"下载"：它没有静态文件，只有一个还在增长的流。
+        # 硬下的话要么下到空文件，要么下到半场就断。
+        # 正确动作是把地址交给 NAS 挂着录 —— 直接在这里引导过去。
+        lives = [it for it in targets if getattr(it, "is_live", False)]
+        if lives:
+            rest = len(targets) - len(lives)
+            tail = f"\n\n（另外 {rest} 条回放会照常下载）" if rest else ""
+            if not messagebox.askyesno(
+                    "其中包含直播",
+                    f"选中的 {len(lives)} 条是**正在直播**，没有可直接下载的文件。\n\n"
+                    "要录直播请用「推送选中项到 NAS」：本机可以关掉，NAS 挂着录，"
+                    "停录后自动转写。" + tail + "\n\n先把直播跳过，继续下载其余回放吗？"):
+                return
+            targets = [it for it in targets if not getattr(it, "is_live", False)]
+            if not targets:
+                return
 
         api = self.fetch_api_var.get().strip() or "http://127.0.0.1:2022"
         keep_video = self.fetch_keep_video_var.get()

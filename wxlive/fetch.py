@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -63,21 +64,34 @@ def _fmt_ts(ts: int, ms: bool = False) -> str:
 
 @dataclass
 class ContentItem:
-    """\u4E00\u6761\u5DF2\u6355\u83B7\u7684\u89C6\u9891\u53F7\u5185\u5BB9\u3002"""
+    """一条已捕获的视频号内容。
 
-    content_id: str          # \u7EAF\u6570\u5B57 id
+    is_live 为什么存在：直播项在工具库里 **url 恒为空**（视频号直播没有
+    静态直链，真实地址只在 detail.resources[] 或工具日志里）。旧版
+    _parse_item 把「url 为空」当脏数据丢弃，导致列表里永远看不到正在
+    直播的项，也就没法推给 NAS —— 见 docs/直播取址根因-2026-11-23.md。
+    """
+
+    content_id: str          # 纯数字 id
     title: str
-    url: str                 # \u5E26\u7B7E\u540D\u7684\u76F4\u94FE
+    url: str                 # 带签名直链（直播项可能为空，需 resolve_stream_url）
     source_url: str = ""
     cover_url: str = ""
-    author: str = ""         # \u4F5C\u8005\u6635\u79F0\uFF08\u5DE5\u5177\u4ECE accounts[].nickname \u7ED9\uFF09
-    publish_time: int = 0    # \u4F5C\u54C1\u53D1\u5E03\u65F6\u523B\uFF08unix \u79D2\uFF09
-    captured_at: int = 0     # \u88AB\u5DE5\u5177\u6355\u83B7\u7684\u65F6\u523B\uFF08unix \u6BEB\u79D2\uFF09
-    duration_seconds: float = 0.0  # \u53EA\u6709\u89E3\u6790\uFF08HEAD/\u6574\u6BB5\u63A2\u6D4B\uFF09\u540E\u624D\u77E5\u9053
+    author: str = ""         # 作者昵称（工具从 accounts[].nickname 给）
+    publish_time: int = 0    # 作品发布时刻（unix 秒）
+    captured_at: int = 0     # 被工具捕获的时刻（unix 毫秒）
+    duration_seconds: float = 0.0  # 只有解析（HEAD/整段探测）后才知道
+    is_live: bool = False    # 直播流：地址要另取，不能直接当文件下载
+    live_id: str = ""        # 直播场次 id（orig_<id>_ 里的那段）
 
     @property
     def api_id(self) -> str:
         return f"wxchannels:{self.content_id}"
+
+    @property
+    def needs_stream_url(self) -> bool:
+        """直播项且还没有地址 —— 推 NAS / 解析前必须先取址。"""
+        return self.is_live and not self.url
 
     @property
     def publish_text(self) -> str:
@@ -90,7 +104,7 @@ class ContentItem:
 
 @dataclass
 class ContentPage:
-    """\u4E00\u9875\u5217\u8868\u7ED3\u679C\u3002
+    """一页列表结果。
 
     \u5DE5\u5177\u7684 /api/content/list \u652F\u6301 page/page_size/limit/offset/keyword\uFF0C
     \u5E76\u8FD4\u56DE total \u2014\u2014 \u53EA\u53D6 list \u4F1A\u628A\u603B\u6570\u4E22\u6389\uFF0C\u754C\u9762\u4E0A\u5C31\u53EA\u80FD\u663E\u793A
@@ -149,13 +163,19 @@ def _api_get(base: str, path: str, timeout: int = 20) -> dict:
 
 
 def _parse_item(it: dict) -> ContentItem | None:
-    """\u628A\u5DE5\u5177\u8FD4\u56DE\u7684\u4E00\u6761\u8BB0\u5F55\u8F6C\u6210 ContentItem\u3002\u7F3A id / url \u7684\u4E22\u5F03\u3002"""
+    """把工具返回的一条记录转成 ContentItem。
+
+    只有「缺 id」才丢弃。**url 为空不再丢弃** —— 直播项本来就该是空，
+    以前这条规则把正在直播的内容整条过滤掉，界面上一条都看不到。
+    """
     cid = str(it.get("external_id") or "").strip()
-    url = str(it.get("url") or "").strip()
-    if not cid or not url:
+    if not cid:
         return None
 
-    # \u4F5C\u8005\uFF1Aaccounts[] \u91CC role=owner \u7684\u662F\u771F\u6B63\u4F5C\u8005\uFF0C\u5176\u4F59\u662F\u8F6C\u53D1/\u5408\u4F5C\u53F7
+    url = str(it.get("url") or "").strip()
+    is_live = str(it.get("type") or "").strip().lower() == "live"
+
+    # 作者：accounts[] 里 role=owner 的是真正作者，其余是转发/合作号
     author = ""
     accounts = it.get("accounts") or []
     if isinstance(accounts, list) and accounts:
@@ -184,7 +204,270 @@ def _parse_item(it: dict) -> ContentItem | None:
         author=author,
         publish_time=_int("publish_time"),
         captured_at=_int("created_at"),
+        is_live=is_live,
+        # 直播项的 url 恒为空，所以 live_id 直接取 external_id：
+        # 它与流地址里 orig_<id>_ 的那段一致（实测两个 id 相同）。
+        # 这个值是用来**精确匹配**候选地址的，不能留空 ——
+        # 留空会退化成"随便取日志里最新一条"，那可能是别人的直播。
+        live_id=cid if is_live else "",
     )
+
+
+_LIVE_ID_RE = re.compile(r"/orig_([0-9]+)_")
+
+
+def _live_id_from_url(url: str) -> str:
+    """从视频号直播流地址里取场次 id。
+
+    地址形如 .../trtc_1400419933/orig_2079009824565503324_orig.flv
+    中间的 2079009824565503324 就是 live id（与 content.external_id 一致）。
+    """
+    m = _LIVE_ID_RE.search(url or "")
+    return m.group(1) if m else ""
+
+
+def _looks_like_live(url: str) -> bool:
+    """这条地址是不是视频号**直播流** —— 必须比 liveurl 的判据更严。
+
+    为什么不能直接用 liveurl.looks_like_live_url：那个判据是给「ffmpeg 命令行
+    扫描」用的，只要域名命中 `finder.video.qq.com` 就算。但日志里同一个域名下
+    还有**封面图**（/stodownload?encfilekey=...），实测被误当成直播流抓了出来
+    （39 条候选里一半是封面图），推给 NAS 必然失败。
+
+    直播流的可靠特征是路径里同时有 `/trtc_` 和 `.flv`：
+        .../trtc_1400419933/orig_2079009794242106815_orig.flv
+    封面/视频则走 /stodownload?encfilekey=... ，没有这两段。
+    """
+    low = (url or "").lower()
+    if not low.startswith(("http://", "https://")):
+        return False
+    if "stodownload" in low or "encfilekey=" in low:
+        return False
+    return "/trtc_" in low and ".flv" in low
+
+
+def _collect_live_urls(obj, out: list) -> None:
+    """递归收集 dict/list 里所有像直播流的地址（保序、去重）。
+
+    工具日志是深度嵌套 JSON，liveCdnUrl 既可能在 feed.live.liveSdkInfo，
+    也可能在 profile.liveInfo 下。不写死路径，按「值像不像直播流」判断，
+    这样上游改字段名也不会失效。
+    """
+    if isinstance(obj, dict):
+        for val in obj.values():
+            if isinstance(val, str):
+                if _looks_like_live(val) and val not in out:
+                    out.append(val)
+            else:
+                _collect_live_urls(val, out)
+    elif isinstance(obj, list):
+        for val in obj:
+            _collect_live_urls(val, out)
+
+
+def resolve_stream_url(item: ContentItem, api: str = DEFAULT_API,
+                       timeout: int = 20) -> tuple:
+    """取直播真实流地址，返回 (url, 来源说明)。
+
+    两条路径，按「需不需要先点工具下载按钮」区分：
+
+    1. /api/content/detail -> data.resources[].url
+       只对**已入库**的直播有效。实测：没点过下载按钮的直播根本没入库，
+       detail 直接返回 content not found。
+
+    2. /api/logs -> 递归找 liveCdnUrl 形态的地址
+       **不需要点任何按钮**。实测：在微信里打开直播间那一刻，前端就把带
+       签名的 liveCdnUrl 打进了日志；14:07 的日志里已经有 14:10 才开始录
+       的那条流。所以「点下载后自动解析」的正解是——根本不点下载。
+
+    两条都失败才抛 FetchError，此时才是真的需要用户回微信重开直播间。
+    """
+    reasons = []
+
+    # ---- 路径 1：detail（已入库的直播）----
+    try:
+        data = _api_get(api, "/api/content/detail?id=" +
+                        urllib.parse.quote(item.api_id), timeout=timeout)
+        payload = data.get("data") or {}
+        if data.get("code") in (0, None) and payload:
+            hit = ""
+            for res in payload.get("resources") or []:
+                if not isinstance(res, dict):
+                    continue
+                cand = (str(res.get("stream_url") or "").strip()
+                        or str(res.get("url") or "").strip())
+                if cand and _looks_like_live(cand):
+                    hit = cand
+                    break
+            if hit:
+                return hit, "工具详情"
+            reasons.append("详情里没有直播地址")
+        else:
+            reasons.append("该直播未入库（还没点过工具下载按钮）")
+    except Exception as exc:  # noqa: BLE001
+        reasons.append("详情接口失败：" + type(exc).__name__)
+
+    # ---- 路径 2：日志（未入库的直播也覆盖）----
+    try:
+        logs = _api_get(api, "/api/logs?page_size=800", timeout=timeout)
+        entries = (logs.get("data") or {}).get("entries") or []
+        found = []
+        for entry in entries:
+            raw = entry.get("raw") if isinstance(entry, dict) else None
+            if not isinstance(raw, str):
+                continue
+            if ("liveCdnUrl" not in raw and "wxlivecdn" not in raw
+                    and "wxqcloud" not in raw):
+                continue
+            try:
+                obj = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+            before = len(found)
+            _collect_live_urls(obj, found)
+            # 日志按时间倒序，新增的就是更新的场次，优先匹配同 live_id
+            if len(found) > before and item.live_id:
+                for cand in found[before:]:
+                    if item.live_id in cand:
+                        return cand, "工具日志"
+        reasons.append("日志里没有进行中的直播地址")
+    except Exception as exc:  # noqa: BLE001
+        reasons.append("日志接口失败：" + type(exc).__name__)
+
+    raise FetchError(
+        "取不到直播地址（" + "；".join(reasons) + "）。\n\n"
+        "请在微信里打开该直播间停留 3-5 秒，再点一次「刷新列表」。"
+    )
+
+
+def probe_stream(url: str, timeout: int = 12) -> tuple:
+    """探测直播流当下是否真的能拉。返回 (ok, 说明)。
+
+    为什么必须有这一步：工具库里的直播项**不会过期下线**
+    （用户 11:26 打开过的直播间，到 14:36 还在列表里），
+    但它的签名地址早就连不上了。直接把这种地址推给 NAS，
+    NAS 会拉 30 秒空流再报"文件未增长"，用户还得回来重来一遍。
+
+    用 ffprobe 而不用 HTTP HEAD：直播是持续流，没有 Content-Length，
+    HEAD 只能判断 403/404，判不出"签名有效但主播已下播"这种最常见的情况。
+    ffprobe 能真的读到音轨 = 主播此刻在播。
+    """
+    exe = shutil.which("ffprobe")
+    if not exe:
+        return True, "没有 ffprobe，跳过探测"
+
+    cmd = [
+        exe, "-v", "error",
+        "-rw_timeout", str(int(timeout * 1000000)),
+        "-show_entries", "stream=codec_type",
+        "-of", "default=noprint_wrappers=1",
+        url,
+    ]
+    try:
+        r = winproc.run(cmd, capture_output=True, text=True,
+                        encoding="utf-8", errors="replace",
+                        timeout=timeout + 8)
+    except subprocess.TimeoutExpired:
+        return False, "探测超时（主播可能已下播）"
+    except Exception as exc:  # noqa: BLE001
+        return False, type(exc).__name__
+
+    out = r.stdout or ""
+    if r.returncode == 0 and "codec_type=audio" in out:
+        return True, "可拉流（含音轨）"
+    if r.returncode == 0:
+        return False, "能连但没有音轨"
+    return False, "地址已失效（多半是主播已下播）"
+
+
+def resolve_playable_stream(item: ContentItem, api: str = DEFAULT_API,
+                            timeout: int = 20) -> tuple:
+    """取一个**当下真的能拉**的直播地址，返回 (url, 来源说明, 探测说明)。
+
+    在 resolve_stream_url 之上加一层可用性校验并回退：
+    日志里同一个主播会留下多次开播的地址，最新的那条未必是活的
+    （实测 14:20 那条到 14:36 已失效，而 detail 里 14:07 那条还活着）。
+    所以按候选逐个探，第一个能拉的胜出。
+    """
+    urls = list_stream_candidates(item, api=api, timeout=timeout)
+    if not urls:
+        raise FetchError(
+            "取不到直播地址。\n\n"
+            "请在微信里打开该直播间停留 3-5 秒，再点一次「刷新列表」。"
+        )
+
+    notes = []
+    for url, src in urls[:6]:
+        ok, why = probe_stream(url, timeout=min(12, timeout))
+        notes.append(src + "：" + why)
+        if ok:
+            return url, src, why
+    raise FetchError(
+        "找到的地址都拉不动（多半是主播已下播，或需要重新打开直播间）。\n"
+        + "；".join(notes[:4])
+    )
+
+
+def list_stream_candidates(item: ContentItem, api: str = DEFAULT_API,
+                           timeout: int = 20) -> list:
+    """按可信度列出该直播的所有候选地址 [(url, 来源), ...]。
+
+    顺序：detail（工具自己认的那条，最准）→ 日志里同 live_id 的 → 日志里最新的。
+    调用方负责逐个探测可用性。
+    """
+    seen = set()
+    out = []
+
+    def _add(url: str, src: str) -> None:
+        key = (url or "").split("?", 1)[0]
+        if url and key not in seen:
+            seen.add(key)
+            out.append((url, src))
+
+    try:
+        data = _api_get(api, "/api/content/detail?id=" +
+                        urllib.parse.quote(item.api_id), timeout=timeout)
+        payload = data.get("data") or {}
+        if data.get("code") in (0, None):
+            for res in payload.get("resources") or []:
+                if not isinstance(res, dict):
+                    continue
+                cand = (str(res.get("stream_url") or "").strip()
+                        or str(res.get("url") or "").strip())
+                if cand and _looks_like_live(cand):
+                    _add(cand, "工具详情")
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        logs = _api_get(api, "/api/logs?page_size=800", timeout=timeout)
+        entries = (logs.get("data") or {}).get("entries") or []
+        mine = []
+        rest = []
+        for entry in entries:
+            raw = entry.get("raw") if isinstance(entry, dict) else None
+            if not isinstance(raw, str):
+                continue
+            if ("liveCdnUrl" not in raw and "wxlivecdn" not in raw
+                    and "wxqcloud" not in raw):
+                continue
+            try:
+                obj = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+            batch = []
+            _collect_live_urls(obj, batch)
+            mine.extend(batch)
+        # 只收**同一个 live_id** 的地址。绝不能"日志里最新那条"兜底：
+        # 实测两个不同主播同时在播，全局最新那条属于别人，
+        # 拿它去录会把 B 主播的内容记成 A 的标题（串台）。
+        for cand in mine:
+            if item.live_id and item.live_id in cand:
+                _add(cand, "工具日志")
+    except Exception:  # noqa: BLE001
+        pass
+
+    return out
 
 
 def list_page(api: str = DEFAULT_API, keyword: str = "",
