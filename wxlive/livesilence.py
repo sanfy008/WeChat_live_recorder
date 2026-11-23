@@ -154,6 +154,105 @@ def read_tail_window(
     return audio, sr, start
 
 
+def read_since(path: Path | str, from_sec: float,
+               max_seconds: float = 60.0) -> tuple:
+    """读出 WAV 中 ``from_sec`` 之后的音频，返回 (音频, 采样率, 起始秒)。
+
+    为什么要这个而不是 read_tail_window（2026-11-23 实测后改）：
+
+    实测 ffmpeg 写 WAV 是**每 8 秒落一块、每块刚好 8 秒音频**：
+        7.8s -> 262144B (8.19s)
+       16.1s -> 524288B (16.38s)
+       24.1s -> 786432B (24.58s)
+    而静音检测每 3 秒读"末尾 4.5 秒"，于是：
+      - 8 秒周期里只有 1 次能读到新数据
+      - 另外 2 次读到的是同一段旧数据 -> poll() 返回"文件未增长"
+      - 而且那 4.5 秒窗口只覆盖了 8 秒块的一半，另一半永远没被分析
+
+    实测后果：一场 150 分钟的直播，静音检测只成功跑了 **3 次**，
+    判停完全失效，最后只能等播放地址 404 才收工（白白多录 1 小时+）。
+
+    这个函数改成"从上次分析到的位置读到现在"，无论块多大、跳多慢，
+    每块音频都会被完整分析一次：不丢、不重、不空转。
+
+    max_seconds 是上限保护：如果中间隔了很久（例如 ffmpeg 卡了 10 分钟
+    才开始补写），一次读太多会占内存，截断后由调用方下一轮继续读。
+    """
+    import numpy as _np
+
+    empty = (_np.zeros(0, dtype=_np.float32), 0, 0.0)
+
+    p = Path(path)
+    try:
+        file_size = p.stat().st_size
+    except OSError:
+        return empty
+    if file_size <= 44:
+        return empty
+
+    try:
+        with p.open("rb") as fh:
+            head = fh.read(min(4096, file_size))
+            info = _parse_wav_header(head)
+            if info is None:
+                return empty
+
+            sr = int(info["sr"])
+            channels = int(info["channels"])
+            width = int(info["width"])
+            data_offset = int(info["data_offset"])
+            frame_bytes = channels * width
+            if frame_bytes <= 0 or sr <= 0:
+                return empty
+
+            # 不信任头部声明的长度：ffmpeg 边写边录时头里的 data size
+            # 常常是 0 或巨大值，必须以真实文件长度为准（老坑）。
+            available = file_size - data_offset
+            if available <= 0:
+                return empty
+            total_frames = available // frame_bytes
+
+            start_frame = max(0, int(round(float(from_sec) * sr)))
+            if start_frame >= total_frames:
+                return empty
+
+            want = total_frames - start_frame
+            limit = int(sr * max_seconds)
+            if limit > 0 and want > limit:
+                want = limit
+
+            start_sec = start_frame / float(sr)
+            fh.seek(data_offset + start_frame * frame_bytes)
+            raw = fh.read(want * frame_bytes)
+    except (OSError, EOFError, ValueError):
+        return empty
+
+    if not raw:
+        return empty
+    raw = raw[: (len(raw) // frame_bytes) * frame_bytes]
+    if not raw:
+        return empty
+
+    if info.get("format") == 3 and width == 4:
+        a = _np.frombuffer(raw, dtype="<f4").astype(_np.float32)
+    elif width == 2:
+        a = _np.frombuffer(raw, dtype="<i2").astype(_np.float32) / 32768.0
+    elif width == 4:
+        a = _np.frombuffer(raw, dtype="<i4").astype(_np.float32) / 2147483648.0
+    elif width == 1:
+        a = (_np.frombuffer(raw, dtype=_np.uint8).astype(_np.float32) - 128.0) / 128.0
+    else:
+        return empty
+
+    if channels > 1:
+        usable = (a.size // channels) * channels
+        if usable <= 0:
+            return empty
+        a = a[:usable].reshape(-1, channels).mean(axis=1)
+
+    return a.astype(_np.float32), sr, start_sec
+
+
 def _read_tail_impl(
     path: Path | str, max_seconds: float
 ) -> tuple[np.ndarray, int, float]:

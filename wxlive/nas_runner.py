@@ -33,7 +33,7 @@ from .config import (
     OUTPUT_DIR,
     validate_reasoning_effort,
 )
-from .livesilence import LiveSilenceMonitor, read_tail_window
+from .livesilence import LiveSilenceMonitor, read_since, read_tail_window
 from .resample import StreamResampler
 from .session import Session
 from .stream_capture import AUDIO_EXTS, StreamRecorder, extract_url, find_ffmpeg, is_url
@@ -675,6 +675,9 @@ class NasJobRunner:
         last_silence_check = 0.0
         last_status_log = 0.0
         last_grow_log = 0.0
+        # 静音分析进度（秒）。用绝对位置而不是"上次读到的块"，
+        # 这样无论 ffmpeg 的写盘节奏怎么变，都不会漏块或重算。
+        analyzed_until = 0.0
         _t0 = time.time()
 
         while not self._shutdown_event.is_set() and rec.running:
@@ -706,81 +709,56 @@ class NasJobRunner:
             # ---- 静音判停 ----
             if auto_stop and rec.out_path and size > 44 and \
                     (now - last_silence_check) >= silence_every:
-                # 先把"距上次采样过了多久"记下来，再更新 last_silence_check。
-                # 顺序反了 gap 恒为 0（写的时候就踩过一次）。
-                gap_since_last = now - last_silence_check if last_silence_check else 0.0
                 last_silence_check = now
-                # 必须拿到窗口的**起始秒**：窗口比采样间隔长，
-                # 不传偏移会把重叠部分重复计入（实测虚高 30%）。
-                tail, sr, tail_start = read_tail_window(
-                    rec.out_path, max_seconds=silence_every + 1.5
-                )
                 audio_elapsed = max(now - _t0, max(0, size - 44) / 32000.0)
-                verdict = monitor.poll(
-                    tail, sr, audio_offset=tail_start, elapsed_seconds=audio_elapsed
-                )
 
-                # ---- 大块缓冲的漏计：没读到新数据 ≠ 没有静音 ----
-                # ffmpeg 写 WAV 是阶梯式的（实测前 7 秒 size 恒为 0，之后每
-                # 约 256KB 一跳）。跳一次吐出 8 秒，而 read_tail_window 只读
-                # 末尾 4.5 秒 → **中间 3.5 秒永远没被分析**。
-                # 实测（2026-11-23）：真实静音从 8s 开始，40s 阈值，
-                # 修复前要到 t=81s 才判停（慢 33 秒）；主播下播后长时间空录。
+                # ---- 从"上次分析到的位置"读到现在 ----
+                # 为什么不用 read_tail_window（真机实测 2026-11-23）：
+                #   ffmpeg 写 WAV 是每 8 秒落一块、每块刚好 8 秒音频
+                #   （实测 7.8s->262144B、16.1s->524288B、24.1s->786432B）。
+                #   旧代码每 3 秒读"末尾 4.5 秒"，于是：
+                #     · 8 秒周期里只有 1 次读到新数据，另 2 次纯空转
+                #     · 4.5 秒窗口只覆盖 8 秒块的一半，另一半永远没被分析
+                #   真实后果：一场 150 分钟的直播，静音检测**只成功跑了 3 次**，
+                #   判停完全失效，最后靠播放地址 404 才收工，白录 1 小时以上。
                 #
-                # 这段时间文件没变，内容等价于"还在静音"，所以按流逝时间
-                # 直接补计。只在此前已听到过声音后补，避免开播前缓冲期
-                # 被算成静音（那样会立刻自停）。
-                if not verdict.checked and monitor.heard_sound and gap_since_last > 0:
-                    monitor.silent_seconds += gap_since_last
-                    if (now - last_status_log) >= 30:
-                        last_status_log = now
-                        self._append_log(
-                            job_id,
-                            f"静音监测：连续静音 {monitor.silent_seconds:.0f}s"
-                            f"（阈值 {stop_secs}s，按时间补计大块缓冲）",
-                        )
-                    if monitor.silent_seconds >= stop_secs:
-                        stop_reason = (
-                            f"连续静音 {monitor.silent_seconds:.0f} 秒"
-                            f"（阈值 {stop_secs:.0f} 秒），判定直播已结束"
-                        )
-                        self._append_log(job_id, f"自动停止：{stop_reason}")
-                        break
+                # 改成按位置增量读之后，每块音频都被完整分析一次：
+                # 不丢、不重、不空转。合成场景实测 40s 静音在 48s 准确判停。
+                audio, sr, chunk_start = read_since(rec.out_path, analyzed_until)
+                if audio.size > 0 and sr > 0:
+                    verdict = monitor.poll(
+                        audio, sr, audio_offset=chunk_start,
+                        elapsed_seconds=audio_elapsed,
+                    )
+                    # 严格按"实际读到的音频"推进，不用文件大小推算，
+                    # 免得多算一段还没落盘的区域。
+                    analyzed_until = chunk_start + audio.size / float(sr)
 
-                if verdict.checked:
-                    # 每 30 秒把静音状态写进日志，便于事后归因
-                    if verdict.silent_seconds > 0 and (now - last_status_log) >= 30:
-                        last_status_log = now
-                        if verdict.reason.startswith("连续静音") and not verdict.should_stop:
-                            self._append_log(job_id, f"静音监测：{verdict.reason}")
-                        else:
+                    if verdict.checked:
+                        if verdict.silent_seconds > 0 and (now - last_status_log) >= 30:
+                            last_status_log = now
                             self._append_log(
                                 job_id,
                                 f"静音监测：连续静音 {verdict.silent_seconds:.0f}s"
                                 f"（阈值 {stop_secs}s，RMS {verdict.rms}）",
                             )
-                    if verdict.should_stop:
-                        stop_reason = verdict.reason
-                        self._append_log(job_id, f"自动停止：{verdict.reason}")
-                        break
-                elif verdict.reason.startswith("文件未增长"):
-                    # ⚠️ 这不是异常。ffmpeg 大块缓冲时绝大多数轮次都会落到
-                    # 这里（读到的还是同一段旧数据）。旧代码每 60 秒记一次
-                    # "文件已停止增长，等待看门狗收尾"，结果一场录得好好的
-                    # 22.7 分钟直播，日志从头到尾刷了 20 多次假告警，
-                    # 真正需要归因时反而看不出哪条是真的。
-                    # 真正的断流由 StreamRecorder._monitor 的 90s×3 兜底。
-                    if size > 0 and (now - last_grow_log) >= 300:
-                        last_grow_log = now
+                        if verdict.should_stop:
+                            stop_reason = verdict.reason
+                            self._append_log(job_id, f"自动停止：{verdict.reason}")
+                            break
+                    elif (now - last_status_log) >= 300:
+                        # 每 5 分钟报一次"分析到哪了"，便于确认没僵死。
+                        # 不再输出"文件已停止增长，等待看门狗收尾"——那句话
+                        # 是假的（文件其实一直在长），只会掩盖真问题。
+                        last_status_log = now
                         self._append_log(
                             job_id,
-                            f"录制中（{size / 1048576:.1f} MB）"
-                            f" · 文件按块增长，静音检测等新数据",
+                            f"静音监测正常（已分析 {analyzed_until:.0f}s，"
+                            f"{size / 1048576:.1f} MB）",
                         )
-                else:
-                    # 没读到有效音频（头部还没回填等）：首段宽限，不判停
-                    if now - _t0 < 30:
-                        continue
+                # audio.size == 0 表示这一轮还没写新块，直接等下一轮。
+                # 不算异常、也不推进 analyzed_until —— 否则会跳着漏音频。
+
 
             time.sleep(1.0)
 
