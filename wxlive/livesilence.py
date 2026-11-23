@@ -259,11 +259,13 @@ class LiveSilenceMonitor:
         stop_after_seconds: float = 40.0,
         block_seconds: float = 0.5,
         require_sound_before: bool = True,
+        min_record_seconds: float = 0.0,
     ) -> None:
         self.silence_rms = float(silence_rms)
         self.stop_after_seconds = float(stop_after_seconds)
         self.block_seconds = max(0.1, float(block_seconds))
         self.require_sound_before = bool(require_sound_before)
+        self.min_record_seconds = max(0.0, float(min_record_seconds))
         self.silent_seconds = 0.0
         self.heard_sound = False
         self._last_rms = 0.0
@@ -276,6 +278,7 @@ class LiveSilenceMonitor:
         sample_rate: int,
         *,
         audio_offset: float | None = None,
+        elapsed_seconds: float | None = None,
     ) -> SilenceVerdict:
         """分析一段音频。
 
@@ -284,6 +287,8 @@ class LiveSilenceMonitor:
             sample_rate: 采样率
             audio_offset: 这段音频在文件里的起始**秒**位置。
                 传入时只分析"上次之后的新增部分"；不传则整段计入。
+            elapsed_seconds: 当前已录制总时长（秒），用于最短录制保护。
+                不传则退回已消费音频的累计位置。
         """
         if sample_rate <= 0 or audio is None or audio.size == 0:
             return SilenceVerdict(
@@ -365,6 +370,19 @@ class LiveSilenceMonitor:
             return verdict
 
         if self.silent_seconds >= self.stop_after_seconds:
+            elapsed = (
+                float(elapsed_seconds)
+                if elapsed_seconds is not None
+                else float(self._consumed_end or 0.0)
+            )
+            if self.min_record_seconds > 0 and elapsed < self.min_record_seconds:
+                verdict.should_stop = False
+                verdict.reason = (
+                    f"连续静音 {self.silent_seconds:.0f} 秒，"
+                    f"但录制未满最短保护时长 {self.min_record_seconds:.0f} 秒"
+                    f"（已录 {elapsed:.0f} 秒），暂不停止"
+                )
+                return verdict
             verdict.should_stop = True
             verdict.reason = (
                 f"连续静音 {self.silent_seconds:.0f} 秒"

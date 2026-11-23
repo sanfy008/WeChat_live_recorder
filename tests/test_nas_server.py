@@ -564,5 +564,34 @@ def test_h2_recording_limits_defaults(tmp_path: Path):
         s = runner.get_settings()
         assert s["max_record_hours"] > 0
         assert s["max_record_gb"] > 0
+        assert s["min_record_seconds"] == 300
     finally:
         runner.shutdown()
+
+
+def test_min_record_and_limits_settings_api_roundtrip(tmp_path: Path):
+    """min_record_seconds 与录制上限通过 PUT /api/settings 可读写，首页含四标签页。"""
+    runner = NasJobRunner(data_dir=tmp_path, engine_factory=lambda t, l: _FakeEngine())
+    try:
+        app = create_app(runner=runner)
+        with TestClient(app) as client:
+            r = client.put(
+                "/api/settings",
+                json={
+                    "min_record_seconds": 600,
+                    "max_record_hours": 6,
+                    "max_record_gb": 3,
+                },
+            )
+            assert r.status_code == 200
+            data = r.json()
+            assert data["min_record_seconds"] == 600
+            assert data["max_record_hours"] == 6
+            assert data["max_record_gb"] == 3
+
+            home = client.get("/").text
+            for marker in ("view-workspace", "view-library", "view-storage", "view-settings", "最短录制保护"):
+                assert marker in home
+    finally:
+        runner.shutdown()
+

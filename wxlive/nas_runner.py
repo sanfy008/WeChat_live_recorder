@@ -102,6 +102,10 @@ class NasSettings:
     max_record_hours: int = 8
     # 单个任务音频上限（GB）。0 = 不限制。8h@16k mono ≈ 0.88GB，留足余量。
     max_record_gb: int = 2
+    # ---- 最短录制保护（2026-11-23 新增）----
+    # 开播前 N 秒内即使出现连续静音（如主播调试设备、短暂离开）也不自动停录。
+    # 默认 300 秒（5 分钟）；0 = 不保护。
+    min_record_seconds: int = 300
 
     @classmethod
     def from_env(cls) -> NasSettings:
@@ -149,6 +153,10 @@ class NasSettings:
             max_gb = int(os.environ.get("WXLIVE_MAX_RECORD_GB", "2") or 2)
         except ValueError:
             max_gb = 2
+        try:
+            min_secs = int(os.environ.get("WXLIVE_MIN_RECORD_SECONDS", "300") or 300)
+        except ValueError:
+            min_secs = 300
         return cls(
             local_threads=threads,
             use_lexicon=True,
@@ -165,6 +173,7 @@ class NasSettings:
             cleanup_interval_hours=max(1, cleanup_hours),
             max_record_hours=max(0, max_hours),
             max_record_gb=max(0, max_gb),
+            min_record_seconds=max(0, min_secs),
         )
 
     def to_public_dict(self) -> dict[str, Any]:
@@ -187,6 +196,7 @@ class NasSettings:
             "cleanup_interval_hours": self.cleanup_interval_hours,
             "max_record_hours": self.max_record_hours,
             "max_record_gb": self.max_record_gb,
+            "min_record_seconds": self.min_record_seconds,
         }
 
 
@@ -250,7 +260,7 @@ class NasJobRunner:
                     "cleanup_interval_hours",
                     "auto_stop_on_silence", "silence_stop_seconds",
                     "silence_rms_threshold",
-                    "max_record_hours", "max_record_gb",
+                    "max_record_hours", "max_record_gb", "min_record_seconds",
                 ):
                     if key in raw and raw[key] is not None:
                         setattr(cfg, key, raw[key])
@@ -260,6 +270,7 @@ class NasJobRunner:
                 cfg.cleanup_interval_hours = max(1, int(cfg.cleanup_interval_hours))
                 cfg.silence_stop_seconds = max(10, int(cfg.silence_stop_seconds))
                 cfg.silence_rms_threshold = max(0.0, float(cfg.silence_rms_threshold))
+                cfg.min_record_seconds = max(0, int(cfg.min_record_seconds))
         except Exception:
             pass
         return cfg
@@ -294,6 +305,8 @@ class NasJobRunner:
                 s.max_record_hours = max(0, int(patch["max_record_hours"]))
             if "max_record_gb" in patch and patch["max_record_gb"] is not None:
                 s.max_record_gb = max(0, int(patch["max_record_gb"]))
+            if "min_record_seconds" in patch and patch["min_record_seconds"] is not None:
+                s.min_record_seconds = max(0, int(patch["min_record_seconds"]))
             if "llm_endpoint" in patch and patch["llm_endpoint"] is not None:
                 s.llm_endpoint = str(patch["llm_endpoint"]).strip()
             if "llm_model" in patch and patch["llm_model"] is not None:
@@ -623,6 +636,7 @@ class NasJobRunner:
             rms_thr = self._settings.silence_rms_threshold
             max_hours = self._settings.max_record_hours
             max_gb = self._settings.max_record_gb
+            min_secs = self._settings.min_record_seconds
 
         max_bytes = max_gb * 1024 * 1024 * 1024 if max_gb > 0 else 0
         max_secs = max_hours * 3600 if max_hours > 0 else 0
@@ -631,6 +645,7 @@ class NasJobRunner:
             silence_rms=rms_thr,
             stop_after_seconds=stop_secs,
             require_sound_before=True,
+            min_record_seconds=min_secs,
         )
         stop_reason = ""
         # 每 3 秒做一次静音采样：块长 0.5s，3 秒窗口能覆盖 6 个块，
@@ -675,16 +690,22 @@ class NasJobRunner:
                 tail, sr, tail_start = read_tail_window(
                     rec.out_path, max_seconds=silence_every + 1.5
                 )
-                verdict = monitor.poll(tail, sr, audio_offset=tail_start)
+                audio_elapsed = max(now - _t0, max(0, size - 44) / 32000.0)
+                verdict = monitor.poll(
+                    tail, sr, audio_offset=tail_start, elapsed_seconds=audio_elapsed
+                )
                 if verdict.checked:
                     # 每 30 秒把静音状态写进日志，便于事后归因
                     if verdict.silent_seconds > 0 and (now - last_status_log) >= 30:
                         last_status_log = now
-                        self._append_log(
-                            job_id,
-                            f"静音监测：连续静音 {verdict.silent_seconds:.0f}s"
-                            f"（阈值 {stop_secs}s，RMS {verdict.rms}）",
-                        )
+                        if verdict.reason.startswith("连续静音") and not verdict.should_stop:
+                            self._append_log(job_id, f"静音监测：{verdict.reason}")
+                        else:
+                            self._append_log(
+                                job_id,
+                                f"静音监测：连续静音 {verdict.silent_seconds:.0f}s"
+                                f"（阈值 {stop_secs}s，RMS {verdict.rms}）",
+                            )
                     if verdict.should_stop:
                         stop_reason = verdict.reason
                         self._append_log(job_id, f"自动停止：{verdict.reason}")
@@ -1189,7 +1210,10 @@ class NasJobRunner:
                 return
             while not self._shutdown_event.is_set():
                 try:
-                    self.run_cleanup(dry_run=False, trigger="auto")
+                    with self._lock:
+                        enabled = self._settings.retention_days > 0
+                    if enabled:
+                        self.run_cleanup(dry_run=False, trigger="auto")
                 except Exception as exc:  # noqa: BLE001
                     self._last_cleanup = {
                         "at": time.strftime("%Y-%m-%d %H:%M:%S"),

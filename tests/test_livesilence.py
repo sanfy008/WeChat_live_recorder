@@ -357,3 +357,37 @@ def test_m1_leftover_not_swallowed(tmp_path: Path):
     v2 = mon.poll(tail, sr, audio_offset=start)
     assert v2.checked, "0.2+0.4 秒仍未凑成一个块 —— 尾巴被吞了"
     assert mon.silent_seconds >= 0.5
+
+
+def test_min_record_seconds_blocks_early_stop_then_stops_after_guard():
+    """最短录制时长保护：前 300s 内连续静音>=40s 不停；恢复说话清零；满 300s 后立即停。"""
+    mon = LiveSilenceMonitor(
+        stop_after_seconds=40,
+        min_record_seconds=300,
+    )
+    # 0..30s 有声
+    v = mon.poll(_tone(30.0), SR, audio_offset=0.0, elapsed_seconds=30.0)
+    assert v.heard_sound is True
+    assert not v.should_stop
+
+    # 30..80s 连续静音 50s（已超 40s 阈值，但总时长仅 80s < 300s）-> 不能停
+    v = mon.poll(_silence(50.0), SR, audio_offset=30.0, elapsed_seconds=80.0)
+    assert v.silent_seconds == pytest.approx(50.0, abs=0.5)
+    assert v.should_stop is False
+    assert "最短保护时长" in v.reason
+
+    # 80..90s 主播回来继续说话 -> 静音计数必须清零
+    v = mon.poll(_tone(10.0), SR, audio_offset=80.0, elapsed_seconds=90.0)
+    assert v.silent_seconds == 0.0
+    assert v.should_stop is False
+
+    # 90..260s 讲话后，260..299s 静音 39s -> 未满 40s 且未满 300s
+    v = mon.poll(_tone(170.0), SR, audio_offset=90.0, elapsed_seconds=260.0)
+    v = mon.poll(_silence(39.0), SR, audio_offset=260.0, elapsed_seconds=299.0)
+    assert v.should_stop is False
+
+    # 299..305s 继续静音 6s（累计 45s >= 40s，且已录 305s >= 300s）-> 立即判停
+    v = mon.poll(_silence(6.0), SR, audio_offset=299.0, elapsed_seconds=305.0)
+    assert v.should_stop is True
+    assert "连续静音" in v.reason
+
