@@ -18,6 +18,27 @@ services:
       - WXLIVE_LLM_API_KEY=${WXLIVE_LLM_API_KEY:-}
       - WXLIVE_LLM_MODEL=${WXLIVE_LLM_MODEL:-workbuddy/deepseek-v4.1-flash}
       - WXLIVE_LLM_EFFORT=${WXLIVE_LLM_EFFORT:-low}
+      # 用宿主机的 ffmpeg（见下方挂载说明），并把 WXLIVE_FFMPEG 指过去，
+      # 让 find_ffmpeg() 优先用它，而不是镜像自带的旧版。
+      - WXLIVE_FFMPEG=/host-ffmpeg/ffmpeg
+      - WXLIVE_FFPROBE=/host-ffmpeg/ffprobe
+      - LD_LIBRARY_PATH=/host-ffmpeg/lib
     volumes:
       - ./data:/app/data
       - ./hf_cache:/app/hf_cache
+      # ------------------------------------------------------------------
+      # 宿主机 ffmpeg（只读挂载）
+      #
+      # 为什么必须这么做（实测 2026-11-23）：
+      #   视频号这条直播流的视频轨是 hevc 的一个新变体，flv demuxer 报
+      #   「Video codec (c) is not implemented」。这个 `(c)` 是未识别的
+      #   4CC 码。镜像里 Debian 自带的 ffmpeg 7.1.5（trixie）同样解不了，
+      #   所以「升级 ffmpeg 版本」这条路走不通。
+      #   fnOS 自带的 /usr/trim/lib/mediasrv/ffmpeg 8.1.1-mediasrv 可以正常
+      #   解析（实测容器内录 10s 得到 320KB 有效 WAV）。
+      #
+      #   /usr/trim 属于 trim 系统包，路径稳定；它的 lib 依赖 106 个库，
+      #   单独拷二进制会缺 libavdevice.so.62 等，必须整个 lib 目录一起挂。
+      #   glibc: 容器 2.41 ≥ 宿主机 2.36，符号兼容。
+      # ------------------------------------------------------------------
+      - /usr/trim/lib/mediasrv:/host-ffmpeg:ro

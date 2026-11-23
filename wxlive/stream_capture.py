@@ -36,7 +36,22 @@ AUDIO_EXTS = (".wav", ".m4a", ".mp3", ".aac", ".flac", ".ogg", ".opus")
 
 
 def find_ffmpeg() -> str | None:
-    """找 ffmpeg。优先 PATH，其次常见安装位置。"""
+    """找 ffmpeg。
+
+    优先级：环境变量 WXLIVE_FFMPEG → PATH → 常见安装位置。
+
+    为什么要环境变量优先（实测 2026-11-23）：
+      NAS 容器里 Debian 自带的 ffmpeg 7.1.5 解不了视频号直播流的视频轨
+      （flv demuxer 报 "Video codec (c) is not implemented"，视频走完
+      也不报致命错，但整条流解析不出来、录音产出 0 字节）。
+      fnOS 自带的 /usr/trim/lib/mediasrv/ffmpeg 8.1.1-mediasrv 可以。
+      所以镜像里那份旧版必须能被显式覆盖掉 —— 光靠 PATH 顺序不够可靠，
+      因为镜像里的 /usr/bin/ffmpeg 在 PATH 里必然排前面。
+    """
+    env = os.environ.get("WXLIVE_FFMPEG", "").strip()
+    if env and Path(env).exists():
+        return env
+
     p = shutil.which("ffmpeg")
     if p:
         return p
@@ -62,7 +77,9 @@ def probe_url(url: str, timeout: int = 20) -> dict:
     # 注意：chocolatey 装的 ffmpeg 是大写 .EXE，
     # 直接 replace("ffmpeg.exe") 匹配不到，会把 ffmpeg 当 ffprobe 调用而报
     # "Option not found"。所以用 Path 的父目录 + shutil.which 双保险。
-    probe = shutil.which("ffprobe") or ""
+    probe = os.environ.get("WXLIVE_FFPROBE", "").strip()
+    if not (probe and Path(probe).exists()):
+        probe = shutil.which("ffprobe") or ""
     if not probe:
         for ext in (".exe", ".EXE", ""):
             cand = Path(ff).with_name("ffprobe" + ext)
@@ -117,8 +134,17 @@ def _force_ipv4_url(url: str) -> str:
     try:
         infos = socket.getaddrinfo(host, parts.port or 80,
                                    socket.AF_INET, socket.SOCK_STREAM)
-        if infos:
-            ip = infos[0][4][0]
+        for info in infos:
+            cand = info[4][0]
+            addr = ipaddress.ip_address(cand)
+            # 只接受公网地址。必须排除：
+            #   - 回环 / 私有 / 链路本地：本机 DNS 被抓流工具 MITM 时，
+            #     视频号 CDN 域名会解析成 127.208.0.126 之类的假地址
+            #     （实测踩过：拿它去拉流得到 403，排查了很久）
+            #   - 任何非全局地址
+            if addr.is_global and not addr.is_multicast:
+                ip = cand
+                break
     except Exception:  # noqa: BLE001
         return url
     if not ip:
@@ -167,7 +193,12 @@ def _probe_once(ff: str, url: str, timeout: int) -> dict:
     （实测踩过：一个验证脚本跑了 150 秒还没返回）。
     实测 `Input #0` 在 0.24 秒就出现了，所以看到它就立刻 kill 进程。
     """
+    # -vn 丢掉视频：我们只要音频，而容器里的 ffmpeg 是 Debian 自带的
+    # 5.1.9，解码不了视频号这条流的 hevc 变体（实测报
+    # "Video codec (c) is not implemented"）。不加 -vn 会把这个
+    # **与音频无关**的解码失败误判成"流不可用"。
     cmd = [ff, "-hide_banner", "-nostats", "-v", "info",
+           "-vn",
            "-i", url,
            "-f", "null", "-"]
 
@@ -225,6 +256,11 @@ def _probe_once(ff: str, url: str, timeout: int) -> dict:
     has_video = any("Video:" in x for x in lines)
     if not has_audio and not has_video:
         return {"ok": False, "error": "连上了但没有任何音视频流"}
+    # 只要流里有音频就够用（我们录的是音轨）。视频编码解不了不影响结论，
+    # 但要如实告诉用户，免得以为是音频有问题。
+    warn = ""
+    if not has_audio and has_video:
+        warn = "（只有视频轨，没有音频）"
 
     brief = " | ".join(x for x in lines if x.startswith(("Input #0", "Stream #0")))
     return {"ok": True, "info": brief[:300],
@@ -328,10 +364,14 @@ class StreamRecorder:
                 "-rw_timeout", "30000000",  # 30s 无数据视为断流
             ]
 
-        # 直播源在容器里可能解析到不通的 IPv6（实测 NAS Docker 环境：
-        # 该 CDN 的 IPv6 curl 直接 HTTP 000）。ffmpeg 不会自动回退 IPv4，
-        # 又没有 -4 选项，所以这里先把主机名换成 IPv4 再交给 ffmpeg。
-        self._effective_url = _force_ipv4_url(self.url)
+        # 注意：这里**不能**把主机名换成 IP。
+        # 视频号 CDN 会对签名 URL 校验 Host 头，换了主机名会直接 403
+        # （实测 2026-11-23：换成 127.208.0.126 后 ffmpeg 报
+        #   "HTTP error 403 Forbidden"）。而且本机的 DNS 被抓流工具
+        # MITM 劫持，解析出来的是假地址。
+        # IPv6 不通的问题用 WXLIVE_FFMPEG 指定宿主机 ffmpeg 解决，
+        # 不需要动 URL。
+        self._effective_url = self.url
         cmd += ["-i", self._effective_url]
 
         # 只保留音轨，直接出 16k 单声道 PCM，ASR 拿到就能用
