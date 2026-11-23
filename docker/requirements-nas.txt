@@ -1,0 +1,10 @@
+# NAS / Docker 无头服务端最小依赖（剔除 Windows 专用的 PyAudioWPatch 与重型 faster-whisper）
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+soundfile>=0.14
+soxr>=1.1
+numpy>=2.0
+sherpa-onnx>=1.12
+huggingface_hub>=0.24
+opencc-python-reimplemented>=0.1.7

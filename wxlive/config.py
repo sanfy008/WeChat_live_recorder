@@ -1,10 +1,11 @@
 """集中配置。所有可调参数集中在此，避免散落在各处。"""
 
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-OUTPUT_DIR = ROOT / "output"
+OUTPUT_DIR = Path(os.environ.get("WXLIVE_OUTPUT_DIR") or (ROOT / "output"))
 RECORDINGS_DIR = OUTPUT_DIR / "recordings"
 TRANSCRIPTS_DIR = OUTPUT_DIR / "transcripts"
 

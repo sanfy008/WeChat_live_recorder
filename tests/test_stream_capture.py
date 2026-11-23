@@ -126,3 +126,62 @@ def test_probe_local_file_ok(sample_wav):
     r = stream_capture.probe_url(str(sample_wav), timeout=15)
     assert r["ok"] is True, f"探测失败: {r.get('error')}"
     assert r["has_audio"] is True
+
+
+# ---------------- 从粘贴内容里抠地址 ----------------
+
+LIVE_URL = (
+    "https://pull-m1.wxlivecdn.com/trtc_1400123456/orig_abc.flv"
+    "?txSecret=deadbeef&txTime=6AE401F7"
+)
+
+
+def test_extract_url_plain():
+    assert stream_capture.extract_url(LIVE_URL) == LIVE_URL
+
+
+def test_extract_url_ffmpeg_command_with_quotes():
+    """微信下载按钮复制的就是这种整条命令，必须能直接吃下去。"""
+    cmd = f'ffmpeg -i "{LIVE_URL}" -c copy -y "live_abc.flv"'
+    assert stream_capture.extract_url(cmd) == LIVE_URL
+
+
+def test_extract_url_ffmpeg_command_escaped_quotes():
+    """有些终端/工具复制出来是转义引号形态。"""
+    cmd = f'ffmpeg -i \\"{LIVE_URL}\\" -c copy -y out.flv'
+    assert stream_capture.extract_url(cmd) == LIVE_URL
+
+
+def test_extract_url_keeps_query_string():
+    """URL 里的 ? & 不能被截断，否则签名丢失。"""
+    got = stream_capture.extract_url(f'ffmpeg -i "{LIVE_URL}" -c copy')
+    assert "txSecret=deadbeef" in got and "txTime=6AE401F7" in got
+
+
+def test_extract_url_single_quotes_and_whitespace():
+    assert stream_capture.extract_url(f"  '{LIVE_URL}'  ") == LIVE_URL
+    assert stream_capture.extract_url(f'ffmpeg  -i  {LIVE_URL}  -c copy') == LIVE_URL
+
+
+def test_extract_url_rtmp():
+    rtmp = "rtmp://live.example.com/app/streamkey"
+    assert stream_capture.extract_url(rtmp) == rtmp
+    assert stream_capture.extract_url(f'ffmpeg -i "{rtmp}" -c copy') == rtmp
+
+
+def test_extract_url_returns_empty_for_garbage():
+    for bad in ("", "   ", "随便一段中文", "https://example.com/a.mp4 但不是流", "ffmpeg -c copy"):
+        got = stream_capture.extract_url(bad)
+        # "https://example.com/a.mp4" 属于合法 http 地址，允许返回；其余必须为空
+        if got:
+            assert stream_capture.is_url(got)
+        else:
+            assert got == ""
+
+
+def test_extract_url_then_is_url_contract():
+    """extract_url 的返回值要么可直接喂 ffmpeg，要么为空——不能是半截。"""
+    for text in (LIVE_URL, f'ffmpeg -i "{LIVE_URL}" -c copy -y x.flv', "garbage", ""):
+        got = stream_capture.extract_url(text)
+        if got:
+            assert stream_capture.is_url(got), got

@@ -165,14 +165,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 def cmd_stream(args: argparse.Namespace) -> int:
     """流地址直录（不转写），产出 16k 单声道 WAV。"""
     from .config import RECORDINGS_DIR, ensure_dirs
-    from .stream_capture import StreamRecorder, is_url, probe_url
+    from .stream_capture import StreamRecorder, extract_url, is_url, probe_url
 
-    if not is_url(args.url):
-        print("不是有效的流地址: " + args.url)
+    # 允许直接粘贴微信"下载"按钮复制的整条 ffmpeg 命令
+    url = extract_url(args.url)
+    if not is_url(url):
+        print("没识别出流地址: " + args.url)
+        print('可以直接粘贴 URL，或整条 ffmpeg -i "https://..." 命令')
         return 1
 
-    print("探测 " + args.url[:80] + " ...")
-    r = probe_url(args.url)
+    print("探测 " + url[:80] + " ...")
+    r = probe_url(url)
     if not r.get("ok"):
         print("探测失败: " + str(r.get("error")))
         return 1
@@ -180,7 +183,7 @@ def cmd_stream(args: argparse.Namespace) -> int:
           "，含音轨: " + str(r.get("has_audio")))
 
     ensure_dirs()
-    rec = StreamRecorder(args.url, RECORDINGS_DIR,
+    rec = StreamRecorder(url, RECORDINGS_DIR,
                          name=args.name or "stream", log_cb=print)
     rec.start()
 
@@ -405,6 +408,21 @@ def cmd_transcribe(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_serve(args: argparse.Namespace) -> int:
+    """启动 NAS 无头 Web 服务（拉流录制 + 上传转写 + Web 控制台）。"""
+    import os
+    import uvicorn
+
+    if args.data_dir:
+        os.environ["WXLIVE_OUTPUT_DIR"] = str(Path(args.data_dir).resolve())
+
+    from .server import create_app
+
+    app = create_app(data_dir=args.data_dir or None)
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="wxlive",
@@ -484,6 +502,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("input", help="音频文件路径（wav/mp3/m4a 等）")
     add_asr_opts(sp)
     sp.set_defaults(func=cmd_transcribe)
+
+    sp = sub.add_parser("serve", help="启动无头 Web 服务（适用于 NAS / Docker 远程录制转写）")
+    sp.add_argument("--host", default="0.0.0.0", help="监听地址（默认 0.0.0.0）")
+    sp.add_argument("--port", type=int, default=8910, help="监听端口（默认 8910）")
+    sp.add_argument("--data-dir", default="", help="数据持久化目录（默认 output/）")
+    sp.set_defaults(func=cmd_serve)
 
     return p
 

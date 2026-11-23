@@ -19,9 +19,21 @@ import time
 from dataclasses import dataclass
 
 import numpy as np
-import pyaudiowpatch as pyaudio
+
+try:
+    import pyaudiowpatch as pyaudio
+except ImportError:  # 非 Windows 或无声卡依赖环境（如 NAS Docker）
+    pyaudio = None  # type: ignore[assignment]
 
 from .resample import StreamResampler
+
+
+def _require_pyaudio():
+    if pyaudio is None:
+        raise RuntimeError(
+            "当前环境未安装 pyaudiowpatch（WASAPI 声卡回环采集仅支持 Windows）"
+        )
+    return pyaudio
 
 
 @dataclass
@@ -34,15 +46,16 @@ class DeviceInfo:
 
 def list_loopback_devices() -> list[DeviceInfo]:
     """列出所有可用的 WASAPI loopback 设备（即"能录到扬声器声音"的设备）。"""
-    p = pyaudio.PyAudio()
+    pa = _require_pyaudio()
+    p = pa.PyAudio()
     try:
         out: list[DeviceInfo] = []
         try:
-            wasapi = p.get_host_api_info_by_type(pyaudio.paWASAPI)
+            wasapi = p.get_host_api_info_by_type(pa.paWASAPI)
         except OSError:
             return []
         for i in range(wasapi["deviceCount"]):
-            idx = p.get_host_api_info_by_type(pyaudio.paWASAPI)["index"]
+            idx = p.get_host_api_info_by_type(pa.paWASAPI)["index"]
             dev = p.get_device_info_by_host_api_device_index(idx, i)
             if dev.get("isLoopbackDevice") and dev.get("maxInputChannels", 0) > 0:
                 out.append(
@@ -72,7 +85,8 @@ def pick_device(hint: str = "") -> DeviceInfo:
             return matched[0]
         print(f"[warn] 未匹配到设备 '{hint}'，回退到默认设备", file=sys.stderr)
 
-    p = pyaudio.PyAudio()
+    pa = _require_pyaudio()
+    p = pa.PyAudio()
     try:
         default = p.get_default_wasapi_loopback()
         for d in devices:
@@ -158,7 +172,8 @@ class LoopbackRecorder:
     def start(self) -> None:
         if self._running:
             return
-        self._pa = pyaudio.PyAudio()
+        pa = _require_pyaudio()
+        self._pa = pa.PyAudio()
         self._open_stream()
         self._running = True
         self._thread = threading.Thread(target=self._guard_loop, daemon=True, name="loopback-guard")

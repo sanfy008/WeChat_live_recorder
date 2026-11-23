@@ -1,0 +1,23 @@
+services:
+  wxlive-nas:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: wxlive-nas
+    restart: unless-stopped
+    ports:
+      - "${WXLIVE_PORT:-8910}:8910"
+    environment:
+      - TZ=Asia/Shanghai
+      - HF_ENDPOINT=https://hf-mirror.com
+      - HF_HOME=/app/hf_cache
+      - WXLIVE_OUTPUT_DIR=/app/data
+      - WXLIVE_LOCAL_THREADS=${WXLIVE_LOCAL_THREADS:-4}
+      - WXLIVE_ENABLE_LLM=${WXLIVE_ENABLE_LLM:-false}
+      - WXLIVE_LLM_ENDPOINT=${WXLIVE_LLM_ENDPOINT:-}
+      - WXLIVE_LLM_API_KEY=${WXLIVE_LLM_API_KEY:-}
+      - WXLIVE_LLM_MODEL=${WXLIVE_LLM_MODEL:-workbuddy/deepseek-v4.1-flash}
+      - WXLIVE_LLM_EFFORT=${WXLIVE_LLM_EFFORT:-low}
+    volumes:
+      - ./data:/app/data
+      - ./hf_cache:/app/hf_cache

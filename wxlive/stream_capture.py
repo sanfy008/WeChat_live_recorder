@@ -180,36 +180,37 @@ class StreamRecorder:
         self._proc = winproc.popen(
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         )
+        self._stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
+        self._stderr_thread.start()
         self._thread = threading.Thread(target=self._monitor, daemon=True)
         self._thread.start()
 
+    def _read_stderr(self) -> None:
+        """独立线程消费 ffmpeg stderr，防止 readline() 阻塞 _monitor() 看门狗。"""
+        proc = self._proc
+        if proc is None or proc.stderr is None:
+            return
+        try:
+            for raw in iter(proc.stderr.readline, b""):
+                text = raw.decode("utf-8", errors="replace").strip()
+                if text and not text.startswith(("size=", "frame=", "  ")):
+                    self.errors.append(text)
+                    if len(self.errors) > 50:
+                        self.errors.pop(0)
+                    if any(k in text.lower() for k in
+                           ("error", "failed", "403", "404", "invalid", "timed out")):
+                        self._log(f"[stream] ffmpeg: {text[:160]}")
+        except Exception:
+            pass
+
     def _monitor(self) -> None:
-        """读 stderr 抓错误、监测文件增长、判断是否还在录。"""
+        """监测文件增长、判断是否还在录（不再被 stderr readline 阻塞）。"""
         assert self._proc is not None
         last_size = 0
         last_grow = time.time()
         stale_restarts = 0
 
         while not self._stop.is_set():
-            # 读一行 stderr（非阻塞式，靠 Popen 的缓冲）
-            line = b""
-            try:
-                if self._proc.stderr is not None:
-                    line = self._proc.stderr.readline()
-            except Exception:
-                pass
-            if line:
-                text = line.decode("utf-8", errors="replace").strip()
-                if text and not text.startswith(("size=", "frame=", "  ")):
-                    self.errors.append(text)
-                    if len(self.errors) > 50:
-                        self.errors.pop(0)
-                    # 只把关键错误抛给 UI，避免刷屏
-                    if any(k in text.lower() for k in
-                           ("error", "failed", "403", "404", "invalid", "timed out")):
-                        self._log(f"[stream] ffmpeg: {text[:160]}")
-
-            # 检查文件是否在增长
             time.sleep(1.0)
             size = 0
             if self.out_path and self.out_path.exists():
@@ -276,3 +277,46 @@ class StreamRecorder:
 def is_url(text: str) -> bool:
     t = (text or "").strip().lower()
     return t.startswith(("http://", "https://", "rtmp://", "rtsp://"))
+
+
+_FFMPEG_CMD_RE = re.compile(
+    r"""(?:^|\s)-i\s+(?:"(?P<dq>[^"]+)"|'(?P<sq>[^']+)'|(?P<plain>[^\s"']+))""",
+    re.IGNORECASE,
+)
+
+
+def extract_url(text: str) -> str:
+    """从用户粘贴的内容里抠出可拉的流地址。
+
+    为什么要这个：微信里点下载按钮给出的是一整条 ffmpeg 命令，
+    第三方工具（yt-dlp / IDM / 手机端抓包 App）给的也常带附加参数。
+    直接把它整段贴进输入框是最自然的动作，我们不该让人先手工裁剪。
+
+    支持三种形态：
+      1. 纯 URL                       https://pull-m1.wxlivecdn.com/...flv?txTime=..
+      2. 完整 ffmpeg 命令              ffmpeg -i "https://..." -c copy -y out.flv
+      3. 带转义引号的命令              ffmpeg -i \\"https://...\\" -c copy
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+
+    # 形态 1：本身就是 URL（先剥掉复制时常带的包裹引号/反斜杠）
+    candidate = raw.strip().strip("\"'")
+    if is_url(candidate):
+        return candidate
+
+    normalized = raw.replace('\\"', '"').replace("\\'", "'")
+
+    # 形态 2/3：从 -i 后面取参数（带引号优先，避免 URL 里的 # & 被截断）
+    m = _FFMPEG_CMD_RE.search(normalized)
+    if m:
+        url = (m.group("dq") or m.group("sq") or m.group("plain") or "").strip()
+        if is_url(url):
+            return url
+
+    # 兜底：正文里出现的第一条 http(s)/rtmp 地址
+    m = re.search(r"(?:https?|rtmp|rtsp)://[^\s\"'<>]+", normalized, re.IGNORECASE)
+    if m:
+        return m.group(0).strip().strip("\"'")
+    return ""
