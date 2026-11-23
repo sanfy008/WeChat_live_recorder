@@ -46,6 +46,18 @@ class SettingsUpdateReq(BaseModel):
     llm_reasoning_effort: str | None = None
     auto_transcribe: bool | None = None
     keep_audio: bool | None = None
+    # 直播静音自动停止
+    auto_stop_on_silence: bool | None = None
+    silence_stop_seconds: int | None = None
+    silence_rms_threshold: float | None = None
+    # 磁盘保留策略
+    retention_days: int | None = None
+    cleanup_delete_transcripts: bool | None = None
+    cleanup_interval_hours: int | None = None
+
+
+class CleanupReq(BaseModel):
+    dry_run: bool = True
 
 
 _DASHBOARD_HTML = r"""<!DOCTYPE html>
@@ -230,6 +242,46 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- ===== 转录文件库 ===== -->
+  <div class="card">
+    <div class="row" style="justify-content:space-between; margin-bottom:12px;">
+      <div>
+        <strong>📚 转录文件库</strong>
+        <div id="lib-summary" style="font-size:12px;color:var(--muted);margin-top:3px;">加载中…</div>
+      </div>
+      <div class="row">
+        <button class="sm" onclick="refreshLibrary()">↻ 刷新</button>
+        <a href="/api/library/export"><button class="primary sm">⬇ 导出全部（ZIP）</button></a>
+      </div>
+    </div>
+
+    <div class="row" style="margin-bottom:10px;">
+      <input id="lib-search" type="text" placeholder="按标题/目录名筛选…" style="flex:1 1 220px;"
+             oninput="renderLibrary()">
+      <span id="lib-disk" style="font-size:12px;color:var(--muted);"></span>
+    </div>
+
+    <div id="lib-list" style="max-height:340px;overflow-y:auto;display:flex;flex-direction:column;gap:8px;">
+      <div style="color:var(--muted);font-size:13px;">暂无转录文件。</div>
+    </div>
+  </div>
+
+  <!-- ===== 磁盘清理 ===== -->
+  <div class="card">
+    <div class="row" style="justify-content:space-between; margin-bottom:10px;">
+      <div>
+        <strong>🧹 磁盘保留与清理</strong>
+        <div id="cleanup-summary" style="font-size:12px;color:var(--muted);margin-top:3px;">加载中…</div>
+      </div>
+      <div class="row">
+        <button class="sm" onclick="previewCleanup()">🔍 预览将要清理的内容</button>
+        <button class="danger sm" onclick="runCleanup()">🗑 立即清理</button>
+      </div>
+    </div>
+    <div id="cleanup-feedback"></div>
+    <div id="cleanup-preview"></div>
+  </div>
+
   <div class="grid">
     <div class="card">
       <div class="row" style="justify-content:space-between; margin-bottom:10px;">
@@ -286,6 +338,19 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
       <label class="chk"><input id="set-keep-audio" type="checkbox"> 转写完成后保留原始音频</label>
     </div>
     <hr style="border:none;border-top:1px solid var(--border);margin:14px 0;">
+    <label class="chk" style="margin-bottom:8px;">
+      <input id="set-auto-stop-silence" type="checkbox"> 直播静音自动停止（直播结束后自动收工并转写）</label>
+    <div class="row">
+      <div class="field">
+        <label>连续静音多少秒判定直播结束（本地实测 40 秒）</label>
+        <input id="set-silence-seconds" type="number" min="10" max="600" value="40">
+      </div>
+      <div class="field">
+        <label>静音阈值 RMS（默认 0.002，越大越容易判为静音）</label>
+        <input id="set-silence-rms" type="number" min="0" max="0.2" step="0.001" value="0.002">
+      </div>
+    </div>
+    <hr style="border:none;border-top:1px solid var(--border);margin:14px 0;">
     <label class="chk" style="margin-bottom:10px;"><input id="set-enable-llm" type="checkbox"> 启用 AI 纠错与结构化要点整理（OpenAI 兼容接口）</label>
     <div class="field">
       <label>LLM Endpoint（如 https://api.deepseek.com/v1/chat/completions 或内网网关）</label>
@@ -310,6 +375,20 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
         </select>
       </div>
     </div>
+    <hr style="border:none;border-top:1px solid var(--border);margin:14px 0;">
+    <div class="field">
+      <label>音频保留天数（0 = 不自动清理；默认 30 天）</label>
+      <input id="set-retention" type="number" min="0" max="3650" value="30">
+    </div>
+    <div class="row" style="margin-bottom:10px;">
+      <label class="chk"><input id="set-clean-transcripts" type="checkbox">
+        连逐字稿一起清（默认只清音频，文字体积小且价值高）</label>
+    </div>
+    <div class="field">
+      <label>自动清理检查间隔（小时）</label>
+      <input id="set-clean-interval" type="number" min="1" max="720" value="24">
+    </div>
+
     <div id="settings-feedback"></div>
     <div class="row" style="justify-content:space-between;margin-top:14px;">
       <button onclick="testLlm()">⚡ 测试 LLM 连通性</button>
@@ -594,6 +673,12 @@ async function openSettings() {
   document.getElementById('set-apikey').placeholder = s.has_api_key ? `已设置 (${s.llm_api_key_masked})` : '输入 API Key';
   document.getElementById('set-model').value = s.llm_model || '';
   document.getElementById('set-effort').value = s.llm_reasoning_effort || 'low';
+  document.getElementById('set-auto-stop-silence').checked = s.auto_stop_on_silence !== false;
+  document.getElementById('set-silence-seconds').value = (s.silence_stop_seconds ?? 40);
+  document.getElementById('set-silence-rms').value = (s.silence_rms_threshold ?? 0.002);
+  document.getElementById('set-retention').value = (s.retention_days ?? 30);
+  document.getElementById('set-clean-transcripts').checked = !!s.cleanup_delete_transcripts;
+  document.getElementById('set-clean-interval').value = (s.cleanup_interval_hours ?? 24);
   document.getElementById('settings-modal').classList.add('open');
 }
 function closeSettings() {
@@ -608,6 +693,12 @@ async function saveSettings() {
     llm_endpoint: document.getElementById('set-endpoint').value.trim(),
     llm_model: document.getElementById('set-model').value.trim(),
     llm_reasoning_effort: document.getElementById('set-effort').value,
+    auto_stop_on_silence: document.getElementById('set-auto-stop-silence').checked,
+    silence_stop_seconds: Number(document.getElementById('set-silence-seconds').value || 40),
+    silence_rms_threshold: Number(document.getElementById('set-silence-rms').value || 0.002),
+    retention_days: Number(document.getElementById('set-retention').value || 0),
+    cleanup_delete_transcripts: document.getElementById('set-clean-transcripts').checked,
+    cleanup_interval_hours: Number(document.getElementById('set-clean-interval').value || 24),
   };
   const key = document.getElementById('set-apikey').value.trim();
   if (key) body.llm_api_key = key;
@@ -617,6 +708,7 @@ async function saveSettings() {
       body: JSON.stringify(body)
     });
     showNotice('settings-feedback', true, '设置已保存');
+    await Promise.all([refreshLibrary(), refreshCleanup()]);
   } catch (e) { showNotice('settings-feedback', false, e.message); }
 }
 async function testLlm() {
@@ -631,8 +723,156 @@ async function testLlm() {
     }
   } catch (e) { showNotice('settings-feedback', false, e.message); }
 }
+// ==================== 转录文件库 ====================
+let libItems = [];
+
+function fmtKB(bytes) {
+  const v = (bytes || 0) / 1024;
+  return v >= 1024 ? (v / 1024).toFixed(1) + ' MB' : v.toFixed(1) + ' KB';
+}
+function fmtTime(ts) {
+  if (!ts) return '—';
+  const d = new Date(ts * 1000);
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+async function refreshLibrary() {
+  try {
+    const data = await api('/api/library');
+    libItems = data.items || [];
+    document.getElementById('lib-summary').textContent =
+      `共 ${data.count} 份逐字稿，合计 ${fmtKB(data.total_bytes)}`;
+    renderLibrary();
+  } catch (e) {
+    document.getElementById('lib-summary').textContent = '读取失败：' + e.message;
+  }
+}
+
+function renderLibrary() {
+  const q = (document.getElementById('lib-search').value || '').trim().toLowerCase();
+  const box = document.getElementById('lib-list');
+  const items = q
+    ? libItems.filter(i => (i.title || '').toLowerCase().includes(q) ||
+                            (i.stem || '').toLowerCase().includes(q))
+    : libItems;
+
+  if (!items.length) {
+    box.innerHTML = `<div style="color:var(--muted);font-size:13px;">${
+      libItems.length ? '没有匹配的条目' : '暂无转录文件。跑完一场转写后会出现在这里。'}</div>`;
+    return;
+  }
+
+  box.innerHTML = items.map(it => {
+    const stem = encodeURIComponent(it.stem);
+    const links = [];
+    if (it.has_md)   links.push(`<a href="/api/library/${stem}/download/md"><button class="sm">⬇ MD</button></a>`);
+    if (it.has_json) links.push(`<a href="/api/library/${stem}/download/json"><button class="sm">⬇ JSON</button></a>`);
+    return `<div class="job-item" style="cursor:default;">
+      <div class="job-head">
+        <span class="job-title">${esc(it.title)}</span>
+        <span class="meta"><span>${fmtKB(it.size_bytes)}</span></span>
+      </div>
+      <div class="meta">
+        <span>🕒 ${fmtTime(it.mtime)}</span>
+        ${it.audio_seconds ? `<span>⏱ ${fmtDur(it.audio_seconds)}</span>` : ''}
+        ${it.sentence_count ? `<span>📝 ${it.sentence_count} 句</span>` : ''}
+        <span>📄 ${it.file_count} 个文件</span>
+      </div>
+      ${it.preview ? `<div style="font-size:12px;color:var(--muted);margin-top:6px;line-height:1.45;">${esc(it.preview)}…</div>` : ''}
+      <div class="row" style="margin-top:8px;gap:6px;">${links.join('')}</div>
+    </div>`;
+  }).join('');
+}
+
+// ==================== 磁盘清理 ====================
+async function refreshCleanup() {
+  try {
+    const s = await api('/api/cleanup/status');
+    const last = s.last_cleanup || {};
+    let txt = s.auto_enabled
+      ? `保留 ${s.retention_days} 天 · 每 ${s.cleanup_interval_hours} 小时检查一次 · ${
+          s.cleanup_delete_transcripts ? '同时清逐字稿' : '只清音频'}`
+      : '自动清理已关闭（保留天数 = 0）';
+    if (last.at) {
+      txt += ` ｜ 上次 ${last.at}：删 ${last.deleted_count || 0} 项，释放 ${last.freed_human || ((last.freed_mb || 0) + " MB")}`;
+      if (last.error) txt += `（有错误：${last.error}）`;
+    }
+    document.getElementById('cleanup-summary').textContent = txt;
+  } catch (e) {
+    document.getElementById('cleanup-summary').textContent = '读取失败：' + e.message;
+  }
+}
+
+async function previewCleanup() {
+  const box = document.getElementById('cleanup-preview');
+  box.innerHTML = '<div style="color:var(--muted);font-size:13px;">正在计算…</div>';
+  try {
+    const p = await api('/api/cleanup/plan', {method:'POST'});
+    if (!p.enabled) {
+      box.innerHTML = '<div class="notice err">保留天数设为 0，自动清理已关闭。请到「⚙ 设置」里设置天数。</div>';
+      return;
+    }
+    if (!p.count) {
+      box.innerHTML = '<div class="notice ok">没有需要清理的内容（都在保留期内）。</div>';
+      return;
+    }
+    const rows = (p.candidates || []).slice(0, 100).map(c => `<tr>
+      <td>${esc(c.name)}</td>
+      <td style="white-space:nowrap;">${c.size_mb} MB</td>
+      <td style="white-space:nowrap;">${c.age_days} 天</td>
+      <td>${esc(c.reason)}</td>
+    </tr>`).join('');
+    const skipped = (p.skipped || []).length
+      ? `<div class="notice" style="background:rgba(245,158,11,0.12);color:#fcd34d;">${p.skipped.length} 项被跳过（任务进行中或路径异常）</div>` : '';
+    // 用 total_human 而不是 total_mb：小文件在 MB 精度下会显示成 0 MB，
+    // 看着像"没东西可删"，实际有内容。
+    box.innerHTML = `<div class="notice ok">
+        将清理 <b>${p.count}</b> 项，共 <b>${esc(p.total_human || (p.total_mb + ' MB'))}</b>
+        （阈值 ${p.retention_days} 天${p.delete_transcripts ? '，含逐字稿' : '，不含逐字稿'}）
+      </div>
+      <div style="max-height:260px;overflow-y:auto;margin-top:8px;">
+        <table style="width:100%;font-size:12px;border-collapse:collapse;">
+          <thead><tr style="color:var(--muted);text-align:left;">
+            <th style="padding:4px;">文件</th><th style="padding:4px;">大小</th>
+            <th style="padding:4px;">年龄</th><th style="padding:4px;">原因</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>${skipped}`;
+  } catch (e) {
+    box.innerHTML = `<div class="notice err">预览失败：${esc(e.message)}</div>`;
+  }
+}
+
+async function runCleanup() {
+  const p = await api('/api/cleanup/plan', {method:'POST'}).catch(() => null);
+  if (!p || !p.enabled) {
+    alert('自动清理未启用（保留天数为 0）。请先在设置里设置保留天数。');
+    return;
+  }
+  if (!p.count) { alert('没有需要清理的内容。'); return; }
+  if (!confirm(`确认删除 ${p.count} 项、共 ${p.total_mb} MB？\n此操作不可恢复。`)) return;
+
+  try {
+    const r = await api('/api/cleanup/run', {
+      method:'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({dry_run: false})
+    });
+    const ok = r.ok !== false;
+    showNotice('cleanup-feedback', ok,
+      `已删除 ${r.deleted_count} 项，释放 ${r.freed_human || (r.freed_mb + " MB")}` +
+      (r.failed_count ? `，${r.failed_count} 项失败` : '') +
+      (r.error ? `（${r.error}）` : ''));
+    document.getElementById('cleanup-preview').innerHTML = '';
+    await Promise.all([refreshLibrary(), refreshCleanup(), refreshHealth()]);
+  } catch (e) {
+    showNotice('cleanup-feedback', false, e.message);
+  }
+}
+
 async function refreshAll() {
-  await Promise.all([refreshHealth(), refreshJobs()]);
+  await Promise.all([refreshHealth(), refreshJobs(), refreshLibrary(), refreshCleanup()]);
 }
 refreshAll();
 </script>
@@ -813,6 +1053,74 @@ def create_app(
     @app.post("/api/settings/test-llm")
     def api_test_llm():
         return job_runner.test_llm()
+
+    # ---------------- 磁盘保留策略 ----------------
+
+    @app.get("/api/cleanup/status")
+    def api_cleanup_status():
+        return job_runner.cleanup_status()
+
+    @app.post("/api/cleanup/plan")
+    def api_cleanup_plan():
+        """预览：将删除什么（不执行）。"""
+        return job_runner.run_cleanup(dry_run=True, trigger="manual")
+
+    @app.post("/api/cleanup/run")
+    def api_cleanup_run(req: CleanupReq | None = None):
+        """执行清理。默认 dry_run=True 防误触；真删必须显式传 false。"""
+        dry = True if req is None else bool(req.dry_run)
+        return job_runner.run_cleanup(dry_run=dry, trigger="manual")
+
+    # ---------------- 转录文件库 ----------------
+
+    @app.get("/api/library")
+    def api_library():
+        items = job_runner.library()
+        total = sum(i.get("size_bytes", 0) for i in items)
+        return {"count": len(items), "total_bytes": total,
+                "total_kb": round(total / 1024, 1), "items": items}
+
+    @app.get("/api/library/export")
+    def api_library_export():
+        try:
+            payload, filename = job_runner.export_library()
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except ValueError as exc:
+            # 超出内存上限：给 413 而不是 500，前端能给出可执行的提示
+            raise HTTPException(status_code=413, detail=str(exc))
+        from fastapi.responses import Response
+
+        return Response(
+            content=payload,
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    @app.get("/api/library/{stem}/download/{kind}")
+    def api_library_download(stem: str, kind: str):
+        """下载单个转录产物的某个文件（md/json/jsonl）。"""
+        import re
+
+        # stem 来自用户输入，必须先校验，避免目录穿越
+        if not re.fullmatch(r"[A-Za-z0-9._\-]{1,120}", stem or ""):
+            raise HTTPException(status_code=400, detail="非法的目录名")
+        if kind not in ("md", "json", "jsonl"):
+            raise HTTPException(status_code=400, detail="只支持 md / json / jsonl")
+
+        target_dir = job_runner.transcripts_dir / stem
+        if not target_dir.is_dir():
+            raise HTTPException(status_code=404, detail="目录不存在")
+        # 再确认解析后的路径仍在 transcripts 下
+        try:
+            target_dir.resolve().relative_to(job_runner.transcripts_dir.resolve())
+        except ValueError:
+            raise HTTPException(status_code=400, detail="非法路径")
+
+        hits = sorted(target_dir.glob(f"*.{kind}"))
+        if not hits:
+            raise HTTPException(status_code=404, detail=f"没有找到 .{kind} 文件")
+        return FileResponse(path=str(hits[0]), filename=hits[0].name)
 
     return app
 

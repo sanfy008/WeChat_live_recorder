@@ -25,13 +25,14 @@ from typing import IO, Any, Callable
 import numpy as np
 import soundfile as sf
 
-from . import lexicon, postprocess
+from . import lexicon, postprocess, retention
 from .config import (
     DEFAULT_REASONING_EFFORT,
     DEFAULT_TEXT_MODEL,
     OUTPUT_DIR,
     validate_reasoning_effort,
 )
+from .livesilence import LiveSilenceMonitor, read_tail_window
 from .resample import StreamResampler
 from .session import Session
 from .stream_capture import AUDIO_EXTS, StreamRecorder, extract_url, find_ffmpeg, is_url
@@ -76,6 +77,21 @@ class NasSettings:
     llm_reasoning_effort: str = DEFAULT_REASONING_EFFORT
     auto_transcribe: bool = True
     keep_audio: bool = True
+    # ---- 直播静音自动停止（2026-11-23 新增）----
+    # 直播结束后流不断（CDN 还挂着），不判停就会一直录到地址过期。
+    # 40 秒是本地 GUI 实测值：2026-11-17 那场末尾正好 40.0 秒静音。
+    auto_stop_on_silence: bool = True
+    silence_stop_seconds: int = 40
+    # 阈值沿用本地实测：16k mono 归一化 float 的 RMS < 0.002 算静音
+    silence_rms_threshold: float = 0.002
+    # ---- 磁盘保留策略（2026-11-23 新增）----
+    # 0 = 禁用自动清理。默认 30 天：一场 2 小时直播音频约 220MB，
+    # 每天一场就是 6.6GB/月，不清理迟早撑爆。
+    retention_days: int = 30
+    # 是否连逐字稿一起清。默认 False：文字体积小、价值高，只清音频就够了。
+    cleanup_delete_transcripts: bool = False
+    # 自动清理的检查间隔（小时）。默认 24 = 每天一次。
+    cleanup_interval_hours: int = 24
 
     @classmethod
     def from_env(cls) -> NasSettings:
@@ -95,6 +111,25 @@ class NasSettings:
             enable_llm = False
         else:
             enable_llm = bool(endpoint and api_key)
+        try:
+            retention = int(os.environ.get("WXLIVE_RETENTION_DAYS", "30") or 30)
+        except ValueError:
+            retention = 30
+        try:
+            cleanup_hours = int(os.environ.get("WXLIVE_CLEANUP_INTERVAL_HOURS", "24") or 24)
+        except ValueError:
+            cleanup_hours = 24
+        try:
+            silence_secs = int(os.environ.get("WXLIVE_SILENCE_STOP_SECONDS", "40") or 40)
+        except ValueError:
+            silence_secs = 40
+        silence_env = os.environ.get("WXLIVE_AUTO_STOP_ON_SILENCE", "").strip().lower()
+        if silence_env in ("0", "false", "no", "off"):
+            auto_stop_silence = False
+        elif silence_env in ("1", "true", "yes", "on"):
+            auto_stop_silence = True
+        else:
+            auto_stop_silence = True
         return cls(
             local_threads=threads,
             use_lexicon=True,
@@ -105,6 +140,10 @@ class NasSettings:
             llm_reasoning_effort=effort,
             auto_transcribe=True,
             keep_audio=True,
+            auto_stop_on_silence=auto_stop_silence,
+            silence_stop_seconds=max(10, silence_secs),
+            retention_days=max(0, retention),
+            cleanup_interval_hours=max(1, cleanup_hours),
         )
 
     def to_public_dict(self) -> dict[str, Any]:
@@ -119,6 +158,12 @@ class NasSettings:
             "llm_reasoning_effort": self.llm_reasoning_effort,
             "auto_transcribe": self.auto_transcribe,
             "keep_audio": self.keep_audio,
+            "auto_stop_on_silence": self.auto_stop_on_silence,
+            "silence_stop_seconds": self.silence_stop_seconds,
+            "silence_rms_threshold": self.silence_rms_threshold,
+            "retention_days": self.retention_days,
+            "cleanup_delete_transcripts": self.cleanup_delete_transcripts,
+            "cleanup_interval_hours": self.cleanup_interval_hours,
         }
 
 
@@ -157,6 +202,11 @@ class NasJobRunner:
         )
         self._worker.start()
 
+        # 保留策略状态（供 UI 展示"上次清理时间/释放了多少"）
+        self._last_cleanup: dict[str, Any] = {}
+        self._cleanup_thread: threading.Thread | None = None
+        self._start_cleanup_loop()
+
     # ---------------- 配置持久化 ----------------
 
     def _load_settings(self) -> NasSettings:
@@ -170,11 +220,19 @@ class NasJobRunner:
                     "local_threads", "use_lexicon", "enable_llm",
                     "llm_endpoint", "llm_api_key", "llm_model",
                     "llm_reasoning_effort", "auto_transcribe", "keep_audio",
+                    "retention_days", "cleanup_delete_transcripts",
+                    "cleanup_interval_hours",
+                    "auto_stop_on_silence", "silence_stop_seconds",
+                    "silence_rms_threshold",
                 ):
                     if key in raw and raw[key] is not None:
                         setattr(cfg, key, raw[key])
                 cfg.local_threads = max(1, min(16, int(cfg.local_threads)))
                 cfg.llm_reasoning_effort = validate_reasoning_effort(cfg.llm_reasoning_effort)
+                cfg.retention_days = max(0, int(cfg.retention_days))
+                cfg.cleanup_interval_hours = max(1, int(cfg.cleanup_interval_hours))
+                cfg.silence_stop_seconds = max(10, int(cfg.silence_stop_seconds))
+                cfg.silence_rms_threshold = max(0.0, float(cfg.silence_rms_threshold))
         except Exception:
             pass
         return cfg
@@ -188,9 +246,20 @@ class NasJobRunner:
             s = self._settings
             if "local_threads" in patch and patch["local_threads"] is not None:
                 s.local_threads = max(1, min(16, int(patch["local_threads"])))
-            for bool_key in ("use_lexicon", "enable_llm", "auto_transcribe", "keep_audio"):
+            for bool_key in ("use_lexicon", "enable_llm", "auto_transcribe",
+                             "keep_audio", "cleanup_delete_transcripts",
+                             "auto_stop_on_silence"):
                 if bool_key in patch and patch[bool_key] is not None:
                     setattr(s, bool_key, bool(patch[bool_key]))
+            if "retention_days" in patch and patch["retention_days"] is not None:
+                s.retention_days = max(0, int(patch["retention_days"]))
+            if "cleanup_interval_hours" in patch and patch["cleanup_interval_hours"] is not None:
+                s.cleanup_interval_hours = max(1, int(patch["cleanup_interval_hours"]))
+            if "silence_stop_seconds" in patch and patch["silence_stop_seconds"] is not None:
+                # 下限 10 秒：比说话的自然停顿还短的话会频繁误判
+                s.silence_stop_seconds = max(10, int(patch["silence_stop_seconds"]))
+            if "silence_rms_threshold" in patch and patch["silence_rms_threshold"] is not None:
+                s.silence_rms_threshold = max(0.0, float(patch["silence_rms_threshold"]))
             if "llm_endpoint" in patch and patch["llm_endpoint"] is not None:
                 s.llm_endpoint = str(patch["llm_endpoint"]).strip()
             if "llm_model" in patch and patch["llm_model"] is not None:
@@ -432,21 +501,93 @@ class NasJobRunner:
         return self.get_job(job_id) or job
 
     def _watch_recorder(self, job_id: str, rec: StreamRecorder) -> None:
+        """监控录制进度，并按静音判停（直播结束后自动收工）。
+
+        静音检测为什么要放在这个循环里而不是单独线程：
+        它需要读**正在增长**的 WAV 尾段，与进度更新共用同一个 1 秒节拍，
+        分两个线程会各自 stat 一遍文件、还要加锁协调，得不偿失。
+        """
+        with self._lock:
+            auto_stop = self._settings.auto_stop_on_silence
+            stop_secs = self._settings.silence_stop_seconds
+            rms_thr = self._settings.silence_rms_threshold
+
+        monitor = LiveSilenceMonitor(
+            silence_rms=rms_thr,
+            stop_after_seconds=stop_secs,
+            require_sound_before=True,
+        )
+        stop_reason = ""
+        # 每 3 秒做一次静音采样：块长 0.5s，3 秒窗口能覆盖 6 个块，
+        # 既够判静音，又不会因为频繁 seek 拖慢磁盘。
+        silence_every = 3.0
+        last_silence_check = 0.0
+        last_status_log = 0.0
+        _t0 = time.time()
+
         while not self._shutdown_event.is_set() and rec.running:
+            now = time.time()
+            size = 0
             if rec.out_path and rec.out_path.exists():
                 try:
-                    sz = rec.out_path.stat().st_size
+                    size = rec.out_path.stat().st_size
                     self._update_job(
                         job_id,
                         persist=False,
-                        audio_bytes=sz,
-                        audio_seconds=round(max(0, sz - 44) / 32000.0, 1),
+                        audio_bytes=size,
+                        audio_seconds=round(max(0, size - 44) / 32000.0, 1),
                     )
                 except OSError:
                     pass
+
+            # ---- 静音判停 ----
+            if auto_stop and rec.out_path and size > 44 and \
+                    (now - last_silence_check) >= silence_every:
+                last_silence_check = now
+                # 必须拿到窗口的**起始秒**：窗口比采样间隔长，
+                # 不传偏移会把重叠部分重复计入（实测虚高 30%）。
+                tail, sr, tail_start = read_tail_window(
+                    rec.out_path, max_seconds=silence_every + 1.5
+                )
+                verdict = monitor.poll(tail, sr, audio_offset=tail_start)
+                if verdict.checked:
+                    # 每 30 秒把静音状态写进日志，便于事后归因
+                    if verdict.silent_seconds > 0 and (now - last_status_log) >= 30:
+                        last_status_log = now
+                        self._append_log(
+                            job_id,
+                            f"静音监测：连续静音 {verdict.silent_seconds:.0f}s"
+                            f"（阈值 {stop_secs}s，RMS {verdict.rms}）",
+                        )
+                    if verdict.should_stop:
+                        stop_reason = verdict.reason
+                        self._append_log(job_id, f"自动停止：{verdict.reason}")
+                        break
+                elif verdict.reason.startswith("文件未增长") and \
+                        (now - last_status_log) >= 60:
+                    # 文件停止增长 ≠ 直播结束（ffmpeg 可能卡住），但值得记一笔：
+                    # 若同时 CDN 已断流，StreamRecorder 的 90s×3 看门狗会接手收尾。
+                    last_status_log = now
+                    self._append_log(
+                        job_id,
+                        "文件已停止增长（ffmpeg 可能卡住或已断流），等待看门狗收尾",
+                    )
+                else:
+                    # 没读到有效音频（头部还没回填等）：首段宽限，不判停
+                    if now - _t0 < 30:
+                        continue
+
             time.sleep(1.0)
 
         rec.stop()
+
+        # 如果是因为静音停的，把原因写进 job。
+        # 必须持久化：容器重启/进程崩溃后要能知道"这场是静音收工还是异常中断"，
+        # 否则事后完全无法归因（persist=False 只写内存，重启即丢，实测复现）。
+        if stop_reason:
+            self._update_job(job_id, stop_reason=stop_reason, persist=True)
+            self._append_log(job_id, f"停止原因：{stop_reason}")
+
         with self._lock:
             self._recorders.pop(job_id, None)
             override = self._stop_overrides.pop(job_id, None)
@@ -893,6 +1034,187 @@ class NasJobRunner:
             changed_count=changed,
             llm_status=llm_status,
         ) or job
+
+    # ---------------- 磁盘保留策略 ----------------
+
+    def _start_cleanup_loop(self) -> None:
+        """后台定时清理线程。
+
+        为什么是"启动后延迟 60 秒再跑第一次"：
+        容器刚起来时 CPU/IO 都很忙（模型加载、任务恢复），
+        清理是纯磁盘扫描，没必要抢这个时间窗。
+        """
+        if self._settings.retention_days <= 0:
+            return
+
+        def loop() -> None:
+            # 首次延迟，避开启动高峰
+            if self._shutdown_event.wait(60):
+                return
+            while not self._shutdown_event.is_set():
+                try:
+                    self.run_cleanup(dry_run=False, trigger="auto")
+                except Exception as exc:  # noqa: BLE001
+                    self._last_cleanup = {
+                        "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "ok": False,
+                        "error": f"{type(exc).__name__}: {exc}"[:300],
+                        "trigger": "auto",
+                    }
+                hours = max(1, int(self._settings.cleanup_interval_hours))
+                if self._shutdown_event.wait(hours * 3600):
+                    return
+
+        self._cleanup_thread = threading.Thread(
+            target=loop, daemon=True, name="nas-cleanup"
+        )
+        self._cleanup_thread.start()
+
+    def cleanup_plan(self) -> dict[str, Any]:
+        """预览清理计划（不删任何东西）。"""
+        with self._lock:
+            days = self._settings.retention_days
+            del_tr = self._settings.cleanup_delete_transcripts
+            jobs = dict(self._jobs)
+        return retention.plan_cleanup(
+            jobs,
+            self.recordings_dir,
+            self.transcripts_dir,
+            retention_days=days,
+            delete_transcripts=del_tr,
+        ).to_dict()
+
+    def run_cleanup(self, dry_run: bool = True, trigger: str = "manual") -> dict[str, Any]:
+        """计算并（可选）执行清理。
+
+        dry_run=True 只返回计划，供 UI 预览；dry_run=False 才真删。
+        """
+        with self._lock:
+            days = self._settings.retention_days
+            del_tr = self._settings.cleanup_delete_transcripts
+            jobs = dict(self._jobs)
+
+        plan = retention.plan_cleanup(
+            jobs,
+            self.recordings_dir,
+            self.transcripts_dir,
+            retention_days=days,
+            delete_transcripts=del_tr,
+        )
+        if dry_run:
+            payload = plan.to_dict()
+            payload["dry_run"] = True
+            payload["trigger"] = trigger
+            return payload
+
+        result = retention.execute_cleanup(plan)
+        payload = {**result.to_dict(), "plan": plan.to_dict(),
+                   "dry_run": False, "trigger": trigger,
+                   "at": time.strftime("%Y-%m-%d %H:%M:%S")}
+        self._last_cleanup = payload
+
+        if result.deleted:
+            self._log_cleanup(payload)
+        return payload
+
+    # cleanup.log 体积上限。每日一次清理，留 200KB 足够回溯几个月。
+    CLEANUP_LOG_MAX_BYTES = 200 * 1024
+
+    def _log_cleanup(self, payload: dict[str, Any]) -> None:
+        line = (
+            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 自动清理："
+            f"删除 {payload.get('deleted_count', 0)} 项，"
+            f"释放 {payload.get('freed_mb', 0)} MB"
+            f"（阈值 {self._settings.retention_days} 天）\n"
+        )
+        path = self.data_dir / "cleanup.log"
+        try:
+            # 必须 with：旧写法 `open().write()` 不关文件，
+            # 7x24 常驻会累积句柄泄漏。
+            if path.exists() and path.stat().st_size > self.CLEANUP_LOG_MAX_BYTES:
+                # 超限就截断重来，不做轮转：这日志只用于人工回溯，保留最近的更有用
+                with path.open("w", encoding="utf-8") as fh:
+                    fh.write(line)
+                return
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(line)
+        except OSError:
+            pass
+
+    def cleanup_status(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "retention_days": self._settings.retention_days,
+                "cleanup_delete_transcripts": self._settings.cleanup_delete_transcripts,
+                "cleanup_interval_hours": self._settings.cleanup_interval_hours,
+                "auto_enabled": self._settings.retention_days > 0,
+                "worker_alive": bool(self._cleanup_thread and self._cleanup_thread.is_alive()),
+                "last_cleanup": self._last_cleanup,
+            }
+
+    # ---------------- 转录文件库 ----------------
+
+    def library(self) -> list[dict[str, Any]]:
+        """列出磁盘上所有转录产物（以磁盘为准，不依赖 jobs.json）。"""
+        with self._lock:
+            jobs = dict(self._jobs)
+        return retention.scan_library(self.transcripts_dir, jobs)
+
+    # 导出上限。NAS 实测可用内存只有约 4.2GB，整包进内存必须有硬上限，
+    # 否则一次导出就能把容器顶到 OOM（转写任务会跟着挂）。
+    EXPORT_MAX_BYTES = 256 * 1024 * 1024     # 256 MB
+
+    def export_library(self) -> tuple[bytes, str]:
+        """把整个转录文件库打包成 zip，返回 (字节内容, 建议文件名)。
+
+        在内存里打包：转录产物总量很小（每场几十 KB），
+        不值得为它写临时文件再删。但加了两道保护：
+
+        1. **先算总量再打包**：超过 `EXPORT_MAX_BYTES` 直接拒绝并说明原因，
+           而不是打一半把内存吃满。
+        2. **跳过符号链接**：`rglob` 本身不跟随目录链接，但文件级链接
+           可能指向库外的大文件，一并跳过更安全。
+        """
+        import io
+        import zipfile
+
+        tr_root = self.transcripts_dir
+        if not tr_root.is_dir():
+            raise FileNotFoundError("转录文件库是空的，没有可导出的内容")
+
+        files: list[Path] = []
+        total = 0
+        for p in sorted(tr_root.rglob("*")):
+            try:
+                if p.is_symlink() or not p.is_file():
+                    continue
+                size = p.stat().st_size
+            except OSError:
+                continue
+            total += size
+            if total > self.EXPORT_MAX_BYTES:
+                raise ValueError(
+                    f"转录库超过导出上限（{self.EXPORT_MAX_BYTES // 1048576} MB），"
+                    "请改用逐个下载或先归档清理"
+                )
+            files.append(p)
+
+        if not files:
+            raise FileNotFoundError("转录文件库是空的，没有可导出的内容")
+
+        buf = io.BytesIO()
+        count = 0
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for p in files:
+                try:
+                    zf.write(p, arcname=str(p.relative_to(tr_root)))
+                    count += 1
+                except OSError:
+                    continue
+        if count == 0:
+            raise FileNotFoundError("转录文件库是空的，没有可导出的内容")
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        return buf.getvalue(), f"wxlive_transcripts_{stamp}.zip"
 
     # ---------------- 查看与删除 ----------------
 

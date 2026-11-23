@@ -196,3 +196,200 @@ def test_fastapi_upload_transcribe_download_and_repostprocess(tmp_path: Path, mo
             assert client.get(f"/api/jobs/{job_id}").status_code == 404
     finally:
         runner.shutdown()
+
+
+# ---------------- 磁盘保留策略 API ----------------
+
+def test_cleanup_settings_roundtrip(tmp_path: Path):
+    runner = NasJobRunner(data_dir=tmp_path, engine_factory=lambda t, l: _FakeEngine())
+    try:
+        s = runner.update_settings({
+            "retention_days": 14,
+            "cleanup_delete_transcripts": True,
+            "cleanup_interval_hours": 12,
+        })
+        assert s["retention_days"] == 14
+        assert s["cleanup_delete_transcripts"] is True
+        assert s["cleanup_interval_hours"] == 12
+
+        # 负数要被钳到 0，间隔至少 1 小时
+        s2 = runner.update_settings({"retention_days": -5, "cleanup_interval_hours": 0})
+        assert s2["retention_days"] == 0
+        assert s2["cleanup_interval_hours"] == 1
+    finally:
+        runner.shutdown()
+
+
+def test_cleanup_plan_and_run_via_api(tmp_path: Path):
+    """API 层的预览与执行：预览不删文件，执行才删。"""
+    import time as _t
+
+    rec = tmp_path / "recordings"
+    rec.mkdir(parents=True)
+    audio = rec / "old.wav"
+    audio.write_bytes(b"\0" * 4096)
+
+    runner = NasJobRunner(data_dir=tmp_path, engine_factory=lambda t, l: _FakeEngine())
+    try:
+        old_ts = _t.time() - 60 * 86400
+        with runner._lock:
+            runner._jobs["j_old"] = {
+                "id": "j_old", "title": "老场次", "status": "completed",
+                "audio_path": str(audio), "md_path": "",
+                "created_at": old_ts, "logs": [],
+            }
+            runner._save_jobs()
+
+        runner.update_settings({"retention_days": 30})
+        app = create_app(runner=runner)
+        with TestClient(app) as client:
+            p = client.post("/api/cleanup/plan").json()
+            assert p["enabled"] is True
+            assert p["count"] == 1
+            assert p["total_bytes"] == 4096
+            assert p["total_human"].endswith("KB")
+            assert audio.exists(), "预览阶段绝不能删文件"
+
+            r = client.post("/api/cleanup/run", json={"dry_run": False}).json()
+            assert r["ok"] is True
+            assert r["deleted_count"] == 1
+            assert r["freed_human"].endswith("KB")
+            assert not audio.exists()
+
+            # 默认 dry_run=True：不带 body 也不能真删
+            audio.write_bytes(b"\0" * 100)
+            r2 = client.post("/api/cleanup/run").json()
+            assert r2["dry_run"] is True
+            assert audio.exists()
+    finally:
+        runner.shutdown()
+
+
+def test_cleanup_status_endpoint(tmp_path: Path):
+    runner = NasJobRunner(data_dir=tmp_path, engine_factory=lambda t, l: _FakeEngine())
+    try:
+        runner.update_settings({"retention_days": 0})
+        app = create_app(runner=runner)
+        with TestClient(app) as client:
+            s = client.get("/api/cleanup/status").json()
+            assert s["retention_days"] == 0
+            assert s["auto_enabled"] is False
+    finally:
+        runner.shutdown()
+
+
+def test_library_listing_and_export_zip(tmp_path: Path):
+    runner = NasJobRunner(data_dir=tmp_path, engine_factory=lambda t, l: _FakeEngine())
+    try:
+        d = runner.transcripts_dir / "session_abc"
+        d.mkdir(parents=True)
+        (d / "20261123_101010_nas_low.md").write_text(
+            "# 标题\n\n- 会话 ID：x\n\n这是正文。\n", encoding="utf-8")
+        (d / "20261123_101010_nas_low.json").write_text(
+            '{"segments":[]}', encoding="utf-8")
+
+        app = create_app(runner=runner)
+        with TestClient(app) as client:
+            lib = client.get("/api/library").json()
+            assert lib["count"] == 1
+            item = lib["items"][0]
+            assert item["stem"] == "session_abc"
+            assert item["has_md"] and item["has_json"]
+            assert "这是正文" in item["preview"]
+
+            z = client.get("/api/library/export")
+            assert z.status_code == 200
+            assert z.headers["content-type"] == "application/zip"
+            assert "attachment" in z.headers["content-disposition"]
+
+            import io as _io
+            import zipfile
+            with zipfile.ZipFile(_io.BytesIO(z.content)) as zf:
+                names = zf.namelist()
+            assert any(n.endswith(".md") for n in names)
+            assert any(n.endswith(".json") for n in names)
+
+            dl = client.get(f"/api/library/{item['stem']}/download/md")
+            assert dl.status_code == 200
+            assert "这是正文" in dl.text
+    finally:
+        runner.shutdown()
+
+
+def test_library_export_empty_returns_404(tmp_path: Path):
+    runner = NasJobRunner(data_dir=tmp_path, engine_factory=lambda t, l: _FakeEngine())
+    try:
+        app = create_app(runner=runner)
+        with TestClient(app) as client:
+            assert client.get("/api/library/export").status_code == 404
+    finally:
+        runner.shutdown()
+
+
+@pytest.mark.parametrize("stem", [
+    "..", "../..", "../../etc", "a/b", "con", "", "x" * 200,
+    # 反斜杠用 chr(92) 拼出来，避免源码里的  被当成退格符
+    "a" + chr(92) + "b",
+    ".." + chr(92) + ".." + chr(92) + "windows",
+])
+def test_library_download_rejects_path_traversal(tmp_path: Path, stem: str):
+    runner = NasJobRunner(data_dir=tmp_path, engine_factory=lambda t, l: _FakeEngine())
+    try:
+        app = create_app(runner=runner)
+        with TestClient(app) as client:
+            r = client.get(f"/api/library/{stem}/download/md")
+            assert r.status_code in (400, 404), f"{stem!r} 应该被拒绝，实际 {r.status_code}"
+    finally:
+        runner.shutdown()
+
+
+def test_export_respects_size_cap(tmp_path: Path, monkeypatch):
+    """导出上限：超过阈值要明确拒绝（413），而不是把 NAS 内存吃满。"""
+    runner = NasJobRunner(data_dir=tmp_path, engine_factory=lambda t, l: _FakeEngine())
+    try:
+        # 把上限压到极小，避免真造 256MB 文件
+        monkeypatch.setattr(type(runner), "EXPORT_MAX_BYTES", 100)
+
+        d = runner.transcripts_dir / "big"
+        d.mkdir(parents=True)
+        (d / "a.md").write_text("x" * 500, encoding="utf-8")
+
+        app = create_app(runner=runner)
+        with TestClient(app) as client:
+            r = client.get("/api/library/export")
+            assert r.status_code == 413
+            assert "导出上限" in r.json()["detail"]
+    finally:
+        runner.shutdown()
+
+
+def test_export_skips_symlinks(tmp_path: Path):
+    """符号链接不能被打进 zip（可能指向库外文件）。"""
+    runner = NasJobRunner(data_dir=tmp_path, engine_factory=lambda t, l: _FakeEngine())
+    try:
+        outside = tmp_path / "secret.txt"
+        outside.write_text("do not export", encoding="utf-8")
+
+        d = runner.transcripts_dir / "s1"
+        d.mkdir(parents=True)
+        (d / "ok.md").write_text("hello", encoding="utf-8")
+        link = d / "leak.md"
+        try:
+            link.symlink_to(outside)
+        except OSError:
+            pytest.skip("当前系统不支持创建符号链接")
+
+        import io as _io
+        import zipfile
+
+        data, _ = runner.export_library()
+        # zip 是压缩的，必须解包再比对内容（直接搜明文会假阴性）
+        with zipfile.ZipFile(_io.BytesIO(data)) as zf:
+            names = zf.namelist()
+            joined = b"".join(zf.read(n) for n in names)
+        assert "s1/ok.md" in names
+        assert not any("leak" in n for n in names), f"符号链接被打包了：{names}"
+        assert b"do not export" not in joined
+        assert b"hello" in joined
+    finally:
+        runner.shutdown()
