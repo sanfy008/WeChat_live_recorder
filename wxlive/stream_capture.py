@@ -19,12 +19,15 @@
 from __future__ import annotations
 
 import os
+import ipaddress
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 from pathlib import Path
 
 from . import winproc
@@ -72,6 +75,168 @@ def probe_url(url: str, timeout: int = 20) -> dict:
     # 注意：-show_entries 里 stream 和 format 用冒号分隔是正确的，
     # 但 ffprobe 不接受 "format=...,format_name" 这种重复前缀写法，
     # 必须分组写：format=duration,format_name:stream=codec_type,codec_name
+    #
+    # ---- 为什么用 ffmpeg 探测而不是 ffprobe（真机实测 2026-11-23）----
+    # NAS 用 Docker 部署，容器里的解析结果是 IPv6 优先，而视频号 CDN
+    # （voipfinderliveplaythird.wxqcloud.qq.com）的 IPv6 **不通**。
+    # ffprobe 不像 curl 会自动回退到 IPv4，它会一直等到超时。
+    # 实测对比：
+    #   宿主机 shell 跑 ffprobe 同一条命令   0 秒出结果
+    #   容器内 /api/probe                    稳定 15 秒超时
+    #   容器内换成 IPv4 直连                  0.13 秒返回
+    #
+    # 但 **ffprobe 没有 -4 选项**（实测 "Option not found"），
+    # 只有 ffmpeg 有。所以探测改用 ffmpeg -4 -i <url> -t 0 -f null -，
+    # 它同样只解析头部、不下载整个流，且能强制 IPv4。
+    return _probe_with_ffmpeg(ff, url, timeout)
+
+
+def _force_ipv4_url(url: str) -> str:
+    """把 URL 里的主机名换成它的 IPv4 地址，返回新 URL（失败则原样返回）。
+
+    为什么要这一步（真机实测 2026-11-23）：
+      NAS 用 Docker 部署，容器里 `voipfinderliveplaythird.wxqcloud.qq.com`
+      解析出 IPv6 优先，而该 CDN 的 IPv6 **不通**（实测 curl -6 -> HTTP 000）。
+      ffmpeg / ffprobe 都**没有 -4 选项**（实测两边构建都没有），
+      也不像 curl 会自动回退到 IPv4 —— 于是它一直在 IPv6 上等到超时。
+      唯一可靠的办法是自己在 Python 层解析出 IPv4，再把地址塞给 ffmpeg。
+
+    保留原始 Host 的方式不可行（ffmpeg 不支持自定义 Host 头），
+    但视频号 CDN 是 IP 直连可用的（实测把主机名换成 14.116.174.61
+    后 0.13 秒就返回），所以直接替换主机名是安全的。
+    """
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except Exception:  # noqa: BLE001
+        return url
+    host = parts.hostname or ""
+    if not host or _is_ip_literal(host):
+        return url
+
+    ip = ""
+    try:
+        infos = socket.getaddrinfo(host, parts.port or 80,
+                                   socket.AF_INET, socket.SOCK_STREAM)
+        if infos:
+            ip = infos[0][4][0]
+    except Exception:  # noqa: BLE001
+        return url
+    if not ip:
+        return url
+
+    netloc = ip
+    if parts.port:
+        netloc = f"{ip}:{parts.port}"
+    return urllib.parse.urlunsplit(
+        (parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def _probe_with_ffmpeg(ff: str, url: str, timeout: int) -> dict:
+    """用 ffmpeg 探测流，失败时自动换 IPv4 重试一次。
+
+    判据不看 returncode：ffmpeg 把版本横幅也打到 stderr，且 rc 可能是 0，
+    连不存在的地址都会"看起来成功"（实测踩过）。只有解析出
+    「Input #0」才是真的连上了。
+    """
+    first = _probe_once(ff, url, timeout)
+    if first.get("ok") or not first.get("timeout"):
+        return first
+
+    # 超时：很可能是 IPv6 黑洞。换成 IPv4 地址再试一次。
+    v4 = _force_ipv4_url(url)
+    if v4 == url:
+        return first
+    second = _probe_once(ff, v4, timeout)
+    if second.get("ok"):
+        second["via_ipv4"] = True
+    return second
+
+
+def _probe_once(ff: str, url: str, timeout: int) -> dict:
+    """单次探测（不重试）。
+
+    必须流式读 stderr：直播流是**无限长**的，用 run() 等它结束会挂到超时
+    （实测踩过：一个验证脚本跑了 150 秒还没返回）。
+    实测 `Input #0` 在 0.24 秒就出现了，所以看到它就立刻 kill 进程。
+    """
+    cmd = [ff, "-hide_banner", "-nostats", "-v", "info",
+           "-i", url,
+           "-f", "null", "-"]
+
+    proc = None
+    lines: list[str] = []
+    got_input = False
+    deadline = time.time() + timeout
+    try:
+        proc = winproc.popen(cmd, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.PIPE,
+                             text=True, encoding="utf-8", errors="replace")
+
+        def _drain() -> None:
+            nonlocal got_input
+            try:
+                for line in proc.stderr:            # type: ignore[union-attr]
+                    t = line.strip()
+                    if not t:
+                        continue
+                    lines.append(t)
+                    if t.startswith("Input #0"):
+                        got_input = True
+                    # 拿到 Input + 至少一个 Stream 就够了，别再等
+                    if got_input and any(x.startswith("Stream #") for x in lines):
+                        return
+                    if len(lines) > 200:
+                        return
+            except Exception:  # noqa: BLE001
+                pass
+
+        th = threading.Thread(target=_drain, daemon=True)
+        th.start()
+        th.join(timeout=max(1.0, timeout))
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": str(e)[:200]}
+    finally:
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+
+    if not got_input:
+        err = next((x for x in reversed(lines)
+                    if any(k in x for k in ("Error", "Invalid", "No route",
+                                            "refused", "timed out", "404",
+                                            "403", "401", "Failed"))), "")
+        if not err and lines:
+            err = lines[-1]
+        timed_out = (not lines) or time.time() >= deadline
+        return {"ok": False, "timeout": bool(timed_out),
+                "error": (err or "探测失败（未解析出输入流）")[:200]}
+
+    has_audio = any("Audio:" in x for x in lines)
+    has_video = any("Video:" in x for x in lines)
+    if not has_audio and not has_video:
+        return {"ok": False, "error": "连上了但没有任何音视频流"}
+
+    brief = " | ".join(x for x in lines if x.startswith(("Input #0", "Stream #0")))
+    return {"ok": True, "info": brief[:300],
+            "has_audio": has_audio, "has_video": has_video}
+
+
+def _probe_url_ffprobe_legacy(probe: str, url: str, timeout: int) -> dict:
+    """保留 ffprobe 版本作为参考（当前不在主路径上）。
+
+    留着是因为某些环境 ffmpeg 的 -t 0 行为可能不同，
+    排查时可以一键切回来对照。
+    """
     cmd = [probe, "-v", "error",
            "-show_entries", "format=duration,format_name:stream=codec_type,codec_name",
            "-of", "default=noprint_wrappers=1",
@@ -91,7 +256,13 @@ def probe_url(url: str, timeout: int = 20) -> dict:
         return {"ok": True, "info": out.strip()[:300], "format": fmt,
                 "has_audio": has_audio}
     except subprocess.TimeoutExpired:
-        return {"ok": False, "error": f"探测超时（{timeout}s），地址可能无效或网络不通"}
+        # 超时有两种截然不同的原因，过去一律说"地址可能已过期"，会误导排查
+        # 方向（实测踩过：其实是 NAS 容器 IPv6 不通，与地址无关）。
+        return {"ok": False,
+                "error": (f"探测超时（{timeout}s）。两种可能：\n"
+                          f"· 主播已下播，或地址签名过期\n"
+                          f"· NAS 到该 CDN 的网络不通（IPv6 黑洞 / 出口被限）"),
+                "timeout": True}
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": str(e)[:200]}
 
@@ -129,6 +300,8 @@ class StreamRecorder:
         self._thread: threading.Thread | None = None
         self.out_path: Path | None = None
         self.errors: list[str] = []
+        # 实际交给 ffmpeg 的地址（可能是换成 IPv4 后的版本）
+        self._effective_url = self.url
 
     def _log(self, msg: str) -> None:
         if self.log_cb:
@@ -142,6 +315,8 @@ class StreamRecorder:
         if not ff:
             raise RuntimeError("未找到 ffmpeg")
 
+        # 注意：ffmpeg 没有 -4 选项（实测两边的构建都不认），
+        # IPv4 的处理在 _build_cmd 末尾把 url 换掉，见下方 self._effective_url。
         cmd = [ff, "-hide_banner", "-loglevel", "warning", "-stats"]
 
         # 断流自动重连：这是直播拉流必须的，服务端关连接是常态
@@ -153,7 +328,11 @@ class StreamRecorder:
                 "-rw_timeout", "30000000",  # 30s 无数据视为断流
             ]
 
-        cmd += ["-i", self.url]
+        # 直播源在容器里可能解析到不通的 IPv6（实测 NAS Docker 环境：
+        # 该 CDN 的 IPv6 curl 直接 HTTP 000）。ffmpeg 不会自动回退 IPv4，
+        # 又没有 -4 选项，所以这里先把主机名换成 IPv4 再交给 ffmpeg。
+        self._effective_url = _force_ipv4_url(self.url)
+        cmd += ["-i", self._effective_url]
 
         # 只保留音轨，直接出 16k 单声道 PCM，ASR 拿到就能用
         cmd += [
