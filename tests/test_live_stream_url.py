@@ -155,3 +155,100 @@ def test_candidates_never_borrow_another_streamers_url(monkeypatch):
     assert all("orig_111_orig.flv" in u for u in urls), \
         "\u4E32\u53F0\u4E86\uFF1A\u62FF\u5230\u4E86\u522B\u7684 live_id \u7684\u5730\u5740"
     assert not any("orig_999_orig.flv" in u for u in urls)
+
+
+# ---------------- 5. 日志发现未入库的直播（2026-11-23 第二版） ----------------
+
+def _log_entry(title, author, cdn, live_id_js=None):
+    """构造一条真实的工具日志 raw（结构照抄实测样本）。"""
+    import json as _j
+    return _j.dumps({
+        "feed": {
+            "live": {
+                "liveDescription": title,
+                "liveSdkInfo": {"liveCdnUrl": cdn},
+                "liveInfo": {"liveId": live_id_js or 0},
+            },
+            "profile": {"nickname": author},
+        }
+    }, ensure_ascii=False)
+
+
+def test_discover_live_streams_finds_unregistered_live(monkeypatch):
+    """核心回归：**没点过下载按钮**的直播也要能被发现。
+
+    实测背景：/api/content/list 只列 content 表，而只有点过下载/打开过的
+    直播才进表。用户只是打开直播间看，那条直播就完全查不到 —— 但他明明
+    在播，地址也已经在工具日志里了。
+    """
+    cdn = ("http://voipfinderliveplaythird.wxqcloud.qq.com/trtc_1400419933/"
+           "orig_2042981055799174797_jf430.flv?txSecret=abc")
+    raw = _log_entry("英语大招方法技巧", "北师大三三讲英语", cdn,
+                     live_id_js=2042981055799175000)
+
+    monkeypatch.setattr(F, "_api_get", lambda api, path, timeout=20: {
+        "code": 0, "data": {"entries": [{"raw": raw}]}
+    })
+
+    items = F.discover_live_streams()
+    assert len(items) == 1
+    it = items[0]
+    assert it.title == "英语大招方法技巧"
+    assert it.author == "北师大三三讲英语"
+    assert it.is_live is True
+    assert it.url == cdn
+    # 必须用 CDN 地址里的 id，不能用 liveInfo.liveId
+    assert it.live_id == "2042981055799174797"
+
+
+def test_discover_uses_cdn_id_not_js_number(monkeypatch):
+    """liveInfo.liveId 是 JS 数字，超过 2^53 丢精度（实测差 203）。
+
+    拿它去匹配流地址永远对不上，所以必须以 CDN 路径里的 id 为准。
+    """
+    cdn = "http://pull-m1.wxlivecdn.com/trtc_1400419933/orig_1111111111111111111_orig.flv?a=1"
+    raw = _log_entry("t", "a", cdn, live_id_js=1111111111111112000)
+    monkeypatch.setattr(F, "_api_get", lambda api, path, timeout=20: {
+        "code": 0, "data": {"entries": [{"raw": raw}]}
+    })
+    items = F.discover_live_streams()
+    assert items
+    assert items[0].live_id == "1111111111111111111"
+
+
+def test_discover_skips_cover_images(monkeypatch):
+    """封面图不能算作直播（同域名，靠 /stodownload 排除）。"""
+    raw = _log_entry("t", "a",
+                     "https://finder.video.qq.com/292/20350/stodownload?encfilekey=x")
+    monkeypatch.setattr(F, "_api_get", lambda api, path, timeout=20: {
+        "code": 0, "data": {"entries": [{"raw": raw}]}
+    })
+    assert F.discover_live_streams() == []
+
+
+def test_discover_dedupes_same_stream(monkeypatch):
+    """同一场直播会刷多条日志（签名不同但流路径相同），只留一条。"""
+    base = ("http://pull-m1.wxlivecdn.com/trtc_1400419933/"
+            "orig_222_orig.flv")
+    raws = [{"raw": _log_entry("t", "a", base + "?txSecret=" + x)}
+            for x in ("a", "b", "c")]
+    monkeypatch.setattr(F, "_api_get", lambda api, path, timeout=20: {
+        "code": 0, "data": {"entries": raws}
+    })
+    assert len(F.discover_live_streams()) == 1
+
+
+def test_discover_tolerates_broken_rows(monkeypatch):
+    """日志里有非 JSON / 不完整条目时不能整批失败。"""
+    good = _log_entry("ok", "a",
+                      "http://pull-m1.wxlivecdn.com/trtc_1/orig_333_orig.flv?x=1")
+    monkeypatch.setattr(F, "_api_get", lambda api, path, timeout=20: {
+        "code": 0, "data": {"entries": [
+            {"raw": "{not json"},
+            {"raw": None},
+            {"nope": 1},
+            {"raw": good},
+        ]}
+    })
+    items = F.discover_live_streams()
+    assert len(items) == 1 and items[0].live_id == "333"

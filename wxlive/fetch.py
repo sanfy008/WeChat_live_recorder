@@ -470,6 +470,81 @@ def list_stream_candidates(item: ContentItem, api: str = DEFAULT_API,
     return out
 
 
+def discover_live_streams(api: str = DEFAULT_API,
+                          timeout: int = 20) -> list:
+    """从工具日志发现**正在直播**的场次，返回已带地址的 ContentItem 列表。
+
+    为什么需要这条路径（2026-11-23 实测）：
+        /api/content/list 只列 content 表，而 content 表里**只有点过下载/
+        打开过的直播**。用户只是打开直播间看，没点那个下载按钮，
+        这条直播就根本不在列表里 —— 于是"刷新列表看不到正在播的直播"。
+
+        但地址其实已经拿到了：微信前端在进入直播间那一刻就把带签名的
+        liveCdnUrl 打进了工具日志。实测在完全没入库的情况下，
+        从日志取出的地址用 ffprobe 能直接拉到 aac+hevc。
+
+    为什么用 keyword 过滤而不拉几千条：
+        实测工具共 2385 条日志，过滤 liveCdnUrl 后只剩 53 条，
+        耗时 0.07s。不过滤要扫全量，每次刷新都白烧 IO。
+
+    返回的 ContentItem.__class__ 与列表项相同，但 content_id 用的是
+    直播场次 id —— 界面上用 "livediscover:" 前缀做 key，避免与
+    /api/content/list 的条目撞车。
+    """
+    data = _api_get(api, "/api/logs?page_size=60&keyword=liveCdnUrl",
+                    timeout=timeout)
+    entries = (data.get("data") or {}).get("entries") or []
+
+    out = []
+    seen = set()
+    for entry in entries:
+        raw = entry.get("raw") if isinstance(entry, dict) else None
+        if not isinstance(raw, str):
+            continue
+        try:
+            obj = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+
+        feed = obj.get("feed") or {}
+        live = feed.get("live") or {}
+        sdk = live.get("liveSdkInfo") or {}
+        cdn = str(sdk.get("liveCdnUrl") or "").strip()
+        if not cdn or not _looks_like_live(cdn):
+            continue
+
+        key = cdn.split("?", 1)[0]
+        if key in seen:
+            continue
+        seen.add(key)
+
+        # live_id 必须从 CDN 地址里取，不能用 liveInfo.liveId：
+        # 后者是 JS 数字，超过 2^53 会丢精度（实测 ...794797 变成
+        # ...795000，差 203），拿它去匹配永远对不上。
+        live_id = _live_id_from_url(cdn)
+        if not live_id:
+            continue
+
+        title = str(live.get("liveDescription") or "").strip()
+        if not title:
+            title = "直播_" + live_id[-6:]
+        author = ""
+        prof = feed.get("profile")
+        if isinstance(prof, dict):
+            author = str(prof.get("nickname") or "").strip()
+
+        out.append(ContentItem(
+            content_id=live_id,
+            title=title,
+            url=cdn,
+            author=author,
+            is_live=True,
+            live_id=live_id,
+            captured_at=int(time.time() * 1000),
+        ))
+    return out
+
+
 def list_page(api: str = DEFAULT_API, keyword: str = "",
               limit: int | None = None, offset: int | None = None,
               page: int | None = None, page_size: int | None = None,

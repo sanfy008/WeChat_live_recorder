@@ -36,6 +36,12 @@ def app(tmp_path, monkeypatch):
     monkeypatch.setattr(GF.messagebox, "askyesno", lambda *a, **kw: True)
     monkeypatch.setattr(GF.messagebox, "askyesnocancel", lambda *a, **kw: True)
 
+    # 刷新列表现在还会调 fetch.discover_live_streams（从工具日志找正在播的
+    # 直播）。这里必须一并桩掉，否则每个 GUI 用例都会真的去连 127.0.0.1:2022，
+    # 把真实直播混进断言里 —— 正是本文件开头警告过的那个坑。
+    import wxlive.fetch as F
+    monkeypatch.setattr(F, "discover_live_streams", lambda *a, **kw: [])
+
     from wxlive.gui import App
 
     a = App()
@@ -104,6 +110,9 @@ def stub_list(monkeypatch):
         return holder["page"]
 
     monkeypatch.setattr(F, "list_page", fake)
+    # 发现直播默认空；需要验证"日志发现"渲染的用例自己覆盖 holder["lives"]
+    monkeypatch.setattr(F, "discover_live_streams",
+                        lambda *a, **kw: holder.get("lives") or [])
     return holder, calls
 
 

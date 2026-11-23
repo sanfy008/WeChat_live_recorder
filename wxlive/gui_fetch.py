@@ -36,6 +36,7 @@ from pathlib import Path
 from tkinter import messagebox, ttk
 
 from . import fetchstate
+from . import fetch as F
 
 # 一页取多少条。工具的默认 page_size 是 20，这里略大一点少翻页，
 # 但别太大：每条都带一个约 1000 字符的签名 URL，500 条就是 500KB。
@@ -198,6 +199,10 @@ class FetchTabMixin:
                    command=self._fetch_invert_selection).pack(side="left", padx=(4, 0))
         ttk.Button(row2, text="解析选中", width=9,
                    command=self._fetch_probe_selected).pack(side="left", padx=(12, 0))
+        # 显式的"取址"入口：选中指定一条，把真实流地址解析出来并告诉你
+        # 能不能拉。比"必须先去微信点下载"少一个来回，也便于确认主播在不在播。
+        ttk.Button(row2, text="解析直播地址", width=12,
+                   command=self._fetch_resolve_live).pack(side="left", padx=(6, 0))
         ttk.Button(row2, text="删除选中", width=9,
                    command=self._fetch_delete_selected).pack(side="left", padx=(12, 0))
         ttk.Button(row2, text="清空列表", width=9,
@@ -461,6 +466,59 @@ class FetchTabMixin:
 
         self._run_bg(work)
 
+    def _fetch_resolve_live(self) -> None:
+        """把选中直播的真实流地址解析出来，并探测当下能不能拉。
+
+        为什么单独给一个按钮（而不是只藏在"推送 NAS"里面）：
+        用户想知道的是"这条到底还能不能录"，而不是先把它推出去再等失败。
+        解析 + 探测一次就能给出确定答案，几秒内完成。
+
+        三条路径的差别（实测 2026-11-23）：
+        - 已入库的直播    -> detail.resources[].url
+        - 未入库但打开过   -> 工具日志里的 liveCdnUrl（不用点下载）
+        - 从没打开过      -> 三条都没有，只能提示回微信打开一次
+        """
+        targets = self._fetch_selected_items()
+        if not targets:
+            messagebox.showinfo("请先选择", "请在列表里选中要解析的条目。")
+            return
+
+        it = targets[0]
+        if not getattr(it, "is_live", False):
+            # 普通回放本来就有直链，直接走原有的 HEAD 解析
+            self._fetch_probe_selected()
+            return
+
+        from . import fetch as fetch_mod
+
+        api = self.fetch_api_var.get().strip() or "http://127.0.0.1:2022"
+        self._fetch_set_state(it.content_id, "取址中…")
+        self._log(f"[解析] 《{it.title}》是直播，正在取流地址…")
+
+        def work() -> None:
+            try:
+                url, src, why = fetch_mod.resolve_playable_stream(it, api=api)
+            except Exception as exc:  # noqa: BLE001
+                msg = str(exc)
+                self._ui(lambda: self._fetch_set_state(it.content_id, "取不到地址"))
+                self._log(f"[解析] 失败：{msg}")
+                self._ui(lambda m=msg: messagebox.showwarning("解析失败", m))
+                return
+
+            self._ui(lambda: self._fetch_set_state(
+                it.content_id, "可录制（含音轨）"))
+            self._log(f"[解析] 《{it.title}》OK（{src}，{why}）")
+            short = url.split("?", 1)[0]
+            self._ui(lambda s2=src, w=why, u=short: messagebox.showinfo(
+                "解析成功",
+                f"《{it.title}》\n\n"
+                f"地址来源：{s2}\n"
+                f"探测结果：{w}\n\n"
+                f"流地址（去掉签名参数）：\n{u}\n\n"
+                f"要录的话点「推送选中项到 NAS」，本机可以关掉。"))
+
+        self._run_bg(work)
+
     def _fetch_push_selected_to_nas(self) -> None:
         """把列表里选中的条目推给 NAS 拉流。
 
@@ -695,6 +753,35 @@ class FetchTabMixin:
                               page: int, size: int) -> None:
         from . import fetch as F
 
+        # 直播发现不能只靠 /api/content/list：content 表里**只有点过下载/
+        # 打开过的直播**。用户只是打开直播间看、没点下载按钮，那条直播就
+        # 根本不在列表里（实测 2026-11-23：正在播的"英语大招方法技巧"
+        # 完全查不到）。但它已经躺在工具日志里，那条路不依赖任何点击。
+        #
+        # 发现后立刻并行探活，只把真能拉的交给 UI。串行实测要 17.8 秒
+        # （每条失效地址都等满超时），并行后 ≈ 最慢一条。
+        found_lives = []
+        try:
+            cands = F.discover_live_streams(api)[:8]
+        except Exception:  # noqa: BLE001
+            cands = []
+
+        if cands:
+            from concurrent.futures import ThreadPoolExecutor
+
+            def _probe(cand):
+                try:
+                    return cand, F.probe_stream(cand.url, timeout=6)
+                except Exception as exc:  # noqa: BLE001
+                    return cand, (False, type(exc).__name__)
+
+            with ThreadPoolExecutor(max_workers=min(8, len(cands))) as pool:
+                for cand, (ok, why) in pool.map(_probe, cands):
+                    if ok:
+                        found_lives.append(cand)
+                    else:
+                        self._log(f"[直播] 跳过《{cand.title}》：{why}")
+
         try:
             result = F.list_page(api, keyword=keyword,
                                  limit=size, offset=(page - 1) * size)
@@ -708,6 +795,8 @@ class FetchTabMixin:
             msg = f"{type(exc).__name__}: {exc}"
             self._ui(lambda m=msg: self._fetch_refresh_done(None, m))
             return
+        if result is not None and found_lives:
+            result.discovered_lives = found_lives
         self._ui(lambda: self._fetch_refresh_done(result, ""))
 
     def _fetch_refresh_done(self, result, err: str) -> None:
@@ -730,6 +819,21 @@ class FetchTabMixin:
         done_ids = fetchstate.downloaded_ids(state)
         show_hidden = self.fetch_show_hidden_var.get()
         only_new = self.fetch_only_new_var.get()
+
+        # ---- 先渲染"从日志发现的直播" ----
+        # 这些直播不在工具 content 表里（用户没点过下载），但地址已经拿到、
+        # 而且刚在后台探活确认能拉。放在最前面，因为用户刷新的动机通常就是它。
+        discovered = list(getattr(result, "discovered_lives", None) or [])
+        in_page = {it.content_id for it in items}
+        fresh = []
+        for it in discovered:
+            if it.live_id in in_page or it.content_id in in_page:
+                continue          # 已经在上面的列表里，别重复
+            if only_new and it.content_id in done_ids:
+                continue
+            self._fetch_add_row(it, False, discovered=True)
+            fresh.append(it)
+        shown_discovered = len(fresh)
 
         shown = 0
         hidden_here = 0
@@ -757,6 +861,8 @@ class FetchTabMixin:
             state="normal" if self._fetch_page < pages else "disabled")
 
         bits = [f"共 {self._fetch_total} 条"]
+        if shown_discovered:
+            bits.append(f"{shown_discovered} 场直播是从日志发现的")
         if shown != len(items):
             bits.append(f"本页显示 {shown}/{len(items)}")
         if hidden_here and not show_hidden:
@@ -785,7 +891,8 @@ class FetchTabMixin:
                 "· 勾选「显示已删除的」可以看回被删除的条目\n"
                 "· 取消「只看未下载的」可以看已下载过的条目")
 
-    def _fetch_add_row(self, it, is_hidden: bool) -> None:
+    def _fetch_add_row(self, it, is_hidden: bool,
+                       discovered: bool = False) -> None:
         """插入一行。状态列区分「直播中」与「待下载/已下载」。
 
         直播为什么单列状态：直播项在工具库里 url 恒为空，点「下载」既下不了
@@ -797,7 +904,12 @@ class FetchTabMixin:
             state_text = "已删除（隐藏）"
             tags = ("hidden",)
         elif getattr(it, "is_live", False):
-            state_text = "直播中 → 推 NAS"
+            if discovered:
+                # 与"已入库的直播"区分：这条没点过下载，地址是从工具日志
+                # 里取的。看到这个就知道"不用点下载也能推 NAS"。
+                state_text = "直播中（日志发现）→ 推 NAS"
+            else:
+                state_text = "直播中 → 推 NAS"
             tags = ("live",)
         elif rec:
             dur = float(rec.get("duration") or 0.0)
