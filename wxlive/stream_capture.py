@@ -235,6 +235,9 @@ class StreamRecorder:
                     self._log(f"[stream] {stale:.0f}s 无新数据，判定断流（第 {stale_restarts} 次）")
                     if stale_restarts >= 3:
                         self._log("[stream] 连续断流，停止。地址可能已过期，需重新获取。")
+                        # 必须真的杀掉进程：只 break 会留下"进程活着但不再写数据"的僵尸，
+                        # `running` 仍为 True，上层 watcher 会永远等下去（对立性审查 H1）。
+                        self._kill_proc()
                         break
                     last_grow = time.time()
 
@@ -247,17 +250,30 @@ class StreamRecorder:
             if self._proc.poll() is not None and size == last_size:
                 break
 
+    def _kill_proc(self) -> None:
+        """终止 ffmpeg 进程（幂等）。
+
+        为什么单独抽出来：`_monitor` 判定断流后如果只 `break`，
+        进程还活着但不再写数据 —— `running` 属性（看 `poll() is None`）
+        仍然是 True，上层 watcher 会永远循环等它结束。
+        """
+        proc = self._proc
+        if proc is None:
+            return
+        if proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=8)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
     def stop(self) -> None:
         self._stop.set()
-        if self._proc and self._proc.poll() is None:
-            try:
-                self._proc.terminate()
-                self._proc.wait(timeout=8)
-            except Exception:
-                try:
-                    self._proc.kill()
-                except Exception:
-                    pass
+        self._kill_proc()
         self._log("[stream] 已停止")
 
     @property

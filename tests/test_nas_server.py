@@ -393,3 +393,176 @@ def test_export_skips_symlinks(tmp_path: Path):
         assert b"hello" in joined
     finally:
         runner.shutdown()
+
+
+# ---------------- 回归：herdr 对立性审查 C1/C2/C3 ----------------
+
+def test_c1_corrupt_job_entry_does_not_orphan_all_audio(tmp_path: Path):
+    """C1 回归：一条畸形任务记录不能拖垮整份任务表（否则老录音全被当孤儿删）。"""
+    import os
+
+    rec = tmp_path / "recordings"
+    rec.mkdir(parents=True)
+    audio = rec / "20260101_120000_老直播_stream.wav"
+    audio.write_bytes(b"\0" * 4096)
+    old = time.time() - 100 * 86400
+    os.utime(audio, (old, old))
+
+    # 一条正常 + 一条畸形
+    (tmp_path / "jobs.json").write_text(json.dumps({
+        "j1": {"id": "j1", "title": "老直播", "status": "completed",
+               "audio_path": str(audio), "md_path": "",
+               "created_at": old, "logs": []},
+        "j2": "oops",
+    }, ensure_ascii=False), encoding="utf-8")
+
+    runner = NasJobRunner(data_dir=tmp_path, engine_factory=lambda t, l: _FakeEngine())
+    try:
+        assert len(runner._jobs) == 1, "健康任务记录不该被畸形条目带走"
+        assert runner._jobs_load_error, "应记录损坏告警"
+        # 坏条目已备份
+        assert (tmp_path / "jobs.corrupt.json").exists()
+
+        # 真删必须被拒绝
+        res = runner.run_cleanup(dry_run=False, trigger="test")
+        assert res["ok"] is False
+        assert "损坏" in res["error"]
+        assert audio.exists(), "损坏状态下文件被删了"
+    finally:
+        runner.shutdown()
+
+
+def test_c1_empty_jobs_but_audio_present_refuses_delete(tmp_path: Path):
+    """C1 另一半：任务表为空但有音频 → 疑似损坏，拒绝真删。"""
+    rec = tmp_path / "recordings"
+    rec.mkdir(parents=True)
+    (rec / "20260101_120000_x_stream.wav").write_bytes(b"\0" * 1024)
+
+    runner = NasJobRunner(data_dir=tmp_path, engine_factory=lambda t, l: _FakeEngine())
+    try:
+        runner.update_settings({"retention_days": 30})
+        res = runner.run_cleanup(dry_run=False, trigger="test")
+        assert res["ok"] is False
+        assert "疑似任务表损坏" in res["error"]
+    finally:
+        runner.shutdown()
+
+
+def test_c2_retention_disabled_by_default(tmp_path: Path):
+    """C2 回归：新装默认不自动删（破坏性操作必须由人显式开启）。"""
+    runner = NasJobRunner(data_dir=tmp_path, engine_factory=lambda t, l: _FakeEngine())
+    try:
+        s = runner.get_settings()
+        assert s["retention_days"] == 0, f"默认值应为 0（不自动删），实际 {s['retention_days']}"
+        st = runner.cleanup_status()
+        assert st["auto_enabled"] is False
+    finally:
+        runner.shutdown()
+
+
+def test_c2_cleanup_history_records_paths(tmp_path: Path):
+    """C2 另一半：删除清单要落盘，能回答"我哪天那场录音哪去了"。"""
+    rec = tmp_path / "recordings"
+    rec.mkdir(parents=True)
+    audio = rec / "20260101_120000_gone_stream.wav"
+    audio.write_bytes(b"\0" * 2048)
+    old = time.time() - 100 * 86400
+    import os
+    os.utime(audio, (old, old))
+
+    runner = NasJobRunner(data_dir=tmp_path, engine_factory=lambda t, l: _FakeEngine())
+    try:
+        with runner._lock:
+            runner._jobs["j1"] = {
+                "id": "j1", "title": "被清的场次", "status": "completed",
+                "audio_path": str(audio), "md_path": "",
+                "created_at": old, "logs": [],
+            }
+            runner._save_jobs()
+        runner.update_settings({"retention_days": 30})
+
+        res = runner.run_cleanup(dry_run=False, trigger="manual")
+        assert res["deleted_count"] == 1
+        assert not audio.exists()
+
+        hist = tmp_path / "cleanup_history"
+        assert hist.is_dir(), "没有清理历史目录"
+        files = list(hist.glob("*.json"))
+        assert files, "没有写清理清单"
+        doc = json.loads(files[0].read_text(encoding="utf-8"))
+        paths = [d["name"] for d in doc.get("deleted", [])]
+        assert "20260101_120000_gone_stream.wav" in paths
+    finally:
+        runner.shutdown()
+
+
+def test_m2_cleanup_thread_starts_when_enabled_later(tmp_path: Path):
+    """M2 回归：启动后把保留天数从 0 改成 >0，定时线程要能起来。"""
+    runner = NasJobRunner(data_dir=tmp_path, engine_factory=lambda t, l: _FakeEngine())
+    try:
+        assert runner.cleanup_status()["worker_alive"] is False
+        runner.update_settings({"retention_days": 30})
+        for _ in range(30):
+            if runner.cleanup_status()["worker_alive"]:
+                break
+            time.sleep(0.05)
+        assert runner.cleanup_status()["worker_alive"] is True
+    finally:
+        runner.shutdown()
+
+
+def test_m9_zero_rms_threshold_clamped(tmp_path: Path):
+    """M9 回归：silence_rms_threshold=0 会让判停静默失效，必须钳住。"""
+    runner = NasJobRunner(data_dir=tmp_path, engine_factory=lambda t, l: _FakeEngine())
+    try:
+        s = runner.update_settings({"silence_rms_threshold": 0})
+        assert s["silence_rms_threshold"] >= 1e-6
+    finally:
+        runner.shutdown()
+
+
+def test_c3_token_required_for_mutating_endpoints(tmp_path: Path):
+    """C3 回归：开了 token 后，写操作必须带令牌；GET 保持开放。"""
+    runner = NasJobRunner(data_dir=tmp_path, engine_factory=lambda t, l: _FakeEngine())
+    try:
+        app = create_app(runner=runner, require_token="secret-token")
+        with TestClient(app) as client:
+            # GET 不需要 token
+            assert client.get("/api/health").status_code == 200
+
+            # 写操作没 token → 401
+            r = client.post("/api/cleanup/run", json={"dry_run": True})
+            assert r.status_code == 401
+
+            # 带上就放行
+            r = client.post("/api/cleanup/run", json={"dry_run": True},
+                            headers={"X-WXLIVE-Token": "secret-token"})
+            assert r.status_code == 200
+    finally:
+        runner.shutdown()
+
+
+def test_c3_rejects_foreign_host_header(tmp_path: Path):
+    """C3 另一半：陌生 Host 头（DNS rebinding）要被挡住。"""
+    runner = NasJobRunner(data_dir=tmp_path, engine_factory=lambda t, l: _FakeEngine())
+    try:
+        app = create_app(runner=runner)
+        with TestClient(app) as client:
+            r = client.get("/api/health", headers={"Host": "evil.example.com"})
+            assert r.status_code == 400
+            # IP 与 localhost 正常放行
+            assert client.get("/api/health", headers={"Host": "127.0.0.1"}).status_code == 200
+            assert client.get("/api/health", headers={"Host": "localhost"}).status_code == 200
+    finally:
+        runner.shutdown()
+
+
+def test_h2_recording_limits_defaults(tmp_path: Path):
+    """H2：录制上限必须有默认值（防永不结束的流写满磁盘）。"""
+    runner = NasJobRunner(data_dir=tmp_path, engine_factory=lambda t, l: _FakeEngine())
+    try:
+        s = runner.get_settings()
+        assert s["max_record_hours"] > 0
+        assert s["max_record_gb"] > 0
+    finally:
+        runner.shutdown()

@@ -32,6 +32,7 @@ mtime 会被 `touch`、同步工具、容器重建影响，`created_at` 才是"�
 
 from __future__ import annotations
 
+import re
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -46,6 +47,16 @@ SECONDS_PER_DAY = 86400.0
 # 孤儿文件只认这些后缀，避免误删别的东西
 _ORPHAN_SUFFIXES = (".wav",)
 _ORPHAN_JUNK_SUFFIXES = (".part", ".tmp", ".16k.wav.part")
+
+# 本程序产出的音频文件名规则。孤儿清理**只认这两类**，
+# 避免误删别人放进同一目录的文件（对立性审查 M7 ——
+# 抓流工具的 download.dir 就指向 recordings/，它会往里放 .mkv/.mp4）。
+#
+#   stream:  20261123_103958_名字_stream.wav
+#   upload:  20261123_103958_名字.wav（用户上传后转的 16k wav）
+_OWN_AUDIO_RE = re.compile(
+    r"^\d{8}_\d{6}_.+(_stream)?\.(wav|16k\.wav)$", re.IGNORECASE
+)
 
 # 孤儿音频的**额外**保护期（小时）。
 #
@@ -245,40 +256,59 @@ def plan_cleanup(
                 "reason": f"音频不在录制目录内，跳过：{audio_p}",
             })
             continue
-        if not audio_p.exists():
-            continue
 
+        # 年龄基准：优先 job.created_at，其次音频 mtime，最后转录 mtime。
+        # 音频可能已经被上一轮清理删掉了，这时不能因为"文件不存在"就跳过 ——
+        # 否则"先只清音频、后勾选连转录一起清"这条最自然的使用路径会永远失效
+        # （对立性审查 H5）。
         created = _job_created_ts(job)
-        base_ts = created if created > 0 else audio_p.stat().st_mtime
+        if created > 0:
+            base_ts = created
+        elif audio_p.exists():
+            try:
+                base_ts = audio_p.stat().st_mtime
+            except OSError:
+                base_ts = ts_now
+        else:
+            md_for_ts = Path(md_raw) if md_raw else None
+            if md_for_ts and md_for_ts.exists():
+                try:
+                    base_ts = md_for_ts.stat().st_mtime
+                except OSError:
+                    base_ts = ts_now
+            else:
+                continue          # 什么都没有：无从判断年龄，跳过
         age = _age_days(base_ts, ts_now)
         if age < plan.retention_days:
             continue
 
-        size = _file_size(audio_p)
-        plan.candidates.append(Candidate(
-            kind="audio",
-            path=audio_p,
-            size_bytes=size,
-            age_days=age,
-            job_id=job_id,
-            title=str(job.get("title") or ""),
-            reason=f"音频已 {age:.0f} 天（阈值 {plan.retention_days:.0f} 天）",
-        ))
+        # 音频：存在才删
+        if audio_p.exists():
+            plan.candidates.append(Candidate(
+                kind="audio",
+                path=audio_p,
+                size_bytes=_file_size(audio_p),
+                age_days=age,
+                job_id=job_id,
+                title=str(job.get("title") or ""),
+                reason=f"音频已 {age:.0f} 天（阈值 {plan.retention_days:.0f} 天）",
+            ))
 
+        # 转录：**独立于音频是否存在**判定
         if delete_transcripts and md_raw:
-            md_p = Path(md_raw)
-            tr_dir = md_p.parent
+            tr_dir = Path(md_raw).parent
             if tr_dir.exists() and _is_within(tr_dir, tr_root) and tr_dir != tr_root:
                 tr_size = sum(_file_size(f) for f in tr_dir.rglob("*") if f.is_file())
-                plan.candidates.append(Candidate(
-                    kind="transcript",
-                    path=tr_dir,
-                    size_bytes=tr_size,
-                    age_days=age,
-                    job_id=job_id,
-                    title=str(job.get("title") or ""),
-                    reason=f"逐字稿已 {age:.0f} 天（阈值 {plan.retention_days:.0f} 天）",
-                ))
+                if tr_size > 0:
+                    plan.candidates.append(Candidate(
+                        kind="transcript",
+                        path=tr_dir,
+                        size_bytes=tr_size,
+                        age_days=age,
+                        job_id=job_id,
+                        title=str(job.get("title") or ""),
+                        reason=f"逐字稿已 {age:.0f} 天（阈值 {plan.retention_days:.0f} 天）",
+                    ))
 
     # ---- 孤儿文件：目录里有、但没有任务引用 ----
     plan.candidates.extend(
@@ -311,7 +341,8 @@ def _plan_orphans(
             continue
         name = p.name
         is_junk = any(name.endswith(s) for s in _ORPHAN_JUNK_SUFFIXES)
-        is_orphan_audio = name.endswith(_ORPHAN_SUFFIXES) and not is_junk
+        # 只认本程序的命名规则，别碰别人放进来的 .wav（审查 M7）
+        is_orphan_audio = bool(_OWN_AUDIO_RE.match(name)) and not is_junk
         if not (is_junk or is_orphan_audio):
             continue
         key = str(p)
@@ -399,8 +430,12 @@ def execute_cleanup(plan: CleanupPlan) -> CleanupResult:
             else:
                 if c.path.exists():
                     c.path.unlink()
+            # 先确认文件真的还不在，再计入释放量：
+            # 两次 cleanup 并发时，路径已被删但仍 append 会让报表虚高（审查 L4）
+            still_there = c.path.exists()
             result.deleted.append(c.to_dict())
-            result.freed_bytes += c.size_bytes
+            if not still_there:
+                result.freed_bytes += c.size_bytes
         except OSError as exc:
             result.failed.append({**c.to_dict(), "error": str(exc)[:200]})
     return result
@@ -434,9 +469,12 @@ def scan_library(
         return []
 
     for d in sorted(tr_root.iterdir()):
-        if not d.is_dir():
+        # 跳过符号链接/junction 目录：itetdir() 会穿过它们，
+        # 把库外目录的文件名和 md 预览读出来（对立性审查 M3）。
+        # 下载端点有 resolve().relative_to() 兜底，但列表接口会泄露内容。
+        if d.is_symlink() or not d.is_dir():
             continue
-        files = [f for f in d.iterdir() if f.is_file()]
+        files = [f for f in d.iterdir() if f.is_file() and not f.is_symlink()]
         if not files:
             continue
         md = next((f for f in files if f.suffix == ".md"), None)
@@ -446,7 +484,13 @@ def scan_library(
 
         job = by_dir.get(str(d), {})
         total = sum(_file_size(f) for f in files)
-        newest = max((f.stat().st_mtime for f in files), default=0.0)
+        # stat 可能因清理线程同时删文件而抛 FileNotFoundError（对立性审查 M8）
+        def _mtime(f: Path) -> float:
+            try:
+                return f.stat().st_mtime
+            except OSError:
+                return 0.0
+        newest = max((_mtime(f) for f in files), default=0.0)
 
         preview = ""
         if md is not None:

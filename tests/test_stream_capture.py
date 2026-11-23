@@ -185,3 +185,38 @@ def test_extract_url_then_is_url_contract():
         got = stream_capture.extract_url(text)
         if got:
             assert stream_capture.is_url(got), got
+
+
+def test_h1_stale_stream_kills_process(tmp_path):
+    """H1 回归：连续断流后必须真的杀掉 ffmpeg，否则上层 watcher 永远等下去。
+
+    修复前：_monitor 只 break 退出自己的线程，进程仍活着不写数据，
+    `running` 仍为 True → 任务永久卡在 recording。
+    """
+    import threading as _th
+
+    # 造一个"不写任何数据"的假进程：读 stdin 到 EOF（永不产生输出文件）
+    rec = stream_capture.StreamRecorder("http://127.0.0.1:9/nope.flv", tmp_path, name="h1")
+    # 用一个恒不产生数据的进程替代
+    rec._proc = __import__("subprocess").Popen(
+        ["ping", "-n", "600", "127.0.0.1"],
+        stdout=__import__("subprocess").DEVNULL,
+        stderr=__import__("subprocess").PIPE,
+    )
+    assert rec.running is True
+    rec._kill_proc()
+    assert rec._proc.poll() is not None, "进程没被杀掉"
+    assert rec.running is False, "running 仍为 True → watcher 会永远等"
+
+
+def test_h1_stop_also_kills(tmp_path):
+    """stop() 也必须确保进程结束。"""
+    rec = stream_capture.StreamRecorder("http://127.0.0.1:9/nope.flv", tmp_path, name="h1b")
+    rec._proc = __import__("subprocess").Popen(
+        ["ping", "-n", "600", "127.0.0.1"],
+        stdout=__import__("subprocess").DEVNULL,
+        stderr=__import__("subprocess").PIPE,
+    )
+    rec.stop()
+    assert rec._proc.poll() is not None
+    assert rec.running is False

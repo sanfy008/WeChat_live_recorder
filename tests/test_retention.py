@@ -174,8 +174,9 @@ def test_transcript_dir_root_never_a_candidate(tmp_path: Path):
 # ---------------- 孤儿文件 ----------------
 
 def test_orphan_audio_detected(tmp_path: Path):
+    """孤儿清理只认本程序命名规则（审查 M7）。"""
     rec = tmp_path / "recordings"
-    orphan = _make_audio(rec, "nobody_owns_me.wav")
+    orphan = _make_audio(rec, "20260101_120000_无人认领_stream.wav")
     old = NOW - 100 * DAY
     import os
     os.utime(orphan, (old, old))
@@ -188,7 +189,7 @@ def test_orphan_audio_detected(tmp_path: Path):
 
 def test_orphan_recent_not_deleted(tmp_path: Path):
     rec = tmp_path / "recordings"
-    _make_audio(rec, "just_created.wav")   # mtime = 现在
+    _make_audio(rec, "20260101_120000_刚建的_stream.wav")   # mtime = 现在
     plan = retention.plan_cleanup({}, rec, tmp_path / "transcripts",
                                   retention_days=30, now=NOW)
     assert plan.candidates == []
@@ -330,7 +331,7 @@ def test_inflight_upload_not_deleted_as_orphan(tmp_path: Path):
     import os
 
     rec = tmp_path / "recordings"
-    inflight = _make_audio(rec, "uploading_now.wav")
+    inflight = _make_audio(rec, "20260101_120000_上传中.wav")
     # 刚过 30 天保留期 2 小时 —— 落在 24h 宽限区内
     old = NOW - (30 * DAY + 2 * 3600)
     os.utime(inflight, (old, old))
@@ -348,7 +349,7 @@ def test_true_orphan_beyond_grace_still_deleted(tmp_path: Path):
     import os
 
     rec = tmp_path / "recordings"
-    orphan = _make_audio(rec, "really_orphan.wav")
+    orphan = _make_audio(rec, "20260101_120000_真孤儿_stream.wav")
     old = NOW - 40 * DAY          # 40 天 > 30 天 + 1 天宽限
     os.utime(orphan, (old, old))
 
@@ -371,3 +372,81 @@ def test_junk_not_delayed_by_orphan_grace(tmp_path: Path):
     plan = retention.plan_cleanup({}, rec, tmp_path / "transcripts",
                                   retention_days=30, now=NOW)
     assert [c.kind for c in plan.candidates] == ["junk"]
+
+
+# ---------------- 回归：herdr 对立性审查发现的问题 ----------------
+
+def test_h5_transcript_cleaned_after_audio_gone(tmp_path: Path):
+    """H5 回归：音频已被上一轮清掉后，delete_transcripts 仍要能清逐字稿。
+
+    修复前：转录候选只在"音频存在且超期"分支里产生，
+    先跑过一轮只清音频 → 第二轮永远清不到转录（磁盘只增不减）。
+    """
+    rec = tmp_path / "recordings"
+    tr = tmp_path / "transcripts"
+    rec.mkdir(parents=True)
+    tr_dir = tr / "s1"
+    tr_dir.mkdir(parents=True)
+    (tr_dir / "a.md").write_text("x" * 200, encoding="utf-8")
+
+    # 音频不存在（已被清），但 job 记录了创建时间和 md 路径
+    jobs = {"j1": {
+        "id": "j1", "title": "老场", "status": "completed",
+        "audio_path": str(rec / "already_deleted.wav"),
+        "md_path": str(tr_dir / "a.md"),
+        "created_at": NOW - 60 * DAY,
+        "logs": [],
+    }}
+    plan = retention.plan_cleanup(jobs, rec, tr, retention_days=30,
+                                  delete_transcripts=True, now=NOW)
+    kinds = [c.kind for c in plan.candidates]
+    assert "transcript" in kinds, f"音频已删后转录清不掉：{kinds}"
+
+
+def test_h5_transcript_not_duplicated(tmp_path: Path):
+    """音频与转录都在时，只产生各一条候选（不重复计）。"""
+    rec = tmp_path / "recordings"
+    tr = tmp_path / "transcripts"
+    audio = _make_audio(rec, "20260101_120000_x_stream.wav")
+    tr_dir = tr / "s1"
+    tr_dir.mkdir(parents=True)
+    (tr_dir / "a.md").write_text("x", encoding="utf-8")
+
+    jobs = {"j1": {"id": "j1", "status": "completed", "audio_path": str(audio),
+                   "md_path": str(tr_dir / "a.md"),
+                   "created_at": NOW - 60 * DAY, "logs": []}}
+    plan = retention.plan_cleanup(jobs, rec, tr, retention_days=30,
+                                  delete_transcripts=True, now=NOW)
+    kinds = sorted(c.kind for c in plan.candidates)
+    assert kinds == ["audio", "transcript"]
+
+
+def test_m7_foreign_wav_not_touched(tmp_path: Path):
+    """M7 回归：不符合本程序命名规则的 .wav 不能被当孤儿删（可能是别人的）。"""
+    import os
+
+    rec = tmp_path / "recordings"
+    foreign = _make_audio(rec, "someone_elses_export.wav")
+    old = NOW - 200 * DAY
+    os.utime(foreign, (old, old))
+
+    plan = retention.plan_cleanup({}, rec, tmp_path / "transcripts",
+                                  retention_days=30, now=NOW)
+    assert plan.candidates == [], (
+        f"误删他人文件：{[c.to_dict() for c in plan.candidates]}"
+    )
+
+
+def test_m7_own_naming_still_recognised(tmp_path: Path):
+    """自己的命名规则仍要认出来，别把功能废掉。"""
+    import os
+
+    rec = tmp_path / "recordings"
+    for name in ("20260101_120000_场次_stream.wav", "20260101_120000_上传.wav"):
+        p = _make_audio(rec, name)
+        os.utime(p, (NOW - 200 * DAY, NOW - 200 * DAY))
+
+    plan = retention.plan_cleanup({}, rec, tmp_path / "transcripts",
+                                  retention_days=30, now=NOW)
+    assert len(plan.candidates) == 2
+    assert all(c.kind == "orphan_audio" for c in plan.candidates)

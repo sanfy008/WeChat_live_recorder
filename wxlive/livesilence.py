@@ -321,12 +321,17 @@ class LiveSilenceMonitor:
         audio = audio[start_idx:]
         n = audio.size // block
         if n == 0:
-            # 新增不足一个块：留着下次一起算（不推进 consumed_end 已做，天然衔接）
+            # 新增不足一个块：**必须把 _consumed_end 退回去**，否则这段音频
+            # 被标记为"已消费"却从未分析，永久丢失（对立性审查 M1）。
+            # 影响是 40 秒阈值系统性偏松（实测每轮最多漏 0.5 秒）。
+            if audio_offset is not None and self._consumed_end is not None:
+                self._consumed_end -= audio.size / float(sample_rate)
             return SilenceVerdict(
                 checked=False,
                 rms=round(self._last_rms, 5),
                 silent_seconds=round(self.silent_seconds, 1),
                 heard_sound=self.heard_sound,
+                reason="新增不足一个块，留待下次",
             )
 
         verdict = SilenceVerdict(checked=True)

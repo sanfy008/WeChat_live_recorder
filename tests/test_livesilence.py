@@ -329,3 +329,31 @@ def test_stop_reason_persisted_to_disk(tmp_path: Path):
         assert j.get("stop_reason") == "连续静音 40 秒，判定直播已结束"
     finally:
         r2.shutdown()
+
+
+def test_m1_leftover_not_swallowed(tmp_path: Path):
+    """M1 回归：不足一个块的新增音频不能被标记为"已消费"然后永久丢失。
+
+    修复前实测：追加 0.2s 后下一轮只计 3.0s（应 3.2s），
+    导致 40 秒阈值系统性偏松。
+    """
+    mon = LiveSilenceMonitor(stop_after_seconds=999, silence_rms=0.002,
+                             block_seconds=0.5)
+    p = _write_wav(tmp_path / "a.wav", _tone(5.0))
+    tail, sr, start = livesilence.read_tail_window(p, max_seconds=5.5)
+    mon.poll(tail, sr, audio_offset=start)
+    before = mon.silent_seconds
+
+    # 追加 0.2 秒静音（不足一个 0.5s 块）
+    with p.open("ab") as fh:
+        fh.write((np.zeros(int(SR * 0.2), dtype=np.float32) * 32767).astype("<i2").tobytes())
+    tail, sr, start = livesilence.read_tail_window(p, max_seconds=5.5)
+    v = mon.poll(tail, sr, audio_offset=start)
+    assert v.checked is False
+    # 这段不能被消费掉：再追 0.4 秒后应能凑够一个块并计入
+    with p.open("ab") as fh:
+        fh.write((np.zeros(int(SR * 0.4), dtype=np.float32) * 32767).astype("<i2").tobytes())
+    tail, sr, start = livesilence.read_tail_window(p, max_seconds=5.5)
+    v2 = mon.poll(tail, sr, audio_offset=start)
+    assert v2.checked, "0.2+0.4 秒仍未凑成一个块 —— 尾巴被吞了"
+    assert mon.silent_seconds >= 0.5

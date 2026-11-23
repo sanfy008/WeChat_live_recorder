@@ -85,13 +85,23 @@ class NasSettings:
     # 阈值沿用本地实测：16k mono 归一化 float 的 RMS < 0.002 算静音
     silence_rms_threshold: float = 0.002
     # ---- 磁盘保留策略（2026-11-23 新增）----
-    # 0 = 禁用自动清理。默认 30 天：一场 2 小时直播音频约 220MB，
-    # 每天一场就是 6.6GB/月，不清理迟早撑爆。
-    retention_days: int = 30
+    # **默认 0 = 不自动删**（对立性审查 C2 修订）。
+    #
+    # 原设计默认 30 天，理由是"一场 2 小时直播音频约 220MB，每天一场 6.6GB/月"。
+    # 但"新装即生效、第 31 天自动删、不可撤销、无回收站"是不可接受的默认值：
+    # 删除是破坏性的，必须由人显式开启并知道后果。
+    # 需要自动清理时在网页「⚙ 设置」里填天数即可，或设环境变量 WXLIVE_RETENTION_DAYS。
+    retention_days: int = 0
     # 是否连逐字稿一起清。默认 False：文字体积小、价值高，只清音频就够了。
     cleanup_delete_transcripts: bool = False
     # 自动清理的检查间隔（小时）。默认 24 = 每天一次。
     cleanup_interval_hours: int = 24
+    # ---- 录制上限（对立性审查 H2）----
+    # 永不结束且有声音的流会无限增长，磁盘写满后转写/日志/jobs.json 全挂。
+    # 0 = 不限制。默认 8 小时：比常见直播长得多，但能兜住异常。
+    max_record_hours: int = 8
+    # 单个任务音频上限（GB）。0 = 不限制。8h@16k mono ≈ 0.88GB，留足余量。
+    max_record_gb: int = 2
 
     @classmethod
     def from_env(cls) -> NasSettings:
@@ -111,10 +121,11 @@ class NasSettings:
             enable_llm = False
         else:
             enable_llm = bool(endpoint and api_key)
+        # 环境变量未设置时保持 0（不自动删）——见 NasSettings.retention_days 注释
         try:
-            retention = int(os.environ.get("WXLIVE_RETENTION_DAYS", "30") or 30)
+            retention = int(os.environ.get("WXLIVE_RETENTION_DAYS", "0") or 0)
         except ValueError:
-            retention = 30
+            retention = 0
         try:
             cleanup_hours = int(os.environ.get("WXLIVE_CLEANUP_INTERVAL_HOURS", "24") or 24)
         except ValueError:
@@ -130,6 +141,14 @@ class NasSettings:
             auto_stop_silence = True
         else:
             auto_stop_silence = True
+        try:
+            max_hours = int(os.environ.get("WXLIVE_MAX_RECORD_HOURS", "8") or 8)
+        except ValueError:
+            max_hours = 8
+        try:
+            max_gb = int(os.environ.get("WXLIVE_MAX_RECORD_GB", "2") or 2)
+        except ValueError:
+            max_gb = 2
         return cls(
             local_threads=threads,
             use_lexicon=True,
@@ -144,6 +163,8 @@ class NasSettings:
             silence_stop_seconds=max(10, silence_secs),
             retention_days=max(0, retention),
             cleanup_interval_hours=max(1, cleanup_hours),
+            max_record_hours=max(0, max_hours),
+            max_record_gb=max(0, max_gb),
         )
 
     def to_public_dict(self) -> dict[str, Any]:
@@ -164,6 +185,8 @@ class NasSettings:
             "retention_days": self.retention_days,
             "cleanup_delete_transcripts": self.cleanup_delete_transcripts,
             "cleanup_interval_hours": self.cleanup_interval_hours,
+            "max_record_hours": self.max_record_hours,
+            "max_record_gb": self.max_record_gb,
         }
 
 
@@ -191,6 +214,9 @@ class NasJobRunner:
         self._engine_factory = engine_factory
 
         self._settings = self._load_settings()
+        # 这两个字段由 _load_jobs 写入，必须在调用前先定义
+        self._jobs_load_error: str = ""
+        self._jobs_load_skipped: int = 0
         self._jobs: dict[str, dict[str, Any]] = self._load_jobs()
         self._recorders: dict[str, StreamRecorder] = {}
         self._stop_overrides: dict[str, bool] = {}
@@ -224,6 +250,7 @@ class NasJobRunner:
                     "cleanup_interval_hours",
                     "auto_stop_on_silence", "silence_stop_seconds",
                     "silence_rms_threshold",
+                    "max_record_hours", "max_record_gb",
                 ):
                     if key in raw and raw[key] is not None:
                         setattr(cfg, key, raw[key])
@@ -259,7 +286,14 @@ class NasJobRunner:
                 # 下限 10 秒：比说话的自然停顿还短的话会频繁误判
                 s.silence_stop_seconds = max(10, int(patch["silence_stop_seconds"]))
             if "silence_rms_threshold" in patch and patch["silence_rms_threshold"] is not None:
-                s.silence_rms_threshold = max(0.0, float(patch["silence_rms_threshold"]))
+                # 下限钳到 1e-6：0 会让 rms>=0 恒真，静音永不累计，
+                # 自动停止静默失效（对立性审查 M9）
+                v = float(patch["silence_rms_threshold"])
+                s.silence_rms_threshold = min(0.05, max(1e-6, v))
+            if "max_record_hours" in patch and patch["max_record_hours"] is not None:
+                s.max_record_hours = max(0, int(patch["max_record_hours"]))
+            if "max_record_gb" in patch and patch["max_record_gb"] is not None:
+                s.max_record_gb = max(0, int(patch["max_record_gb"]))
             if "llm_endpoint" in patch and patch["llm_endpoint"] is not None:
                 s.llm_endpoint = str(patch["llm_endpoint"]).strip()
             if "llm_model" in patch and patch["llm_model"] is not None:
@@ -275,7 +309,15 @@ class NasJobRunner:
                 if new_key and "****" not in new_key:
                     s.llm_api_key = new_key
             _atomic_write_json(self.settings_path, asdict(s))
-            return s.to_public_dict()
+            started_cleanup = s.retention_days > 0
+            needs_start = started_cleanup and (
+                self._cleanup_thread is None or not self._cleanup_thread.is_alive()
+            )
+
+        # 锁外启动线程：_start_cleanup_loop 自己会再加锁判重
+        if needs_start:
+            self._start_cleanup_loop()
+        return self.get_settings()
 
     def test_llm(self) -> dict[str, Any]:
         with self._lock:
@@ -312,29 +354,97 @@ class NasJobRunner:
     # ---------------- 任务存储 ----------------
 
     def _load_jobs(self) -> dict[str, dict[str, Any]]:
+        """加载任务表。**逐条容错**，绝不因单条畸形而丢掉整份。
+
+        ## 为什么必须逐条容错（2026-11-23 对立性审查 C1）
+
+        旧实现是 `for j in raw.values(): j.get(...)`，只要有**一条**不是 dict
+        （JSON 手改出错、外部工具写坏、磁盘半写），`AttributeError` 就会被外层
+        `except Exception: return {}` 吞掉 —— 整份任务表变成空字典。
+
+        后果是链式的、灾难性的：
+        1. `referenced_audio` 为空 → 清理时所有老音频都被当"孤儿"
+        2. 下一次任何 `_save_jobs` 会把空表**写回磁盘**，原始记录永久消失
+        3. 启动 60 秒后自动清理线程真删，全程无人确认
+
+        实测复现：`{"j1":{正常}, "j2":"oops"}` → 加载后 jobs 为空 →
+        健康任务的 100 天前录音被列入待删清单。
+
+        所以这里改成：坏条目单独跳过并计数，好的照常加载。
+        并且把"是否发生过损坏"记在 `self._jobs_load_error` 上，
+        供清理逻辑做二次保护（损坏时拒绝真删）。
+        """
+        self._jobs_load_error = ""
+        self._jobs_load_skipped = 0
+
         if not self.jobs_path.exists():
             return {}
         try:
             raw = json.loads(self.jobs_path.read_text(encoding="utf-8"))
-            if not isinstance(raw, dict):
-                return {}
-            changed = False
-            for j in raw.values():
-                if j.get("status") in ACTIVE_STATUSES:
-                    j["status"] = "interrupted"
-                    j["error"] = "服务重启，任务已中断（如有已录制音频可点击重新转写）"
-                    j.setdefault("logs", []).append(
+        except Exception as exc:  # noqa: BLE001
+            self._jobs_load_error = f"{type(exc).__name__}: {exc}"[:300]
+            return {}
+        if not isinstance(raw, dict):
+            self._jobs_load_error = f"jobs.json 顶层不是对象，而是 {type(raw).__name__}"
+            return {}
+
+        good: dict[str, dict[str, Any]] = {}
+        bad_keys: list[str] = []
+        changed = False
+
+        for key, job in raw.items():
+            if not isinstance(job, dict):
+                bad_keys.append(str(key))
+                continue
+            # 逐字段容错：status 读不出来也不能拖垮整条
+            try:
+                status = job.get("status")
+            except Exception:  # noqa: BLE001
+                bad_keys.append(str(key))
+                continue
+            if status in ACTIVE_STATUSES:
+                job["status"] = "interrupted"
+                job["error"] = "服务重启，任务已中断（如有已录制音频可点击重新转写）"
+                try:
+                    job.setdefault("logs", []).append(
                         f"[{time.strftime('%H:%M:%S')}] 服务重启，状态恢复为 interrupted"
                     )
-                    changed = True
-            if changed:
-                _atomic_write_json(self.jobs_path, raw)
-            return raw
-        except Exception:
-            return {}
+                except Exception:  # noqa: BLE001
+                    job["logs"] = []
+                changed = True
+            if not isinstance(job.get("logs"), list):
+                job["logs"] = []
+            # id 缺失时用 key 补上，否则后续按 job_id 索引会失效
+            if not job.get("id"):
+                job["id"] = str(key)
+            good[str(key)] = job
+
+        if bad_keys:
+            self._jobs_load_skipped = len(bad_keys)
+            self._jobs_load_error = (
+                f"{len(bad_keys)} 条任务记录格式非法已跳过："
+                + "、".join(bad_keys[:5])
+            )
+            # 把坏条目另存一份，避免被 _save_jobs 覆盖后彻底丢失
+            try:
+                _atomic_write_json(
+                    self.data_dir / "jobs.corrupt.json",
+                    {k: raw.get(k) for k in bad_keys},
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+        if changed:
+            try:
+                _atomic_write_json(self.jobs_path, good)
+            except Exception:  # noqa: BLE001
+                pass
+        return good
 
     def _save_jobs(self) -> None:
         with self._lock:
+            # 加载失败或有过损坏时，仍然允许保存（否则新任务无法落盘），
+            # 但清理逻辑会自己拒绝真删 —— 见 run_cleanup 的保护。
             _atomic_write_json(self.jobs_path, self._jobs)
 
     def _append_log(self, job_id: str, msg: str) -> None:
@@ -511,6 +621,11 @@ class NasJobRunner:
             auto_stop = self._settings.auto_stop_on_silence
             stop_secs = self._settings.silence_stop_seconds
             rms_thr = self._settings.silence_rms_threshold
+            max_hours = self._settings.max_record_hours
+            max_gb = self._settings.max_record_gb
+
+        max_bytes = max_gb * 1024 * 1024 * 1024 if max_gb > 0 else 0
+        max_secs = max_hours * 3600 if max_hours > 0 else 0
 
         monitor = LiveSilenceMonitor(
             silence_rms=rms_thr,
@@ -539,6 +654,17 @@ class NasJobRunner:
                     )
                 except OSError:
                     pass
+
+            # ---- 录制上限（对立性审查 H2）----
+            # 永不结束且有声音的流会无限增长；磁盘写满后转写/日志全挂。
+            if size > 0 and max_bytes and size >= max_bytes:
+                stop_reason = f"达到单任务体积上限 {max_gb} GB，自动停止"
+                self._append_log(job_id, stop_reason)
+                break
+            if max_secs and (now - _t0) >= max_secs:
+                stop_reason = f"达到单任务时长上限 {max_hours} 小时，自动停止"
+                self._append_log(job_id, stop_reason)
+                break
 
             # ---- 静音判停 ----
             if auto_stop and rec.out_path and size > 44 and \
@@ -1038,14 +1164,24 @@ class NasJobRunner:
     # ---------------- 磁盘保留策略 ----------------
 
     def _start_cleanup_loop(self) -> None:
-        """后台定时清理线程。
+        """后台定时清理线程（幂等，可由 update_settings 在 0→>0 时懒启动）。
 
         为什么是"启动后延迟 60 秒再跑第一次"：
         容器刚起来时 CPU/IO 都很忙（模型加载、任务恢复），
         清理是纯磁盘扫描，没必要抢这个时间窗。
+
+        ## 为什么允许重复调用（对立性审查 M2）
+
+        旧实现只在 __init__ 且 retention_days>0 时建线程。
+        用户在网页里把保留天数从 0 改成 30 后，定时清理**永远不会启动**，
+        直到重启容器 —— 表现是"设置了但没生效"。
+        现在 update_settings 会在 0→>0 时调本方法，靠 `_cleanup_thread` 判重。
         """
-        if self._settings.retention_days <= 0:
-            return
+        with self._lock:
+            if self._settings.retention_days <= 0:
+                return
+            if self._cleanup_thread is not None and self._cleanup_thread.is_alive():
+                return
 
         def loop() -> None:
             # 首次延迟，避开启动高峰
@@ -1088,11 +1224,41 @@ class NasJobRunner:
         """计算并（可选）执行清理。
 
         dry_run=True 只返回计划，供 UI 预览；dry_run=False 才真删。
+
+        ## 二次保护（对立性审查 C1）
+
+        真删前再检查一遍"任务表是否可信"：
+        - `_jobs_load_error` 非空（jobs.json 损坏过）→ 拒绝真删
+        - 任务表为空、但 recordings 目录里有音频 → 拒绝真删
+          （正常情况下不可能：有音频就必然有任务记录。
+            为空只能是"表读坏了"，这时删任何东西都可能误伤）
+
+        预览(dry_run)不拦，否则用户看不到问题在哪。
         """
         with self._lock:
             days = self._settings.retention_days
             del_tr = self._settings.cleanup_delete_transcripts
             jobs = dict(self._jobs)
+            load_error = self._jobs_load_error
+
+        if not dry_run:
+            if load_error:
+                return {
+                    "ok": False, "dry_run": False, "trigger": trigger,
+                    "error": f"任务表存在损坏，为安全起见拒绝自动删除：{load_error}",
+                    "deleted_count": 0, "failed_count": 0,
+                    "freed_bytes": 0, "freed_mb": 0, "freed_human": "0 B",
+                    "deleted": [], "failed": [],
+                }
+            if not jobs and self._has_audio_files():
+                return {
+                    "ok": False, "dry_run": False, "trigger": trigger,
+                    "error": ("任务表为空但录制目录里有音频 —— 疑似任务表损坏，"
+                              "拒绝自动删除。请先检查 jobs.json。"),
+                    "deleted_count": 0, "failed_count": 0,
+                    "freed_bytes": 0, "freed_mb": 0, "freed_human": "0 B",
+                    "deleted": [], "failed": [],
+                }
 
         plan = retention.plan_cleanup(
             jobs,
@@ -1105,6 +1271,16 @@ class NasJobRunner:
             payload = plan.to_dict()
             payload["dry_run"] = True
             payload["trigger"] = trigger
+            # 预览时把"任务表不安全"直接摆出来，让人知道真删会被拒绝
+            if load_error:
+                payload["warning"] = (
+                    f"任务表损坏（{load_error}）。预览基于已加载的有效任务，"
+                    "但真删会被拒绝，请先修复 jobs.json。"
+                )
+            elif not jobs and self._has_audio_files():
+                payload["warning"] = (
+                    "任务表为空但录制目录有音频 —— 疑似任务表损坏，真删会被拒绝。"
+                )
             return payload
 
         result = retention.execute_cleanup(plan)
@@ -1121,11 +1297,17 @@ class NasJobRunner:
     CLEANUP_LOG_MAX_BYTES = 200 * 1024
 
     def _log_cleanup(self, payload: dict[str, Any]) -> None:
+        """把清理结果落盘：一行摘要 + 一份**完整删除清单**。
+
+        对立性审查 C2 指出：只记"删了几项、多少 MB"无法事后审计
+        （"我哪天的那场录音哪去了？"）。所以除了摘要行，
+        每批删除都把完整路径清单写成 JSON 存进 `cleanup_history/`。
+        """
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
         line = (
-            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 自动清理："
-            f"删除 {payload.get('deleted_count', 0)} 项，"
-            f"释放 {payload.get('freed_mb', 0)} MB"
-            f"（阈值 {self._settings.retention_days} 天）\n"
+            f"[{ts}] 清理：删除 {payload.get('deleted_count', 0)} 项，"
+            f"释放 {payload.get('freed_human') or (str(payload.get('freed_mb', 0)) + ' MB')}"
+            f"（阈值 {self._settings.retention_days} 天，触发方式 {payload.get('trigger', '?')}）\n"
         )
         path = self.data_dir / "cleanup.log"
         try:
@@ -1135,11 +1317,44 @@ class NasJobRunner:
                 # 超限就截断重来，不做轮转：这日志只用于人工回溯，保留最近的更有用
                 with path.open("w", encoding="utf-8") as fh:
                     fh.write(line)
-                return
-            with path.open("a", encoding="utf-8") as fh:
-                fh.write(line)
+            else:
+                with path.open("a", encoding="utf-8") as fh:
+                    fh.write(line)
         except OSError:
             pass
+
+        # 完整清单：只保留最近 100 批，避免无限堆积
+        try:
+            hist = self.data_dir / "cleanup_history"
+            hist.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            _atomic_write_json(hist / f"{stamp}.json", {
+                "at": ts,
+                "trigger": payload.get("trigger", ""),
+                "retention_days": self._settings.retention_days,
+                "deleted": payload.get("deleted", []),
+                "failed": payload.get("failed", []),
+            })
+            files = sorted(hist.glob("*.json"))
+            for old in files[:-100]:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+    def _has_audio_files(self) -> bool:
+        """录制目录里是否有任何音频文件（不含临时残骸）。"""
+        try:
+            if not self.recordings_dir.is_dir():
+                return False
+            for p in self.recordings_dir.iterdir():
+                if p.is_file() and p.suffix.lower() == ".wav" and not p.is_symlink():
+                    return True
+        except OSError:
+            return False
+        return False
 
     def cleanup_status(self) -> dict[str, Any]:
         with self._lock:

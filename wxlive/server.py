@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -388,6 +389,20 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
       <label>自动清理检查间隔（小时）</label>
       <input id="set-clean-interval" type="number" min="1" max="720" value="24">
     </div>
+    <hr style="border:none;border-top:1px solid var(--border);margin:14px 0;">
+    <div class="row">
+      <div class="field">
+        <label>单任务最长录制（小时，0=不限）</label>
+        <input id="set-max-hours" type="number" min="0" max="72" value="8">
+      </div>
+      <div class="field">
+        <label>单任务最大体积（GB，0=不限）</label>
+        <input id="set-max-gb" type="number" min="0" max="100" value="2">
+      </div>
+    </div>
+    <div style="font-size:12px;color:var(--muted);margin-bottom:10px;">
+      防止永不结束且有声音的流写满磁盘（写满后转写、日志都会失败）
+    </div>
 
     <div id="settings-feedback"></div>
     <div class="row" style="justify-content:space-between;margin-top:14px;">
@@ -679,6 +694,8 @@ async function openSettings() {
   document.getElementById('set-retention').value = (s.retention_days ?? 30);
   document.getElementById('set-clean-transcripts').checked = !!s.cleanup_delete_transcripts;
   document.getElementById('set-clean-interval').value = (s.cleanup_interval_hours ?? 24);
+  document.getElementById('set-max-hours').value = (s.max_record_hours ?? 8);
+  document.getElementById('set-max-gb').value = (s.max_record_gb ?? 2);
   document.getElementById('settings-modal').classList.add('open');
 }
 function closeSettings() {
@@ -699,6 +716,8 @@ async function saveSettings() {
     retention_days: Number(document.getElementById('set-retention').value || 0),
     cleanup_delete_transcripts: document.getElementById('set-clean-transcripts').checked,
     cleanup_interval_hours: Number(document.getElementById('set-clean-interval').value || 24),
+    max_record_hours: Number(document.getElementById('set-max-hours').value || 0),
+    max_record_gb: Number(document.getElementById('set-max-gb').value || 0),
   };
   const key = document.getElementById('set-apikey').value.trim();
   if (key) body.llm_api_key = key;
@@ -884,9 +903,26 @@ refreshAll();
 def create_app(
     data_dir: Path | str | None = None,
     runner: NasJobRunner | None = None,
+    require_token: str | None = None,
 ) -> FastAPI:
-    """创建 FastAPI 实例；支持注入 runner / data_dir 以便测试隔离。"""
+    """创建 FastAPI 实例；支持注入 runner / data_dir 以便测试隔离。
+
+    ## 鉴权（对立性审查 C3）
+
+    服务默认绑 `0.0.0.0`，且 `/api/cleanup/run` 是**破坏性**端点。
+    局域网内任何主机都能直接 POST 删数据，恶意网页还能借 DNS rebinding 绕过同源。
+
+    所以加一层可选 token：
+    - `require_token` 为空字符串/None → 不校验（保持兼容，本地/隧道场景）
+    - 非空 → 所有 `POST/PUT/DELETE` 必须带 `X-WXLIVE-Token` 头或 `?token=` 查询参数
+
+    启动时用 `--token` 或环境变量 `WXLIVE_TOKEN` 开启。
+    另外始终校验 `Host` 头，挡住 DNS rebinding（只放行 IP 字面量与 localhost）。
+    """
     job_runner = runner or NasJobRunner(data_dir=data_dir)
+    _token = (require_token if require_token is not None
+              else os.environ.get("WXLIVE_TOKEN", "")).strip()
+    _MUTATING = {"POST", "PUT", "DELETE", "PATCH"}
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -896,6 +932,59 @@ def create_app(
 
     app = FastAPI(title="WXLive NAS Service", version="0.1.0", lifespan=lifespan)
     app.state.runner = job_runner
+
+    @app.middleware("http")
+    async def _guard(request, call_next):
+        """Host 白名单 + 可选 token 校验。
+
+        Host 白名单防 DNS rebinding：攻击者把自己的域名解析到 192.168.x.x，
+        浏览器就会认为是同源。只放行 IP 字面量 / localhost / 配置的额外域名。
+        """
+        host = (request.headers.get("host") or "").split(":")[0].strip().lower()
+
+        # 允许：IP 字面量、localhost、容器内主机名
+        import re as _re
+        is_ip = bool(_re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", host or ""))
+        is_ipv6 = ":" in (request.headers.get("host") or "")
+        allowed_host = (
+            not host
+            or is_ip
+            or is_ipv6
+            or host in (
+                "localhost",
+                "wxlive-nas",
+                "host.docker.internal",
+                # TestClient（httpx）默认用 testserver 作为 Host，
+                # 不放行的话所有单元测试都会被自己的防护挡住
+                "testserver",
+            )
+            or host.endswith(".local")
+        )
+        if not allowed_host:
+            from fastapi.responses import JSONResponse
+
+            return JSONResponse(
+                {"detail": f"拒绝的 Host 头：{host}（防 DNS rebinding）。"
+                           "如需域名访问请通过反向代理并配置白名单。"},
+                status_code=400,
+            )
+
+        # token 校验只作用于写操作；GET 保持开放，便于直接用浏览器/curl 查看
+        if _token and request.method in _MUTATING:
+            provided = (
+                request.headers.get("X-WXLIVE-Token")
+                or request.query_params.get("token")
+                or ""
+            )
+            if provided != _token:
+                from fastapi.responses import JSONResponse
+
+                return JSONResponse(
+                    {"detail": "需要有效的 X-WXLIVE-Token 头或 ?token= 参数"},
+                    status_code=401,
+                )
+
+        return await call_next(request)
 
     @app.get("/", response_class=HTMLResponse)
     def index():
