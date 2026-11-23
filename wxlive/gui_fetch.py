@@ -221,6 +221,36 @@ class FetchTabMixin:
         ttk.Checkbutton(opt, text="下载完自动转写",
                         variable=self.fetch_auto_trans_var).pack(side="left", padx=(16, 0))
 
+        # ===== 直播 → NAS（方案 A 的分工：本机拿地址，NAS 长时间拉流转写）=====
+        # 和上面"下载选中项的音频"是两件不同的事：
+        #   · 下载 = 回放（已放完），本地拉一遍、抽音频、本地转写
+        #   · 推 NAS = 直播（正在播），把流地址交给 NAS，本机可以关掉
+        # 不做这个区分的话，直播就只能等播完再下，等于放弃了方案 A 的价值。
+        nas = ttk.Frame(f)
+        nas.pack(fill="x", padx=12, pady=(2, 4))
+
+        ttk.Label(nas, text="NAS").pack(side="left")
+        self.fetch_nas_var = tk.StringVar(value="http://192.168.68.49:8910")
+        ttk.Entry(nas, textvariable=self.fetch_nas_var, width=30).pack(side="left", padx=(4, 8))
+
+        self.fetch_nas_health_btn = ttk.Button(
+            nas, text="体检", width=6, command=self._fetch_nas_health)
+        self.fetch_nas_health_btn.pack(side="left")
+
+        self.fetch_nas_live_btn = ttk.Button(
+            nas, text="把正在播的直播推给 NAS", width=22,
+            command=self._fetch_push_local_live)
+        self.fetch_nas_live_btn.pack(side="left", padx=(10, 0))
+
+        self.fetch_nas_sel_btn = ttk.Button(
+            nas, text="推送选中项到 NAS", width=17,
+            command=self._fetch_push_selected_to_nas)
+        self.fetch_nas_sel_btn.pack(side="left", padx=(6, 0))
+
+        self.fetch_nas_var_status = tk.StringVar(value="")
+        ttk.Label(nas, textvariable=self.fetch_nas_var_status,
+                  style="Hint.TLabel").pack(side="left", padx=(10, 0))
+
         # ===== 操作按钮 + 进度 =====
         btns = ttk.Frame(f)
         btns.pack(fill="x", padx=12, pady=(4, 6))
@@ -247,12 +277,17 @@ class FetchTabMixin:
         self.fetch_note.pack(fill="x", padx=12, pady=(0, 10))
 
         txt = (
+            "【回放：已放完】\n"
             "1. 先启动抓流工具（tools/wxcd 下用根命令启动，不要加 server 子命令）\n"
             "2. 在微信里打开目标回放/视频，工具会自动捕获地址与解密密钥\n"
-            "3. 回到这里点「刷新列表」，选中目标（可多选 / Ctrl+A 全选），点「下载选中项的音频」\n"
-            "4. 不需要点工具里的下载按钮 —— 那是它自己下 MP4 再转 MP3，我们不采用\n"
-            "5. 「删除选中 / 清空列表」只是本工具隐藏，不动物具数据库，随时可「恢复被删除的」\n"
-            "6. 「解析选中」做一次 HEAD 探测：地址是否过期、要不要解密、文件多大，失败会说明原因"
+            "3. 点「刷新列表」，选中目标（可多选 / Ctrl+A），点「下载选中项的音频」→ 本地转写\n"
+            "\n"
+            "【直播：正在播】不要用「下载」，要推给 NAS —— 本机可以关掉，NAS 挂着录\n"
+            "4. 在微信里打开直播页，点一次抓流工具的下载按钮（让它起 ffmpeg）\n"
+            "5. 点「把正在播的直播推给 NAS」，地址会自动从 ffmpeg 命令行里读出来\n"
+            "6. NAS 停录后自动转写；进度与逐字稿在 NAS 网页上看\n"
+            "\n"
+            "注：「删除选中 / 清空列表」只在本工具隐藏，不动工具数据库，随时可恢复"
         )
         self.fetch_note_label = ttk.Label(self.fetch_note, text=txt, justify="left",
                                           style="Hint.TLabel")
@@ -280,6 +315,161 @@ class FetchTabMixin:
                 fetchstate.save_state(st)
         except Exception:  # noqa: BLE001
             pass
+
+    # ---------- NAS：直播推流（方案 A）----------
+
+    def _fetch_nas_base(self) -> str:
+        return (self.fetch_nas_var.get() or "").strip().rstrip("/")
+
+    def _fetch_nas_set_status(self, text: str, warn: bool = False) -> None:
+        try:
+            self.fetch_nas_var_status.set(text)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _fetch_nas_health(self) -> None:
+        """确认 NAS 服务在线，把关键信息显示在状态栏。"""
+        import json
+        import urllib.request
+
+        base = self._fetch_nas_base()
+        if not base:
+            self._fetch_nas_set_status("请先填 NAS 地址", warn=True)
+            return
+        self._fetch_nas_set_status("检测中…")
+
+        def work() -> None:
+            try:
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                with opener.open(base + "/api/health", timeout=10) as r:
+                    h = json.loads(r.read().decode("utf-8"))
+                ok = bool(h.get("ok"))
+                msg = (f"在线 · ffmpeg={'有' if h.get('ffmpeg_available') else '缺'}"
+                       f" · 磁盘 {h.get('disk_free_gb')}GB"
+                       f" · 任务 {h.get('job_count')}（进行中 {h.get('active_count')}）")
+                self._ui(lambda: self._fetch_nas_set_status(msg if ok else "服务异常"))
+                self._log("[NAS] " + msg)
+            except Exception as exc:  # noqa: BLE001
+                m = f"{type(exc).__name__}: {exc}"
+                self._ui(lambda: self._fetch_nas_set_status("连不上", warn=True))
+                self._log(f"[NAS] 体检失败：{m}")
+
+        self._run_bg(work)
+
+    def _fetch_nas_push(self, url: str, name: str,
+                        on_done=None) -> None:
+        """把一条流地址交给 NAS 开录（停录后 NAS 自动转写）。"""
+        import json
+        import urllib.error
+        import urllib.request
+
+        from .stream_capture import extract_url, is_url
+
+        base = self._fetch_nas_base()
+        clean = extract_url(url)
+        if not is_url(clean):
+            messagebox.showwarning("地址无效", "没能从这一条里识别出流地址。")
+            return
+
+        self._fetch_nas_set_status("推送中…")
+
+        def work() -> None:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            try:
+                probe_req = urllib.request.Request(
+                    base + "/api/probe",
+                    data=json.dumps({"url": clean}).encode(),
+                    headers={"Content-Type": "application/json"},
+                )
+                with opener.open(probe_req, timeout=40) as r:
+                    probe = json.loads(r.read().decode("utf-8"))
+                if not probe.get("ok"):
+                    err = probe.get("error") or "未知错误"
+                    self._ui(lambda: self._fetch_nas_set_status("探测失败", warn=True))
+                    self._log(f"[NAS] 探测失败：{err}")
+                    self._ui(lambda e=err: messagebox.showwarning(
+                        "NAS 探测失败", e + "\n\n地址可能已过期，回微信重新打开该直播。"))
+                    return
+
+                start_req = urllib.request.Request(
+                    base + "/api/jobs/stream",
+                    data=json.dumps({
+                        "url": clean,
+                        "name": name or "",
+                        "auto_transcribe": True,
+                    }).encode(),
+                    headers={"Content-Type": "application/json"},
+                )
+                with opener.open(start_req, timeout=60) as r:
+                    job = json.loads(r.read().decode("utf-8"))
+
+                jid = job.get("id", "?")
+                title = job.get("title", name)
+                msg = f"NAS 已开始录制：{title}"
+                self._ui(lambda: self._fetch_nas_set_status("录制中", warn=False))
+                self._log(f"[NAS] {msg}（任务 {jid}，停录后自动转写）")
+                self._ui(lambda: messagebox.showinfo(
+                    "已交给 NAS",
+                    f"{msg}\n\n任务 ID：{jid}\n本机可以停止播放/关闭页面了。\n\n"
+                    f"进度与逐字稿：{self._fetch_nas_base()}/"))
+                if on_done:
+                    self._ui(on_done)
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", "replace")[:300]
+                self._ui(lambda: self._fetch_nas_set_status("推送失败", warn=True))
+                self._log(f"[NAS] 推送失败 HTTP {exc.code}：{detail}")
+                self._ui(lambda d=detail, c=exc.code: messagebox.showwarning(
+                    "NAS 拒绝", f"HTTP {c}\n{d}"))
+            except Exception as exc:  # noqa: BLE001
+                m = f"{type(exc).__name__}: {exc}"
+                self._ui(lambda: self._fetch_nas_set_status("推送失败", warn=True))
+                self._log(f"[NAS] 推送失败：{m}")
+                self._ui(lambda mm=m: messagebox.showwarning("推送到 NAS 失败", mm))
+
+        self._run_bg(work)
+
+    def _fetch_push_local_live(self) -> None:
+        """把本机正在录的直播流推给 NAS。
+
+        地址从运行中的 ffmpeg 命令行里读，不依赖那个藏得很深的下拉菜单。
+        """
+        from . import liveurl
+
+        self._fetch_nas_set_status("查找本机直播流…")
+
+        def work() -> None:
+            streams = liveurl.find_live_streams()
+            if not streams:
+                self._ui(lambda: self._fetch_nas_set_status("没有进行中的直播", warn=True))
+                self._ui(lambda: messagebox.showinfo(
+                    "没有找到直播流",
+                    "本机现在没有正在拉取的视频号直播。\n\n"
+                    "请在微信里打开直播页，先点一次抓流工具的下载按钮"
+                    "（让它起 ffmpeg），再点这里。"))
+                return
+            pick = streams[0]
+            note = ""
+            if len(streams) > 1:
+                note = f"（检测到 {len(streams)} 路，取第一路）"
+            self._log(f"[NAS] 找到直播流 {pick.title_hint}{note}")
+            self._ui(lambda: self._fetch_nas_set_status(f"找到：{pick.title_hint}"))
+            self._fetch_nas_push(pick.url, pick.title_hint)
+
+        self._run_bg(work)
+
+    def _fetch_push_selected_to_nas(self) -> None:
+        """把列表里选中的条目直接推给 NAS 拉流（适合正在播的直播条目）。"""
+        targets = self._fetch_selected_items()
+        if not targets:
+            messagebox.showinfo("请先选择", "请在列表里选中要推给 NAS 的条目。")
+            return
+        if len(targets) > 1:
+            if not messagebox.askyesno(
+                    "推送多条",
+                    f"选中了 {len(targets)} 条，只推送第一条《{targets[0].title}》。继续？"):
+                return
+        it = targets[0]
+        self._fetch_nas_push(it.url, it.title)
 
     # ---------- 搜索 ----------
 

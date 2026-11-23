@@ -96,6 +96,10 @@ def main() -> int:
     src.add_argument("--list", action="store_true", help="只列出抓流工具里已捕获的内容")
     src.add_argument("--match", default="", help="按标题关键词匹配已捕获内容（取最新一条）")
     src.add_argument("--url", default="", help="直接给流地址或整条 ffmpeg -i 命令")
+    src.add_argument("--from-local", action="store_true",
+                     help="从本机运行中的 ffmpeg 自动取直播地址（最省事）")
+    src.add_argument("--list-live", action="store_true",
+                     help="只列出本机正在进行中的直播流")
     ap.add_argument("--nas", default=DEFAULT_NAS, help=f"NAS 服务地址（默认 {DEFAULT_NAS}）")
     ap.add_argument("--tool-api", default=DEFAULT_TOOL_API,
                     help=f"本地抓流工具 API（默认 {DEFAULT_TOOL_API}）")
@@ -116,6 +120,41 @@ def main() -> int:
     print(f"NAS 就绪：ffmpeg={health.get('ffmpeg_available')} "
           f"引擎已加载={health.get('engine_loaded')} "
           f"剩余磁盘={health.get('disk_free_gb')} GB")
+
+    # ---- 只列本机正在进行的直播 ----
+    if args.list_live:
+        from wxlive import liveurl
+
+        streams = liveurl.find_live_streams()
+        if not streams:
+            print("本机没有正在拉取的视频号直播流。")
+            print("请先在微信里打开直播页，并点一次抓流工具的下载按钮"
+                  "（让它起 ffmpeg），然后再试。")
+            return 1
+        print(f"本机进行中的直播 {len(streams)} 路：")
+        for i, s in enumerate(streams, 1):
+            print(f"  {i}. pid={s.pid} id={s.stream_id}  {s.title_hint}")
+            print(f"     签名={'有' if s.has_signature else '无'} "
+                  f"len={len(s.url)}")
+        return 0
+
+    # ---- 从本机 ffmpeg 自动取址 ----
+    if args.from_local:
+        from wxlive import liveurl
+
+        streams = liveurl.find_live_streams()
+        if not streams:
+            print("本机没有正在拉取的视频号直播流。", file=sys.stderr)
+            print("请先在微信里打开直播页，点一次抓流工具的下载按钮"
+                  "（让它起 ffmpeg 进程），再运行本命令。", file=sys.stderr)
+            return 1
+        pick = streams[0]
+        if len(streams) > 1:
+            print(f"检测到 {len(streams)} 路直播，取第一路：{pick.title_hint}")
+        print(f"取到直播流：{pick.title_hint}（pid={pick.pid}）")
+        args.url = pick.url
+        if not args.name:
+            args.name = pick.title_hint
 
     # ---- 只列清单 ----
     if args.list:

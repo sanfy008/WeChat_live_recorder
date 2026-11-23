@@ -408,6 +408,14 @@ def cmd_transcribe(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_localagent(args: argparse.Namespace) -> int:
+    """启动本机直播地址代理（只读扫描 ffmpeg 命令行）。"""
+    from .localagent import serve
+
+    serve(host=args.host, port=args.port)
+    return 0
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     """启动 NAS 无头 Web 服务（拉流录制 + 上传转写 + Web 控制台）。"""
     import os
@@ -502,6 +510,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("input", help="音频文件路径（wav/mp3/m4a 等）")
     add_asr_opts(sp)
     sp.set_defaults(func=cmd_transcribe)
+
+    sp = sub.add_parser("localagent", help="启动本机直播地址代理（供 NAS 反查进行中的直播流）")
+    sp.add_argument("--host", default="127.0.0.1", help="监听地址（默认仅本机）")
+    sp.add_argument("--port", type=int, default=8911, help="监听端口（默认 8911）")
+    sp.set_defaults(func=cmd_localagent)
 
     sp = sub.add_parser("serve", help="启动无头 Web 服务（适用于 NAS / Docker 远程录制转写）")
     sp.add_argument("--host", default="0.0.0.0", help="监听地址（默认 0.0.0.0）")

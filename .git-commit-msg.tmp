@@ -1,0 +1,18 @@
+feat: 直播地址自动捕获 + GUI 一键推 NAS（消除与回放下载的重复）
+
+问题：微信里拿直播流地址要靠抓流工具下拉菜单里「复制 ffmpeg 命令」，入口极深。
+实测该地址根本不落库（download_task.source_url 为空），只存在于 ffmpeg 命令行。
+
+- 新增 wxlive/liveurl.py：从运行中的 ffmpeg 命令行提取直播流地址
+  - 跨平台（Windows PowerShell / Linux /proc / macOS ps），只读不启动不杀进程
+  - 按 stream_key（去 query）去重：txSecret 每次重连都变，按完整 URL 去重会失效
+  - 走 winproc.run，避免 pythonw 下弹黑框（test_no_console_flash 盯着这条）
+- 新增 wxlive/localagent.py：仅回环的 HTTP 代理，GET /live 供 NAS 反查
+- gui_fetch: 新增「NAS」区——体检 / 把正在播的直播推给 NAS / 推送选中项
+  - 明确区分两条路：回放 -> 本地下载后转写；直播 -> 推 NAS 挂着录（本机可关）
+- scripts/push_to_nas.py: 新增 --from-local（自动取址）与 --list-live
+- cli: 新增 localagent 子命令
+- 新增 23 个 liveurl/localagent 用例
+
+实测：319 passed / 2 skipped；GUI 两套 54 passed。真实直播验证：NAS 拉流
+205 句 / RTF 0.03 / 15.4 分钟；容器重启后任务正确恢复为 interrupted 并可续转。

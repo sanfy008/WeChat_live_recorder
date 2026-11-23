@@ -361,7 +361,8 @@ class NasJobRunner:
         name: str = "",
         auto_transcribe: bool | None = None,
     ) -> dict[str, Any]:
-        # 允许直接粘贴微信"下载"按钮复制出来的整条 ffmpeg 命令
+        # 允许直接粘贴微信"下载"按钮复制出来的整条 ffmpeg 命令；
+        # 也允许特殊值 "auto"（由调用方先去本机 ffmpeg 进程里找地址）
         clean_url = extract_url(url)
         if not is_url(clean_url):
             raise ValueError(
