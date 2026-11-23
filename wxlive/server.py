@@ -36,10 +36,15 @@ class StopReq(BaseModel):
     transcribe: bool | None = None
 
 
+class RenameJobReq(BaseModel):
+    title: str
+
+
 class SettingsUpdateReq(BaseModel):
     local_threads: int | None = None
     use_lexicon: bool | None = None
     enable_llm: bool | None = None
+    auto_title: bool | None = None
     llm_endpoint: str | None = None
     llm_api_key: str | None = None
     clear_api_key: bool = False
@@ -570,7 +575,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
           </div>
           <div class="field">
             <label>场次名称（可选）</label>
-            <input id="stream-name" type="text" placeholder="如：20261123_升学直播">
+            <input id="stream-name" type="text" placeholder="留空则转写整理后自动识别命名">
           </div>
           <div class="row">
             <button onclick="probeStream()">探测流</button>
@@ -865,6 +870,13 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
           </div>
           <span class="switch"><input id="set-enable-llm" type="checkbox"><span class="slider"></span></span>
         </label>
+        <label class="switch-row">
+          <div class="switch-info">
+            <span class="switch-title">自动识别直播名称（AI 命名）</span>
+            <span class="switch-desc">未指定名称（或仅为数字 ID）的任务，整理后自动提炼主播与主题</span>
+          </div>
+          <span class="switch"><input id="set-auto-title" type="checkbox"><span class="slider"></span></span>
+        </label>
         <div class="field">
           <label>LLM Endpoint</label>
           <input id="set-endpoint" type="text" placeholder="https://api.deepseek.com/v1/chat/completions">
@@ -924,6 +936,19 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
   </section>
 </main>
+
+<!-- Rename Modal -->
+<div id="rename-modal" class="modal-bg" onclick="if(event.target===this)closeRename(false)">
+  <div class="modal">
+    <div style="font-size:16px;font-weight:700;margin-bottom:8px;">重命名任务</div>
+    <div style="font-size:12.5px;color:var(--text-2);margin-bottom:10px;">将同步更新任务队列、文件库及逐字稿标题。</div>
+    <input id="rename-input" type="text" maxlength="120" placeholder="输入新的直播场次名称" onkeydown="if(event.key==='Enter')closeRename(true);else if(event.key==='Escape')closeRename(false);">
+    <div class="row" style="justify-content:flex-end;margin-top:14px;">
+      <button onclick="closeRename(false)">取消</button>
+      <button class="primary" onclick="closeRename(true)">保存</button>
+    </div>
+  </div>
+</div>
 
 <!-- Confirm Modal -->
 <div id="confirm-modal" class="modal-bg" onclick="if(event.target===this)closeConfirm(false)">
@@ -1201,6 +1226,10 @@ async function renderDetail(j) {
   document.getElementById('det-meta').innerHTML = chips.map(c => `<span class="chip">${esc(c)}</span>`).join('');
 
   const acts = [];
+  acts.push(`<button class="sm" onclick="renameJobPrompt('${esc(j.id)}')">重命名</button>`);
+  if ((j.has_json || j.has_md) && !ACTIVE_SET.has(j.status)) {
+    acts.push(`<button class="sm" onclick="autoTitleJob('${esc(j.id)}')">AI 识别命名</button>`);
+  }
   if (j.status === 'recording') {
     acts.push(`<button class="primary sm" onclick="stopStream('${esc(j.id)}', true)">停止并转写</button>`);
     acts.push(`<button class="sm" onclick="stopStream('${esc(j.id)}', false)">仅停止</button>`);
@@ -1283,6 +1312,40 @@ async function retranscribe(id) {
   try {
     await api(`/api/jobs/${encodeURIComponent(id)}/transcribe`, {method:'POST'});
     toast('已重新加入转写队列');
+    await refreshAll();
+  } catch (e) { toast(e.message, 'err'); }
+}
+let renameJobId = null;
+function renameJobPrompt(id) {
+  const j = jobs.find(x => x.id === id);
+  renameJobId = id;
+  const inp = document.getElementById('rename-input');
+  inp.value = j ? (j.title || '') : '';
+  document.getElementById('rename-modal').classList.add('open');
+  setTimeout(() => { inp.focus(); inp.select(); }, 30);
+}
+async function closeRename(save) {
+  const modal = document.getElementById('rename-modal');
+  const id = renameJobId;
+  const title = document.getElementById('rename-input').value.trim();
+  modal.classList.remove('open');
+  renameJobId = null;
+  if (!save || !id) return;
+  if (!title) return toast('名称不能为空', 'err');
+  try {
+    await api(`/api/jobs/${encodeURIComponent(id)}`, {
+      method: 'PATCH', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({title})
+    });
+    toast('已重命名');
+    await refreshAll();
+  } catch (e) { toast(e.message, 'err'); }
+}
+async function autoTitleJob(id) {
+  toast('正在用 AI 识别直播名称…');
+  try {
+    const r = await api(`/api/jobs/${encodeURIComponent(id)}/auto-title`, {method:'POST'});
+    toast(`已识别命名：${r.title}`);
     await refreshAll();
   } catch (e) { toast(e.message, 'err'); }
 }
@@ -1541,6 +1604,7 @@ async function loadSettingsForm(showToast = false) {
     document.getElementById('set-lexicon').checked = !!s.use_lexicon;
     document.getElementById('set-keep-audio').checked = !!s.keep_audio;
     document.getElementById('set-enable-llm').checked = !!s.enable_llm;
+    document.getElementById('set-auto-title').checked = s.auto_title !== false;
     document.getElementById('set-endpoint').value = s.llm_endpoint || '';
     document.getElementById('set-apikey').value = '';
     document.getElementById('set-apikey').placeholder = s.has_api_key ? `已保存 (${s.llm_api_key_masked})` : '输入 API Key';
@@ -1574,6 +1638,7 @@ async function saveSettings(silent = false) {
     use_lexicon: document.getElementById('set-lexicon').checked,
     keep_audio: document.getElementById('set-keep-audio').checked,
     enable_llm: document.getElementById('set-enable-llm').checked,
+    auto_title: document.getElementById('set-auto-title').checked,
     llm_endpoint: document.getElementById('set-endpoint').value.trim(),
     llm_model: document.getElementById('set-model').value.trim(),
     llm_reasoning_effort: document.getElementById('set-effort').value,
@@ -1829,6 +1894,26 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(e))
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
+
+    @app.patch("/api/jobs/{job_id}")
+    def api_rename_job(job_id: str, req: RenameJobReq):
+        try:
+            return job_runner.rename_job(job_id, req.title)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.post("/api/jobs/{job_id}/auto-title")
+    def api_auto_title_job(job_id: str):
+        try:
+            return job_runner.auto_title_job(job_id)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except RuntimeError as e:
+            raise HTTPException(status_code=502, detail=str(e))
 
     @app.get("/api/jobs/{job_id}/transcript")
     def api_transcript(job_id: str):

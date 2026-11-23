@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import shutil
 import threading
 import time
@@ -55,6 +56,18 @@ def _mask_secret(secret: str) -> str:
 def _safe_stem(name: str, fallback: str = "live") -> str:
     cleaned = "".join(c for c in (name or "").strip() if c.isalnum() or c in "-_.")
     return cleaned.strip("._-") or fallback
+
+
+_PLACEHOLDER_TITLE_RE = re.compile(
+    r"^(?:直播_\d{8}_\d{6}|音频_\d{8}_\d{6}|orig_\d+(?:_orig)?|stream|upload|live|audio)$",
+    re.IGNORECASE,
+)
+
+
+def is_placeholder_title(title: str) -> bool:
+    """判断任务标题是否只是时间占位名或抓流原始数字 ID（适合 AI 自动重命名）。"""
+    t = (title or "").strip()
+    return (not t) or bool(_PLACEHOLDER_TITLE_RE.match(t))
 
 
 def _atomic_write_json(path: Path, data: Any) -> None:
@@ -106,6 +119,10 @@ class NasSettings:
     # 开播前 N 秒内即使出现连续静音（如主播调试设备、短暂离开）也不自动停录。
     # 默认 300 秒（5 分钟）；0 = 不保护。
     min_record_seconds: int = 300
+    # ---- AI 自动识别直播名称 ----
+    # 当任务名称未填（或仅为 orig_xxx_orig / 直播_时间戳 等占位符）且启用了 LLM 时，
+    # 转写整理完成后自动用 AI 从内容/要点中提炼一场好记的标题。
+    auto_title: bool = True
 
     @classmethod
     def from_env(cls) -> NasSettings:
@@ -157,6 +174,8 @@ class NasSettings:
             min_secs = int(os.environ.get("WXLIVE_MIN_RECORD_SECONDS", "300") or 300)
         except ValueError:
             min_secs = 300
+        auto_title_env = os.environ.get("WXLIVE_AUTO_TITLE", "").strip().lower()
+        auto_title = auto_title_env not in ("0", "false", "no", "off")
         return cls(
             local_threads=threads,
             use_lexicon=True,
@@ -174,6 +193,7 @@ class NasSettings:
             max_record_hours=max(0, max_hours),
             max_record_gb=max(0, max_gb),
             min_record_seconds=max(0, min_secs),
+            auto_title=auto_title,
         )
 
     def to_public_dict(self) -> dict[str, Any]:
@@ -197,6 +217,7 @@ class NasSettings:
             "max_record_hours": self.max_record_hours,
             "max_record_gb": self.max_record_gb,
             "min_record_seconds": self.min_record_seconds,
+            "auto_title": self.auto_title,
         }
 
 
@@ -286,7 +307,7 @@ class NasJobRunner:
                 s.local_threads = max(1, min(16, int(patch["local_threads"])))
             for bool_key in ("use_lexicon", "enable_llm", "auto_transcribe",
                              "keep_audio", "cleanup_delete_transcripts",
-                             "auto_stop_on_silence"):
+                             "auto_stop_on_silence", "auto_title"):
                 if bool_key in patch and patch[bool_key] is not None:
                     setattr(s, bool_key, bool(patch[bool_key]))
             if "retention_days" in patch and patch["retention_days"] is not None:
@@ -1034,8 +1055,7 @@ class NasJobRunner:
 
         self._update_job(
             job_id,
-            status="completed",
-            progress_pct=100.0,
+            persist=False,
             done_seconds=round(dur, 1),
             sentence_count=len(doc["segments"]),
             changed_count=changed,
@@ -1045,6 +1065,8 @@ class NasJobRunner:
             json_path=str(sess.json_path),
             error="",
         )
+        self._maybe_auto_title(job_id, getattr(sess, "_digest_text", "") or sess.segments)
+        self._update_job(job_id, status="completed", progress_pct=100.0)
         self._append_log(job_id, f"全部完成：{sess.md_path.name}（{len(doc['segments'])} 句）")
 
     def _run_llm_postprocess(self, job_id: str, sess: Session, title: str) -> tuple[int, str]:
@@ -1174,6 +1196,7 @@ class NasJobRunner:
                 full_md += "\n---\n\n# AI 整理要点\n\n" + tmp._digest_text + "\n"
             md_p.write_text(full_md, encoding="utf-8")
 
+        self._maybe_auto_title(job_id, tmp._digest_text or tmp.segments)
         return self._update_job(
             job_id,
             status="completed",
@@ -1181,6 +1204,137 @@ class NasJobRunner:
             changed_count=changed,
             llm_status=llm_status,
         ) or job
+
+    # ---------------- 任务重命名与 AI 自动识别标题 ----------------
+
+    def rename_job(
+        self,
+        job_id: str,
+        new_title: str,
+        *,
+        auto_named: bool | None = None,
+    ) -> dict[str, Any]:
+        """更新任务名称，并同步更新磁盘上的 .md 标题行与 .json 元数据。"""
+        clean = " ".join((new_title or "").split())[:120].strip()
+        if not clean:
+            raise ValueError("任务名称不能为空")
+
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                raise KeyError(f"任务不存在: {job_id}")
+            job["title"] = clean
+            if auto_named is not None:
+                job["auto_named"] = bool(auto_named)
+            else:
+                job["auto_named"] = False
+            job["updated_at"] = time.time()
+            md_raw = str(job.get("md_path") or "")
+            json_raw = str(job.get("json_path") or "")
+            self._save_jobs()
+
+        md_p = Path(md_raw) if md_raw else None
+        if md_p and md_p.exists():
+            try:
+                text = md_p.read_text(encoding="utf-8")
+                lines = text.splitlines(keepends=True)
+                if lines and lines[0].startswith("# 微信直播逐字稿"):
+                    eol = "\n" if lines[0].endswith("\n") else ""
+                    lines[0] = f"# 微信直播逐字稿（{clean}）{eol}"
+                    md_p.write_text("".join(lines), encoding="utf-8")
+            except OSError:
+                pass
+
+        json_p = Path(json_raw) if json_raw else None
+        if json_p and json_p.exists():
+            try:
+                doc = json.loads(json_p.read_text(encoding="utf-8"))
+                if isinstance(doc, dict):
+                    doc["title"] = clean
+                    _atomic_write_json(json_p, doc)
+            except Exception:  # noqa: BLE001
+                pass
+
+        return self.get_job(job_id) or {}
+
+    def _maybe_auto_title(self, job_id: str, source: str | list[dict]) -> str:
+        """若当前标题仍是时间/ID 占位名，且启用了自动命名与 LLM，则自动提炼标题。"""
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                return ""
+            if not self._settings.auto_title:
+                return ""
+            if not self._settings.enable_llm or not self._settings.llm_endpoint.strip():
+                return ""
+            cur_title = str(job.get("title") or "")
+            if not is_placeholder_title(cur_title):
+                return ""
+            model = self._settings.llm_model.strip() or DEFAULT_TEXT_MODEL
+            endpoint = self._settings.llm_endpoint.strip()
+            api_key = self._settings.llm_api_key.strip()
+            effort = self._settings.llm_reasoning_effort
+
+        suggested = postprocess.suggest_title(
+            source,
+            model=model,
+            endpoint=endpoint,
+            api_key=api_key,
+            reasoning_effort=effort,
+        )
+        if not suggested or suggested == cur_title:
+            return ""
+        self.rename_job(job_id, suggested, auto_named=True)
+        self._append_log(job_id, f"AI 自动识别直播名称：{suggested}")
+        return suggested
+
+    def auto_title_job(self, job_id: str) -> dict[str, Any]:
+        """手动触发：根据已完成任务的 AI 要点或逐字稿，用 LLM 识别并命名。"""
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                raise KeyError(f"任务不存在: {job_id}")
+            if not self._settings.enable_llm or not self._settings.llm_endpoint.strip():
+                raise ValueError("请先在「系统设置」中启用 LLM 并填写 Endpoint")
+            md_raw = str(job.get("md_path") or "")
+            json_raw = str(job.get("json_path") or "")
+            model = self._settings.llm_model.strip() or DEFAULT_TEXT_MODEL
+            endpoint = self._settings.llm_endpoint.strip()
+            api_key = self._settings.llm_api_key.strip()
+            effort = self._settings.llm_reasoning_effort
+
+        source: str | list[dict] = ""
+        md_p = Path(md_raw) if md_raw else None
+        if md_p and md_p.exists():
+            md_text = md_p.read_text(encoding="utf-8")
+            marker = "# AI 整理要点"
+            if marker in md_text:
+                source = md_text.split(marker, 1)[1].strip()
+            else:
+                source = md_text
+
+        if not source or len(str(source)) < 20:
+            json_p = Path(json_raw) if json_raw else None
+            if json_p and json_p.exists():
+                doc = json.loads(json_p.read_text(encoding="utf-8"))
+                source = doc.get("segments") or doc.get("full_text") or ""
+
+        if not source:
+            raise ValueError("任务暂无可用的逐字稿或 AI 要点，无法自动识别名称")
+
+        suggested = postprocess.suggest_title(
+            source,
+            model=model,
+            endpoint=endpoint,
+            api_key=api_key,
+            reasoning_effort=effort,
+        )
+        if not suggested:
+            raise RuntimeError("AI 未能提炼出有效标题，请检查 LLM 接口连通性或手动重命名")
+
+        updated = self.rename_job(job_id, suggested, auto_named=True)
+        self._append_log(job_id, f"AI 识别命名：{suggested}")
+        return updated
 
     # ---------------- 磁盘保留策略 ----------------
 

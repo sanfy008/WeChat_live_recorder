@@ -401,6 +401,74 @@ def build_digest(segments: list[dict], model: str = DEFAULT_MODEL,
     return finish(digest, True)
 
 
+def _clean_suggested_title(raw: str, max_len: int = 48) -> str:
+    """清洗 LLM 返回的标题文本，去掉引号、前缀与多余符号。"""
+    for line in (raw or "").splitlines():
+        t = line.strip()
+        if not t:
+            continue
+        t = t.lstrip("#*-•·> ").strip()
+        for prefix in ("直播标题：", "直播标题:", "场次名称：", "场次名称:", "标题：", "标题:"):
+            if t.startswith(prefix):
+                t = t[len(prefix):].strip()
+        t = t.strip(" \t\"'“”‘’《》「」『』【】`")
+        if not t:
+            continue
+        return t[:max_len].strip()
+    return ""
+
+
+def suggest_title(
+    source: str | list[dict],
+    model: str = DEFAULT_MODEL,
+    endpoint: str = DEFAULT_ENDPOINT,
+    api_key: str = "magpie-alma",
+    reasoning_effort: str = DEFAULT_REASONING_EFFORT,
+) -> str:
+    """根据 AI 要点文本或转写片段提炼一个简短准确的场次标题。失败时返回空串。"""
+    reasoning_effort = validate_reasoning_effort(reasoning_effort)
+    if isinstance(source, str):
+        snippet = source.strip()[:3500]
+    else:
+        parts: list[str] = []
+        total = 0
+        for s in source or []:
+            txt = str(s.get("text") or "").strip() if isinstance(s, dict) else str(s).strip()
+            if not txt:
+                continue
+            parts.append(txt)
+            total += len(txt) + 1
+            if total >= 3500:
+                break
+        snippet = "\n".join(parts)[:3500]
+
+    if len(snippet) < 20:
+        return ""
+
+    prompt = (
+        "请根据下面这场微信视频号直播的内容，提炼一个简短、信息明确的任务标题（8~24个字）。\n"
+        "规则：\n"
+        "1. 如果内容中能看出主播名、老师名或机构名，优先写成「主播或机构 - 核心主题」\n"
+        "2. 如果看不出主播名，直接概括「核心主题」\n"
+        "3. 只输出标题这一行文字，不要加引号、书名号、序号、Markdown 符号或任何解释。\n\n"
+        f"{snippet}"
+    )
+    try:
+        # 网关把 reasoning_tokens 计入 max_tokens，给 1024 避免思考耗尽输出空间
+        raw = _call(
+            model=model,
+            prompt=prompt,
+            endpoint=endpoint,
+            api_key=api_key,
+            max_tokens=1024,
+            timeout=60,
+            reasoning_effort=reasoning_effort,
+        )
+    except Exception:  # noqa: BLE001
+        return ""
+    return _clean_suggested_title(raw)
+
+
 def _ts(seconds: float) -> str:
     s = max(0, int(seconds))
     h, rem = divmod(s, 3600)

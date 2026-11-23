@@ -30,12 +30,22 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import re
 import sys
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import winproc
 from .stream_capture import is_url
+
+DEFAULT_TOOL_API = "http://127.0.0.1:2022"
+_EXT_ID_RE = re.compile(
+    r"(?:^|/)orig_(\d+)(?:_orig)?(?:\.(?:flv|m3u8|ts))?$",
+    re.IGNORECASE,
+)
 
 # 只认这些域名的流，避免把别的 ffmpeg 任务误当成视频号直播
 _LIVE_HOST_HINTS = (
@@ -49,6 +59,24 @@ _LIVE_HOST_HINTS = (
 _LIVE_PATH_HINTS = ("/trtc_", "orig_", "_orig.flv")
 
 
+def extract_external_id(url: str) -> str:
+    """从视频号直播流 URL 路径里提取内容 ID（如 orig_2042980977478071617_orig.flv -> 2042980977478071617）。"""
+    path = (url or "").split("?", 1)[0].strip()
+    m = _EXT_ID_RE.search(path)
+    return m.group(1) if m else ""
+
+
+def format_live_title(author: str = "", title: str = "", fallback: str = "") -> str:
+    """把主播昵称和直播间标题拼成易读的场次名。"""
+    a = " ".join((author or "").split())
+    t = " ".join((title or "").split())
+    if a and t:
+        if a in t:
+            return t
+        return f"{a} - {t}"
+    return a or t or fallback
+
+
 @dataclass
 class LiveStream:
     """一条正在进行的直播流。"""
@@ -56,6 +84,8 @@ class LiveStream:
     url: str
     pid: int = 0
     source: str = ""          # ffmpeg / unknown
+    author: str = ""
+    title: str = ""
     extra: dict = field(default_factory=dict)
 
     @property
@@ -68,8 +98,14 @@ class LiveStream:
         return hashlib.sha1(self.stream_key.encode("utf-8")).hexdigest()[:12]
 
     @property
+    def external_id(self) -> str:
+        return extract_external_id(self.url)
+
+    @property
     def title_hint(self) -> str:
-        """从 URL 路径里猜一个名字，给「场次名称」做默认值。"""
+        """优先返回抓流工具里的主播+标题；查不到时退回 URL 路径猜名。"""
+        if self.author or self.title:
+            return format_live_title(self.author, self.title)
         tail = self.stream_key.rsplit("/", 1)[-1]
         for suffix in (".flv", ".m3u8", ".ts"):
             if tail.lower().endswith(suffix):
@@ -234,6 +270,94 @@ def running_cmdlines() -> list[tuple[int, str]]:
         return []
 
 
-def find_live_streams() -> list[LiveStream]:
-    """本机正在录制的视频号直播流（按 stream_key 去重）。"""
-    return live_streams_from_cmdlines(running_cmdlines())
+def _extract_owner_nickname(item: dict) -> str:
+    accounts = item.get("accounts") or []
+    if not isinstance(accounts, list) or not accounts:
+        return ""
+    pick = None
+    for acc in accounts:
+        if isinstance(acc, dict) and str(acc.get("role") or "") == "owner":
+            pick = acc
+            break
+    if pick is None and isinstance(accounts[0], dict):
+        pick = accounts[0]
+    return str(pick.get("nickname") or "").strip() if pick else ""
+
+
+def resolve_wxcd_metadata(
+    external_id: str,
+    tool_api: str = DEFAULT_TOOL_API,
+    timeout: float = 1.5,
+) -> tuple[str, str]:
+    """按视频号 external_id 从本地抓流工具 API 查询 (主播昵称, 直播标题)。
+
+    抓流工具不可用或查不到时静默返回 ("", "")，绝不阻塞主流程。
+    """
+    eid = (external_id or "").strip()
+    base = (tool_api or "").strip().rstrip("/")
+    if not eid or not base:
+        return "", ""
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def _get(path: str) -> dict | None:
+        try:
+            with opener.open(base + path, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except Exception:  # noqa: BLE001
+            return None
+
+    q_id = urllib.parse.quote(f"wxchannels:{eid}")
+    detail = _get(f"/api/content/detail?id={q_id}")
+    if isinstance(detail, dict) and detail.get("code") in (0, None):
+        data = detail.get("data")
+        if isinstance(data, dict):
+            author = _extract_owner_nickname(data)
+            title = str(data.get("title") or "").strip()
+            if author or title:
+                return author, title
+
+    listing = _get("/api/content/list?platform_id=wxchannels&page_size=50")
+    if isinstance(listing, dict) and listing.get("code") in (0, None):
+        rows = (listing.get("data") or {}).get("list") or []
+        for it in rows:
+            if isinstance(it, dict) and str(it.get("external_id") or "").strip() == eid:
+                author = _extract_owner_nickname(it)
+                title = str(it.get("title") or "").strip()
+                if author or title:
+                    return author, title
+    return "", ""
+
+
+def enrich_streams_with_wxcd(
+    streams: list[LiveStream],
+    tool_api: str = DEFAULT_TOOL_API,
+    timeout: float = 1.5,
+) -> list[LiveStream]:
+    """用抓流工具 API 补全直播流的 author / title（按 external_id 去重查询）。"""
+    cache: dict[str, tuple[str, str]] = {}
+    for s in streams:
+        if s.author or s.title:
+            continue
+        eid = s.external_id
+        if not eid:
+            continue
+        if eid not in cache:
+            cache[eid] = resolve_wxcd_metadata(eid, tool_api=tool_api, timeout=timeout)
+        author, title = cache[eid]
+        if author:
+            s.author = author
+        if title:
+            s.title = title
+    return streams
+
+
+def find_live_streams(
+    tool_api: str = DEFAULT_TOOL_API,
+    resolve_meta: bool = True,
+) -> list[LiveStream]:
+    """本机正在录制的视频号直播流（按 stream_key 去重，可选自动补全主播与标题）。"""
+    streams = live_streams_from_cmdlines(running_cmdlines())
+    if resolve_meta and tool_api and streams:
+        enrich_streams_with_wxcd(streams, tool_api=tool_api)
+    return streams

@@ -437,8 +437,10 @@ class FetchTabMixin:
 
         self._fetch_nas_set_status("查找本机直播流…")
 
+        tool_api = (self.fetch_api_var.get() or "").strip() or liveurl.DEFAULT_TOOL_API
+
         def work() -> None:
-            streams = liveurl.find_live_streams()
+            streams = liveurl.find_live_streams(tool_api=tool_api)
             if not streams:
                 self._ui(lambda: self._fetch_nas_set_status("没有进行中的直播", warn=True))
                 self._ui(lambda: messagebox.showinfo(
@@ -459,6 +461,8 @@ class FetchTabMixin:
 
     def _fetch_push_selected_to_nas(self) -> None:
         """把列表里选中的条目直接推给 NAS 拉流（适合正在播的直播条目）。"""
+        from . import liveurl
+
         targets = self._fetch_selected_items()
         if not targets:
             messagebox.showinfo("请先选择", "请在列表里选中要推给 NAS 的条目。")
@@ -469,7 +473,8 @@ class FetchTabMixin:
                     f"选中了 {len(targets)} 条，只推送第一条《{targets[0].title}》。继续？"):
                 return
         it = targets[0]
-        self._fetch_nas_push(it.url, it.title)
+        name = liveurl.format_live_title(it.author, it.title, fallback=it.title)
+        self._fetch_nas_push(it.url, name)
 
     # ---------- 搜索 ----------
 

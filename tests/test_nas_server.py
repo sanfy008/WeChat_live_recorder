@@ -595,3 +595,130 @@ def test_min_record_and_limits_settings_api_roundtrip(tmp_path: Path):
     finally:
         runner.shutdown()
 
+
+def test_is_placeholder_title():
+    from wxlive.nas_runner import is_placeholder_title
+
+    assert is_placeholder_title("")
+    assert is_placeholder_title("直播_20261123_114405")
+    assert is_placeholder_title("orig_2042980977478071617_orig")
+    assert is_placeholder_title("音频_20261123_120000")
+    assert not is_placeholder_title("北大文辉讲学习 - 欢迎来到我的直播间")
+
+
+def test_suggest_title_cleans_llm_output(monkeypatch):
+    from wxlive import postprocess
+
+    monkeypatch.setattr(
+        postprocess,
+        "_call",
+        lambda **kw: '标题：「积极人生家庭教育 - 厌学六大解法」\n说明：不需要',
+    )
+    got = postprocess.suggest_title(
+        "这是一场关于青少年厌学五大类型与六大解法的家庭教育直播。",
+        endpoint="http://fake/v1/chat/completions",
+        api_key="k",
+    )
+    assert got == "积极人生家庭教育 - 厌学六大解法"
+
+
+def test_rename_and_auto_title_job_endpoints(tmp_path: Path, monkeypatch):
+    """手动重命名 + 自动/手动 AI 识别命名会同步更新任务、逐字稿与文件库。"""
+    from wxlive import postprocess
+
+    wav_bytes = _make_wav_bytes(seconds=1.0)
+
+    monkeypatch.setattr(postprocess, "fix_errors", lambda lines, **kw: lines)
+    monkeypatch.setattr(postprocess, "build_digest", lambda segs, **kw: "## 一句话概括\n测试厌学解法直播。")
+    monkeypatch.setattr(
+        postprocess,
+        "suggest_title",
+        lambda src, **kw: "积极人生 - 厌学六大解法",
+    )
+
+    runner = NasJobRunner(data_dir=tmp_path, engine_factory=lambda t, l: _FakeEngine())
+    try:
+        runner.update_settings({"enable_llm": True, "llm_endpoint": "http://fake", "auto_title": True})
+        app = create_app(runner=runner)
+        with TestClient(app) as client:
+            # 1) 占位名（orig_xxx_orig）在转写整理后应自动被 AI 命名替换
+            r = client.post(
+                "/api/jobs/upload",
+                data={"name": "orig_2079009824565503324_orig", "auto_transcribe": "true"},
+                files={"file": ("sample.wav", io.BytesIO(wav_bytes), "audio/wav")},
+            )
+            assert r.status_code == 200
+            jid = r.json()["id"]
+
+            deadline = time.time() + 10.0
+            job = {}
+            while time.time() < deadline:
+                job = client.get(f"/api/jobs/{jid}").json()
+                if job["status"] in ("completed", "failed"):
+                    break
+                time.sleep(0.05)
+
+            assert job["status"] == "completed"
+            assert job["title"] == "积极人生 - 厌学六大解法"
+            assert job.get("auto_named") is True
+
+            # 文件库和 .md 标题行也同步更新
+            lib = client.get("/api/library").json()
+            assert any(it["title"] == "积极人生 - 厌学六大解法" for it in lib["items"])
+            md_text = client.get(f"/api/jobs/{jid}/transcript").json()["md_text"]
+            assert md_text.splitlines()[0] == "# 微信直播逐字稿（积极人生 - 厌学六大解法）"
+
+            # 2) 手动重命名 PATCH /api/jobs/{id}
+            r2 = client.patch(f"/api/jobs/{jid}", json={"title": "人工改好的直播名"})
+            assert r2.status_code == 200
+            assert r2.json()["title"] == "人工改好的直播名"
+            assert r2.json()["auto_named"] is False
+
+            # 3) 手动点击 AI 识别命名 POST /api/jobs/{id}/auto-title
+            monkeypatch.setattr(
+                postprocess,
+                "suggest_title",
+                lambda src, **kw: "积极人生家庭教育 - 六大解法",
+            )
+            r3 = client.post(f"/api/jobs/{jid}/auto-title")
+            assert r3.status_code == 200
+            assert r3.json()["title"] == "积极人生家庭教育 - 六大解法"
+            assert r3.json()["auto_named"] is True
+    finally:
+        runner.shutdown()
+
+
+def test_custom_name_not_overwritten_by_auto_title(tmp_path: Path, monkeypatch):
+    """用户明确指定的场次名称，不应在转写完成后被自动覆盖。"""
+    from wxlive import postprocess
+
+    wav_bytes = _make_wav_bytes(seconds=1.0)
+
+    monkeypatch.setattr(postprocess, "fix_errors", lambda lines, **kw: lines)
+    monkeypatch.setattr(postprocess, "build_digest", lambda segs, **kw: "## 一句话概括\n测试。")
+    monkeypatch.setattr(postprocess, "suggest_title", lambda src, **kw: "不该覆盖这个名字")
+
+    runner = NasJobRunner(data_dir=tmp_path, engine_factory=lambda t, l: _FakeEngine())
+    try:
+        runner.update_settings({"enable_llm": True, "llm_endpoint": "http://fake", "auto_title": True})
+        app = create_app(runner=runner)
+        with TestClient(app) as client:
+            r = client.post(
+                "/api/jobs/upload",
+                data={"name": "家长必看专场", "auto_transcribe": "true"},
+                files={"file": ("sample.wav", io.BytesIO(wav_bytes), "audio/wav")},
+            )
+            jid = r.json()["id"]
+            deadline = time.time() + 10.0
+            job = {}
+            while time.time() < deadline:
+                job = client.get(f"/api/jobs/{jid}").json()
+                if job["status"] in ("completed", "failed"):
+                    break
+                time.sleep(0.05)
+
+            assert job["status"] == "completed"
+            assert job["title"] == "家长必看专场"
+    finally:
+        runner.shutdown()
+

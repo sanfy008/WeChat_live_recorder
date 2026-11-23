@@ -201,3 +201,92 @@ def test_localagent_reports_error_without_crashing(monkeypatch):
     assert payload["ok"] is False
     assert "扫描失败" in payload["error"]
     assert payload["streams"] == []
+
+
+# ---------------- 抓流工具元数据反查 ----------------
+
+def test_extract_external_id():
+    assert liveurl.extract_external_id(LIVE_URL) == "2042980977478071617"
+    assert liveurl.extract_external_id(OTHER_URL) == "999"
+    assert liveurl.extract_external_id("https://example.com/live/stream.flv") == ""
+
+
+def test_format_live_title():
+    assert liveurl.format_live_title("北大文辉讲学习", "欢迎来到我的直播间") == "北大文辉讲学习 - 欢迎来到我的直播间"
+    assert liveurl.format_live_title("小林升学", "小林升学专场答疑") == "小林升学专场答疑"
+    assert liveurl.format_live_title("", "厌学的五大类型") == "厌学的五大类型"
+    assert liveurl.format_live_title("", "", fallback="orig_1_orig") == "orig_1_orig"
+
+
+def test_find_live_streams_enriches_wxcd_metadata(monkeypatch):
+    import urllib.parse
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _FakeWxcd(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            path = urllib.parse.unquote(self.path)
+            if "id=wxchannels:2042980977478071617" in path:
+                body = json.dumps({
+                    "code": 0,
+                    "data": {
+                        "external_id": "2042980977478071617",
+                        "title": "欢迎来到我的直播间",
+                        "accounts": [{"role": "owner", "nickname": "北大文辉讲学习"}],
+                    },
+                }, ensure_ascii=False).encode("utf-8")
+            elif "/api/content/list" in path:
+                body = json.dumps({
+                    "code": 0,
+                    "data": {
+                        "list": [{
+                            "external_id": "999",
+                            "title": "小升初跨区答疑",
+                            "accounts": [{"role": "owner", "nickname": "小林升学"}],
+                        }],
+                    },
+                }, ensure_ascii=False).encode("utf-8")
+            else:
+                body = json.dumps({"code": 404, "data": None}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, fmt, *args):  # noqa: A003
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _FakeWxcd)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        monkeypatch.setattr(
+            liveurl,
+            "running_cmdlines",
+            lambda: [
+                (11, f'ffmpeg -i "{LIVE_URL}" -c copy a.mkv'),
+                (12, f'ffmpeg -i "{OTHER_URL}" -c copy b.mkv'),
+            ],
+        )
+        streams = liveurl.find_live_streams(tool_api=f"http://127.0.0.1:{port}")
+        assert len(streams) == 2
+        assert streams[0].author == "北大文辉讲学习"
+        assert streams[0].title == "欢迎来到我的直播间"
+        assert streams[0].title_hint == "北大文辉讲学习 - 欢迎来到我的直播间"
+        # 第二条走 list 兜底命中
+        assert streams[1].title_hint == "小林升学 - 小升初跨区答疑"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_find_live_streams_graceful_when_wxcd_unreachable(monkeypatch):
+    monkeypatch.setattr(
+        liveurl,
+        "running_cmdlines",
+        lambda: [(11, f'ffmpeg -i "{LIVE_URL}" -c copy a.mkv')],
+    )
+    streams = liveurl.find_live_streams(tool_api="http://127.0.0.1:1")
+    assert len(streams) == 1
+    assert streams[0].title_hint == "orig_2042980977478071617_orig"

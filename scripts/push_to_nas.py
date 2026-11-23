@@ -125,7 +125,7 @@ def main() -> int:
     if args.list_live:
         from wxlive import liveurl
 
-        streams = liveurl.find_live_streams()
+        streams = liveurl.find_live_streams(tool_api=args.tool_api)
         if not streams:
             print("本机没有正在拉取的视频号直播流。")
             print("请先在微信里打开直播页，并点一次抓流工具的下载按钮"
@@ -142,7 +142,7 @@ def main() -> int:
     if args.from_local:
         from wxlive import liveurl
 
-        streams = liveurl.find_live_streams()
+        streams = liveurl.find_live_streams(tool_api=args.tool_api)
         if not streams:
             print("本机没有正在拉取的视频号直播流。", file=sys.stderr)
             print("请先在微信里打开直播页，点一次抓流工具的下载按钮"
@@ -180,7 +180,16 @@ def main() -> int:
     title = ""
     if args.url:
         url = _strip_quotes(args.url)
+        if not args.name:
+            from wxlive import liveurl
+
+            eid = liveurl.extract_external_id(url)
+            if eid:
+                author, live_t = liveurl.resolve_wxcd_metadata(eid, tool_api=args.tool_api)
+                title = liveurl.format_live_title(author, live_t)
     elif args.match:
+        from wxlive import liveurl
+
         try:
             items = list_captured(args.tool_api, keyword=args.match)
         except Exception as exc:  # noqa: BLE001
@@ -197,7 +206,8 @@ def main() -> int:
             return 1
         pick = hits[0]
         url = _strip_quotes(pick.get("url") or "")
-        title = (pick.get("title") or "").strip()
+        author = liveurl._extract_owner_nickname(pick)
+        title = liveurl.format_live_title(author, pick.get("title") or "")
         if not url:
             print("这条内容没有可用地址（可能只在抓流工具里登记过、没抓到真实 URL）。",
                   file=sys.stderr)

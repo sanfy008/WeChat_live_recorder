@@ -47,6 +47,9 @@ def _payload() -> dict:
             {
                 "url": s.url,
                 "stream_id": s.stream_id,
+                "external_id": s.external_id,
+                "author": s.author,
+                "title": s.title,
                 "title_hint": s.title_hint,
                 "pid": s.pid,
                 "has_signature": s.has_signature,
