@@ -1196,7 +1196,7 @@ function renderJobs() {
         ${j.sentence_count ? `<span>${j.sentence_count} 句</span>` : ''}
         ${j.rtf ? `<span>RTF ${j.rtf}</span>` : ''}
       </div>
-      ${j.stop_reason ? `<div class="job-stop-note">${esc(j.stop_reason)}</div>` : ''}
+      ${j.stop_reason ? `<div class="job-stop-note">${esc(j.stop_reason_text || j.stop_reason)}</div>` : ''}
       ${j.error ? `<div style="color:var(--rose);font-size:11.5px;margin-top:5px;">${esc(j.error)}</div>` : ''}
       ${bar}
     </div>`;
@@ -1222,7 +1222,8 @@ async function renderDetail(j) {
   if (j.sentence_count) chips.push(`句数: ${j.sentence_count}`);
   if (j.changed_count) chips.push(`AI 纠错: ${j.changed_count} 处`);
   if (j.llm_status && !j.llm_status.startsWith('skipped')) chips.push(`AI: ${j.llm_status}`);
-  if (j.stop_reason) chips.push(j.stop_reason);
+  if (j.stop_reason) chips.push(j.stop_reason_text || j.stop_reason);
+  if (j.truncated) chips.push('录音可能不完整');
   document.getElementById('det-meta').innerHTML = chips.map(c => `<span class="chip">${esc(c)}</span>`).join('');
 
   const acts = [];
@@ -1698,6 +1699,25 @@ async function refreshAll() {
 """
 
 
+def _valid_library_stem(stem: str) -> bool:
+    """校验文件库目录名（允许中文，拒绝路径穿越）。
+
+    目录名来自 Session 的 `_safe_part(audio_stem)`：保留全部 Unicode
+    字母数字、`-`、`_`，因此中文标题是合法且常见的情况。
+    这里只拦真正危险的东西：路径分隔符、空字节、控制字符、
+    以点开头的隐藏/相对路径名、过长名字。
+    """
+    if not stem or len(stem) > 120:
+        return False
+    if stem.startswith("."):
+        return False
+    if any(ch in stem for ch in ("/", "\\", "\x00")):
+        return False
+    if any(ord(ch) < 32 for ch in stem):
+        return False
+    return True
+
+
 def create_app(
     data_dir: Path | str | None = None,
     runner: NasJobRunner | None = None,
@@ -1795,11 +1815,21 @@ def create_app(
         active = sum(
             1
             for j in jobs
-            if j["status"] in ("recording", "queued", "converting", "transcribing", "postprocessing")
+            if j.get("status") in ("recording", "queued", "converting", "transcribing", "postprocessing")
         )
+        # WXLIVE_FFMPEG 配置失效时 find_ffmpeg 会抛错（有意为之，避免静默回退）。
+        # 健康接口不能因此 500 —— 相反要把原因摆在明面上。
+        ff_error = ""
+        try:
+            ff = find_ffmpeg()
+        except Exception as exc:  # noqa: BLE001
+            ff = None
+            ff_error = str(exc)[:300]
         return {
             "ok": True,
-            "ffmpeg_available": bool(find_ffmpeg()),
+            "ffmpeg_available": bool(ff),
+            "ffmpeg_path": ff or "",
+            "ffmpeg_error": ff_error,
             "engine_loaded": job_runner.engine_loaded(),
             "disk_free_gb": round(usage.free / (1024**3), 1),
             "job_count": len(jobs),
@@ -2007,10 +2037,11 @@ def create_app(
     @app.get("/api/library/{stem}/download/{kind}")
     def api_library_download(stem: str, kind: str):
         """下载单个转录产物的某个文件（md/json/jsonl）。"""
-        import re
-
-        # stem 来自用户输入，必须先校验，避免目录穿越
-        if not re.fullmatch(r"[A-Za-z0-9._\-]{1,120}", stem or ""):
+        # stem 来自用户输入，必须先校验，避免目录穿越。
+        # 注意：**不能用 ASCII 正则** —— 目录名来自录音文件名/直播标题，
+        # 中文是常态（如 `20261123_103958_家长必看专场_stream`），
+        # 一旦只放行 [A-Za-z0-9]，中文场次的单条下载会全部 400。
+        if not _valid_library_stem(stem):
             raise HTTPException(status_code=400, detail="非法的目录名")
         if kind not in ("md", "json", "jsonl"):
             raise HTTPException(status_code=400, detail="只支持 md / json / jsonl")

@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from wxlive import lexicon
 from wxlive.config import ROOT
 from wxlive.userconfig import _normalize_lexicon_path
 
@@ -65,3 +66,28 @@ def test_unknown_custom_name_falls_back_to_default() -> None:
     cfg = _Cfg("C:/tmp/absolutely_no_such_lexicon.json")
     _normalize_lexicon_path(cfg)
     assert Path(cfg.asr.lexicon_path).exists()
+
+
+def test_missing_explicit_lexicon_path_warns(tmp_path, capsys) -> None:
+    """显式传入的词表路径不存在时必须告警，不能静默回退内置表。"""
+    data = lexicon.load(tmp_path / "definitely_missing.json")
+    out = capsys.readouterr().out
+
+    assert "warn" in out.lower()
+    assert "不存在" in out
+    assert data["schools"], "仍然应该返回内置词表"
+
+
+def test_opencc_missing_warns_once(monkeypatch, capsys) -> None:
+    """opencc 缺失时繁转简只能用有限兜底表，必须提示一次。"""
+    import sys
+
+    monkeypatch.setitem(sys.modules, "opencc", None)
+    monkeypatch.setattr(lexicon, "_OPENCC_TRIED", False)
+    monkeypatch.setattr(lexicon, "_OPENCC_T2S", None)
+
+    lexicon.to_simplified("會")
+    out = capsys.readouterr().out
+
+    assert "opencc" in out.lower()
+    assert "warn" in out.lower()

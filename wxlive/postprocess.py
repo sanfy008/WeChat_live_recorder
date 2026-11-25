@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import re
 import time
 import urllib.error
 import urllib.request
@@ -29,6 +30,22 @@ DEFAULT_ENDPOINT = "http://127.0.0.1:3425/v1/chat/completions"
 # 单一真相在 config.py（TextConfig 的默认值也取同一个常量）。
 DEFAULT_MODEL = DEFAULT_TEXT_MODEL
 DEFAULT_FIX_WORKERS = 12
+
+# 纠错批次的初始 token 预算与上限。
+# 网关把 reasoning_tokens 计入 max_tokens，high/max 档下 8000 很容易被
+# 思考吃掉导致 finish_reason="length"；实测重试同样预算仍会截断，
+# 所以在重试时逐次放大预算，直到上限。
+FIX_MAX_TOKENS = 8000
+FIX_MAX_TOKENS_CAP = 32000
+
+# 模型偶尔无视“不要序号”的指令，返回 `1. xxx` / `2、xxx` / `3) xxx`。
+# 行数校验能过，但序号会进正文，必须剥离。
+# `(?!\d)` 防止误伤小数开头的内容（如“1.5万人报名”不能被改成“5万人报名”）。
+_NUMBER_PREFIX = re.compile(r"^\s*\d+\s*[.、)．](?!\d)\s*")
+
+
+def _strip_number_prefix(line: str) -> str:
+    return _NUMBER_PREFIX.sub("", line, count=1).strip()
 
 # 纠错分批的失败重试间隔（秒）。网关会瞬时抖动：实测串行复跑里出现
 # 23/40 行、1/40 行、HTTP 502/403，单独重试全部成功且行数正确。
@@ -190,6 +207,7 @@ def fix_errors(lines: list[str], model: str = DEFAULT_MODEL,
         )
         last_err = ""
         retries = 0
+        max_tokens = FIX_MAX_TOKENS
         for attempt in range(len(delays) + 1):
             if attempt:
                 retries += 1
@@ -199,13 +217,26 @@ def fix_errors(lines: list[str], model: str = DEFAULT_MODEL,
             try:
                 call_meta: dict = {}
                 res = _call(model, prompt, endpoint, api_key,
+                            max_tokens=max_tokens,
                             reasoning_effort=reasoning_effort,
                             out_meta=call_meta)
-                # 输出被 max_tokens 截断：这批结果不完整，不可信任
+                # 输出被 max_tokens 截断：这批结果不完整，不可信任。
+                # 截断常见于 reasoning_tokens 吃满预算，重试时放大预算，
+                # 而不是用同样预算再问一遍（那样大概率再次截断）。
                 if call_meta.get("finish_reason") == "length":
-                    last_err = "输出被截断（finish_reason=length）"
+                    if max_tokens < FIX_MAX_TOKENS_CAP:
+                        max_tokens = min(FIX_MAX_TOKENS_CAP, max_tokens * 2)
+                        last_err = (f"输出被截断（finish_reason=length，"
+                                    f"下一轮预算 {max_tokens}）")
+                    else:
+                        last_err = "输出被截断（finish_reason=length，已达预算上限）"
                     continue
-                fixed = [x.strip() for x in res.split("\n") if x.strip()]
+                fixed = [
+                    _strip_number_prefix(x)
+                    for x in res.split("\n")
+                    if x.strip()
+                ]
+                fixed = [x for x in fixed if x]
                 # 行数不一致时不要用这批结果，避免错位
                 if len(fixed) == len(batch):
                     if attempt:

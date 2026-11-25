@@ -16,6 +16,7 @@
 | 对象 | 默认 | 理由 |
 |---|---|---|
 | 旧音频 WAV | **删** | 体积大（1.83MB/分钟，2 小时约 220MB），是空间浪费的主因 |
+| 上传转码源文件 | **删** | `.mp4/.m4a` 原片转码后不再被 audio_path 引用，不清理就永久占盘 |
 | 转录 md/json | **保留** | 体积小（一场几十 KB），是真正有价值的产物 |
 | 孤儿 WAV（无对应任务） | **删** | 进程崩溃/上传中断留下的碎片 |
 | 孤儿 .part/.tmp | **删** | 下载中断的残骸 |
@@ -234,6 +235,11 @@ def plan_cleanup(
 
         if audio_raw:
             referenced_audio.add(str(Path(audio_raw)))
+        # 转码源文件也要算"被引用"：否则若原片恰好是 .wav（48k 上传），
+        # 孤儿扫描会把它当无人认领再删一遍，绕过任务级的年龄判定。
+        src_raw = str(job.get("source_path") or "")
+        if src_raw:
+            referenced_audio.add(str(Path(src_raw)))
         if md_raw:
             # 转录产物按 <transcripts>/<stem>/ 目录组织
             referenced_tr_dirs.add(str(Path(md_raw).parent))
@@ -310,12 +316,71 @@ def plan_cleanup(
                         reason=f"逐字稿已 {age:.0f} 天（阈值 {plan.retention_days:.0f} 天）",
                     ))
 
+    # ---- 上传转码的源文件 ----
+    # 单独一遍：即使 audio_path 已被上一轮清掉，源文件仍要按任务年龄清理。
+    plan.candidates.extend(
+        _plan_sources(jobs, rec_root,
+                      retention_days=plan.retention_days, now=ts_now)
+    )
+
     # ---- 孤儿文件：目录里有、但没有任务引用 ----
     plan.candidates.extend(
         _plan_orphans(rec_root, referenced_audio, referenced_tr_dirs,
                       retention_days=plan.retention_days, now=ts_now)
     )
     return plan
+
+
+def _plan_sources(
+    jobs: dict[str, dict[str, Any]],
+    rec_root: Path,
+    *,
+    retention_days: float,
+    now: float,
+) -> Iterable[Candidate]:
+    """上传任务转码后留下的原始媒体文件（.mp4/.m4a/...）。
+
+    这些文件转码完成后不再是 `audio_path`，此前完全不受保留策略管理，
+    属于"删任务才消失、平时只增不减"的盲区。
+    与音频一样受保留天数约束，且必须落在录制目录内。
+    """
+    out: list[Candidate] = []
+    for job_id, job in (jobs or {}).items():
+        if not isinstance(job, dict):
+            continue
+        raw = str(job.get("source_path") or "")
+        if not raw:
+            continue
+        if str(job.get("status") or "") in ACTIVE_STATUSES:
+            continue
+        sp = Path(raw)
+        audio_raw = str(job.get("audio_path") or "")
+        if audio_raw and str(Path(audio_raw)) == str(sp):
+            continue                      # 源就是当前音频：不要重复计
+        if not sp.is_file() or not _is_within(sp, rec_root):
+            continue
+
+        created = _job_created_ts(job)
+        if created > 0:
+            base_ts = created
+        else:
+            try:
+                base_ts = sp.stat().st_mtime
+            except OSError:
+                continue
+        age = _age_days(base_ts, now)
+        if age < retention_days:
+            continue
+        out.append(Candidate(
+            kind="source",
+            path=sp,
+            size_bytes=_file_size(sp),
+            age_days=age,
+            job_id=job_id,
+            title=str(job.get("title") or ""),
+            reason=f"上传转码源文件已 {age:.0f} 天（阈值 {retention_days:.0f} 天）",
+        ))
+    return out
 
 
 def _plan_orphans(

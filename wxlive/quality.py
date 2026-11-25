@@ -157,6 +157,48 @@ def split_long_line(text: str, limit: int = 80) -> list[str]:
     return [x for x in out if x]
 
 
+def compute_completeness(
+    *,
+    drain_incomplete: bool = False,
+    dropped_chunks: int = 0,
+    asr_queue_dropped: int = 0,
+    asr_spilled: int = 0,
+    asr_failed_chunks: int = 0,
+    has_content_loss: bool = False,
+) -> dict:
+    """统一判定本次产物是否完整。
+
+    之前 pipeline / 两个离线脚本 / NAS 各有一套判定：
+    pipeline 只看收尾线程有没有超时，脚本/NAS 只看末句时间与音频时长差。
+    两边都会漏掉“片段被丢、占位符进正文”这类内容损失。
+
+    这里把已知的丢失来源汇总成一处：
+      - drain_incomplete：收尾等待超时
+      - dropped_chunks：采集端丢块（录音本身可能缺）
+      - asr_queue_dropped：转写队列满导致片段未入队（主循环）
+      - asr_spilled：片段落盘到 spilled 但未转写
+      - asr_failed_chunks：转写调用异常导致片段丢失
+      - has_content_loss：引擎内部已落占位符（如 Gemini 整块失败）
+
+    返回 `{"complete": bool, "reasons": [...]}`，reasons 可直接写进产物 meta，
+    用户/界面不必再猜“为什么这份稿子不可信”。
+    """
+    reasons: list[str] = []
+    if drain_incomplete:
+        reasons.append("drain_timeout")
+    if dropped_chunks:
+        reasons.append(f"capture_dropped_chunks={int(dropped_chunks)}")
+    if asr_queue_dropped:
+        reasons.append(f"asr_queue_dropped={int(asr_queue_dropped)}")
+    if asr_spilled:
+        reasons.append(f"asr_spilled={int(asr_spilled)}")
+    if asr_failed_chunks:
+        reasons.append(f"asr_failed_chunks={int(asr_failed_chunks)}")
+    if has_content_loss:
+        reasons.append("has_content_loss")
+    return {"complete": not reasons, "reasons": reasons}
+
+
 def placeholder_text(start: float, end: float) -> str:
     """彻底救不回来时的占位文案。
 

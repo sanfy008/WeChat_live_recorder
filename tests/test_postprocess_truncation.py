@@ -113,6 +113,52 @@ def test_fix_truncated_exhausted_keeps_original(monkeypatch):
     assert stats["failed_batches"] == [1]
 
 
+def test_fix_escalates_max_tokens_when_truncated(monkeypatch):
+    """截断不能拿同样预算重问；必须逐步放大 max_tokens。"""
+    seen = []
+
+    def call(model, prompt, endpoint, api_key, **kwargs):
+        seen.append(kwargs.get("max_tokens"))
+        meta = kwargs["out_meta"]
+        if len(seen) == 1:
+            meta["finish_reason"] = "length"
+            return "半截"
+        meta["finish_reason"] = "stop"
+        return "修正一\n修正二"
+
+    monkeypatch.setattr(postprocess, "_call", call)
+    out = postprocess.fix_errors(["原一", "原二"], batch_size=10, workers=1,
+                                 retry_delays=(0.0, 0.0))
+
+    assert out == ["修正一", "修正二"]
+    assert seen[0] == postprocess.FIX_MAX_TOKENS
+    assert seen[1] == min(postprocess.FIX_MAX_TOKENS_CAP,
+                          postprocess.FIX_MAX_TOKENS * 2)
+
+
+def test_fix_strips_number_prefix_from_output(monkeypatch):
+    """模型偶尔无视“不要序号”，返回 1. / 2、/ 3) 前缀，必须剥离。"""
+    def call(model, prompt, endpoint, api_key, **kwargs):
+        kwargs["out_meta"]["finish_reason"] = "stop"
+        return "1. 修正一\n2、修正二\n3) 修正三"
+
+    monkeypatch.setattr(postprocess, "_call", call)
+    out = postprocess.fix_errors(["原一", "原二", "原三"], batch_size=10,
+                                 workers=1)
+    assert out == ["修正一", "修正二", "修正三"]
+
+
+def test_fix_does_not_strip_decimal_lines(monkeypatch):
+    """小数开头的内容不能被当序号删掉（1.5万 ≠ 5万）。"""
+    def call(model, prompt, endpoint, api_key, **kwargs):
+        kwargs["out_meta"]["finish_reason"] = "stop"
+        return "1.5万人报名\n2.5万学费"
+
+    monkeypatch.setattr(postprocess, "_call", call)
+    out = postprocess.fix_errors(["原一", "原二"], batch_size=10, workers=1)
+    assert out == ["1.5万人报名", "2.5万学费"]
+
+
 def test_fix_monkeypatched_str_call_still_works(monkeypatch):
     """旧测试的 _call 只返回 str、不写 out_meta：不能因此误判失败。"""
     monkeypatch.setattr(postprocess, "_call", _fake_call)

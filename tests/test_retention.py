@@ -224,6 +224,96 @@ def test_non_wav_untouched(tmp_path: Path):
     assert plan.candidates == []
 
 
+# ---------------- 上传转码的源文件 ----------------
+
+def _job_with_source(job_id: str, audio: Path | None, source: Path | None,
+                     *, days_old: float = 0.0, status: str = "completed") -> dict:
+    job = _job(job_id, audio, days_old=days_old, status=status)
+    job["source_path"] = str(source) if source else ""
+    return job
+
+
+def test_old_source_media_cleaned_with_audio(tmp_path: Path):
+    """上传转码后的原始 .mp4 也要按保留天数清理（此前永久占盘）。"""
+    rec = tmp_path / "recordings"
+    audio = _make_audio(rec, "20260101_120000_上传.16k.wav", size=1000)
+    src = _make_audio(rec, "20260101_120000_上传.mp4", size=5000)
+
+    plan = retention.plan_cleanup(
+        {"j1": _job_with_source("j1", audio, src, days_old=45)},
+        rec, tmp_path / "transcripts",
+        retention_days=30, now=NOW,
+    )
+    kinds = sorted(c.kind for c in plan.candidates)
+    assert kinds == ["audio", "source"], [c.to_dict() for c in plan.candidates]
+    src_c = next(c for c in plan.candidates if c.kind == "source")
+    assert src_c.path == src
+    assert src_c.size_bytes == 5000
+    assert plan.total_bytes == 6000
+
+
+def test_source_within_retention_kept(tmp_path: Path):
+    rec = tmp_path / "recordings"
+    audio = _make_audio(rec, "a.wav")
+    src = _make_audio(rec, "a.mp4")
+    plan = retention.plan_cleanup(
+        {"j1": _job_with_source("j1", audio, src, days_old=3)},
+        rec, tmp_path / "transcripts", retention_days=30, now=NOW,
+    )
+    assert plan.candidates == []
+
+
+def test_source_outside_recordings_dir_skipped(tmp_path: Path):
+    """源文件路径必须落在录制目录内，别处文件一律不碰。"""
+    rec = tmp_path / "recordings"
+    rec.mkdir()
+    audio = _make_audio(rec, "a.wav")
+    outside = tmp_path / "elsewhere" / "x.mp4"
+    outside.parent.mkdir()
+    outside.write_bytes(b"\0" * 100)
+
+    plan = retention.plan_cleanup(
+        {"j1": _job_with_source("j1", audio, outside, days_old=45)},
+        rec, tmp_path / "transcripts", retention_days=30, now=NOW,
+    )
+    assert all(c.kind != "source" for c in plan.candidates)
+
+
+def test_source_equal_to_audio_not_duplicated(tmp_path: Path):
+    """没有转码时 source_path == audio_path，不能算两条候选。"""
+    rec = tmp_path / "recordings"
+    audio = _make_audio(rec, "a.wav", size=2048)
+    plan = retention.plan_cleanup(
+        {"j1": _job_with_source("j1", audio, audio, days_old=45)},
+        rec, tmp_path / "transcripts", retention_days=30, now=NOW,
+    )
+    assert [c.kind for c in plan.candidates] == ["audio"]
+
+
+def test_active_job_source_skipped(tmp_path: Path):
+    rec = tmp_path / "recordings"
+    audio = _make_audio(rec, "a.wav")
+    src = _make_audio(rec, "a.mp4")
+    plan = retention.plan_cleanup(
+        {"j1": _job_with_source("j1", audio, src, days_old=999, status="recording")},
+        rec, tmp_path / "transcripts", retention_days=30, now=NOW,
+    )
+    assert plan.candidates == []
+
+
+def test_execute_deletes_source(tmp_path: Path):
+    rec = tmp_path / "recordings"
+    audio = _make_audio(rec, "a.wav", size=100)
+    src = _make_audio(rec, "a.mp4", size=900)
+    plan = retention.plan_cleanup(
+        {"j1": _job_with_source("j1", audio, src, days_old=45)},
+        rec, tmp_path / "transcripts", retention_days=30, now=NOW,
+    )
+    result = retention.execute_cleanup(plan)
+    assert result.ok
+    assert not src.exists() and not audio.exists()
+
+
 # ---------------- 执行 ----------------
 
 def test_execute_deletes_and_reports_freed(tmp_path: Path):

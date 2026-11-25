@@ -37,11 +37,18 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 
+# 头部扫描窗口上限。原先只读 4096 字节：带大 LIST/INFO 元数据的 WAV，
+# data 块可能落在窗口外，函数会误判“没有 data 块 = 已收尾”，
+# 导致录制中途就开始转写。
+MAX_HEADER_SCAN = 1024 * 1024
+
+
 def header_closed(p: Path) -> bool:
     try:
         size = p.stat().st_size
+        scan = min(size, MAX_HEADER_SCAN)
         with open(p, "rb") as f:
-            head = f.read(4096)
+            head = f.read(scan)
     except OSError:
         return False
     if len(head) < 44 or head[:4] != b"RIFF" or head[8:12] != b"WAVE":
@@ -54,7 +61,9 @@ def header_closed(p: Path) -> bool:
         if cid == b"data":
             return csz > 0 and riff == size - 8
         i += 8 + csz + (csz & 1)
-    return True  # 没有 data 块却已到文件尾 = 已收工（空录音另行处理）
+    # 只有把整个文件都扫完仍没看到 data 块，才能断言“已收工”。
+    # 若只是窗口用完，必须返回 False，交给“大小稳定”信号判断。
+    return scan >= size
 
 
 def main() -> int:
@@ -156,8 +165,14 @@ def _transcribe(src: Path, log, engine_override: str | None = None,
     info = sf.info(str(src))
     sr = int(info.samplerate)
     total = int(info.frames)
-    dur = total / sr
+    dur = total / sr if sr else 0.0
     log(f"音频 {dur/60:.1f} 分钟 @ {sr}Hz（{total} 帧）")
+    # 帧数为 0 基本只有两种可能：空文件，或录制被强杀后 WAV 头没回填。
+    # 继续跑会生成空产物并打印“✓ 全部完成”，是本项目反复踩过的假成功。
+    if sr <= 0 or total <= 0 or dur <= 0:
+        log(f"✗ 音频帧数为 0（total={total}, sr={sr}）：文件可能未正常收尾，"
+            f"拒绝生成空产物")
+        return 3
 
     cfg = userconfig.build_config_from_user(Config())
     if engine_override:
@@ -243,7 +258,10 @@ def _transcribe(src: Path, log, engine_override: str | None = None,
             changed = sum(1 for a, b in zip(lines, fixed) if a and b and a != b)
             for seg, new in zip(sess.segments, fixed):
                 if new and new != seg["text"]:
-                    seg["raw_text"] = seg["text"]
+                    # 不覆盖已有的 raw_text（展开前的原始文本）；
+                    # 原始 ASR 文本另有 asr_text 字段，纠错不得改动。
+                    if not seg.get("raw_text"):
+                        seg["raw_text"] = seg["text"]
                     seg["text"] = new
             log(f"纠错 {changed} 处（重试 {fix_stats.get('retry_count', 0)}，"
                 f"失败批 {fix_stats.get('failed_batches', [])}）")
@@ -266,6 +284,15 @@ def _transcribe(src: Path, log, engine_override: str | None = None,
 
     text_meta = {"model": text_model, "reasoning_effort": effort,
                  "fix": fix_stats, "digest": digest_stats}
+    from wxlive.quality import compute_completeness
+
+    # tail gap ≥120s 等同于“收尾没跑完”；其余丢失来源由统一判定汇总。
+    completeness = compute_completeness(
+        drain_incomplete=gap >= 120,
+        has_content_loss=bool(stats.get("has_content_loss")),
+    )
+    if not completeness["complete"]:
+        log(f"⚠ 产物不完整：{'；'.join(completeness['reasons'])}")
     doc = sess.close(extra_meta={
         "engine": "auto_transcribe_after_stop",
         "asr": stats,
@@ -273,7 +300,8 @@ def _transcribe(src: Path, log, engine_override: str | None = None,
         "audio_seconds": round(dur, 1),
         "last_segment_end": round(float(last_ts), 1),
         "tail_gap_seconds": round(gap, 1),
-        "transcript_complete": bool(sess.segments) and gap < 120,
+        "transcript_complete": bool(sess.segments) and completeness["complete"],
+        "completeness_reasons": completeness["reasons"],
     })
     if digest:
         md = sess.md_path

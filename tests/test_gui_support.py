@@ -198,3 +198,131 @@ def test_build_digest_content_not_lost(monkeypatch):
 
     for i in range(20):
         assert f"句{i}" in captured["prompt"], f"第 {i} 句丢失了"
+
+
+# ---------------- 系统代理诊断：上游 10808 探活 ----------------
+
+def test_diagnose_flags_dead_upstream_behind_tool(monkeypatch):
+    """2023 活着但 10808 挂了：代理链已断，不能假报正常。"""
+    from wxlive import systemproxy as sp
+
+    monkeypatch.setattr(sp, "_tcp_alive",
+                        lambda host, port, timeout=0.5: port == 2023)
+    diag = sp.diagnose({"enabled": True, "server": sp.TOOL_PROXY,
+                        "override": ""})
+
+    assert diag.startswith("⚠"), diag
+    assert "10808" in diag
+    assert "不通" in diag
+
+
+def test_diagnose_flags_dead_fixed_proxy(monkeypatch):
+    """系统代理就是 10808 但没人监听：必须报警。"""
+    from wxlive import systemproxy as sp
+
+    monkeypatch.setattr(sp, "_tcp_alive", lambda *a, **k: False)
+    diag = sp.diagnose({"enabled": True, "server": sp.FIXED_PROXY,
+                        "override": ""})
+
+    assert diag.startswith("⚠"), diag
+    assert "10808" in diag
+
+
+def test_diagnose_ok_when_tool_and_upstream_alive(monkeypatch):
+    from wxlive import systemproxy as sp
+
+    monkeypatch.setattr(sp, "_tcp_alive", lambda *a, **k: True)
+    diag = sp.diagnose({"enabled": True, "server": sp.TOOL_PROXY,
+                        "override": ""})
+
+    assert not diag.startswith("⚠"), diag
+    assert "正常" in diag
+
+
+# ---------------- 直播探测：代理环境剥离与错误分类 ----------------
+
+def _stub_probe(monkeypatch, rc: int, stderr: str = "", stdout: str = ""):
+    """替换 ffprobe 的查找与执行，返回捕获到的 kwargs。"""
+    import subprocess
+
+    from wxlive import fetch as F
+
+    seen = {"env": None}
+    monkeypatch.setattr(F.shutil, "which", lambda name: "ffprobe")
+
+    def fake_run(cmd, **kw):
+        seen["env"] = kw.get("env")
+        return subprocess.CompletedProcess(cmd, rc, stdout, stderr)
+
+    monkeypatch.setattr(F.winproc, "run", fake_run)
+    return seen
+
+
+def test_probe_stream_strips_proxy_env(monkeypatch):
+    """ffprobe 不能继承 http_proxy/https_proxy/all_proxy（大小写都剥）。"""
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:10808")
+    monkeypatch.setenv("https_proxy", "http://127.0.0.1:10808")
+    monkeypatch.setenv("ALL_PROXY", "socks5://127.0.0.1:7890")
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1")   # 这个不剥，留着无害
+
+    from wxlive import fetch as F
+
+    seen = _stub_probe(monkeypatch, rc=0, stdout="")
+    F.probe_stream("http://x/y.flv")
+
+    env = seen["env"]
+    assert env is not None, "探测子进程没有传 env，等于继承了代理变量"
+    assert "HTTP_PROXY" not in env
+    assert "https_proxy" not in env
+    assert "ALL_PROXY" not in env
+    assert env.get("NO_PROXY") == "127.0.0.1"
+
+
+def test_probe_stream_403_means_expired(monkeypatch):
+    from wxlive import fetch as F
+
+    _stub_probe(monkeypatch, rc=1,
+                stderr="http://x/y.flv: Server returned 403 Forbidden")
+    ok, why = F.probe_stream("http://x/y.flv")
+
+    assert ok is False
+    assert "失效" in why and "下播" in why
+
+
+def test_probe_stream_network_error_is_not_offline_host(monkeypatch):
+    """连接被拒/代理异常必须报网络问题，不能误导成"主播下播"。"""
+    from wxlive import fetch as F
+
+    _stub_probe(monkeypatch, rc=1,
+                stderr="[http @ 0x1] Connection refused")
+    ok, why = F.probe_stream("http://x/y.flv")
+
+    assert ok is False
+    assert "网络/代理异常" in why
+    assert "不是主播下播" in why
+
+
+def test_probe_stream_timeout_is_network_class(monkeypatch):
+    import subprocess
+
+    from wxlive import fetch as F
+
+    monkeypatch.setattr(F.shutil, "which", lambda name: "ffprobe")
+
+    def boom(cmd, **kw):
+        raise subprocess.TimeoutExpired(cmd, 20)
+
+    monkeypatch.setattr(F.winproc, "run", boom)
+    ok, why = F.probe_stream("http://x/y.flv", timeout=3)
+
+    assert ok is False
+    assert "网络/代理异常" in why
+
+
+def test_probe_stream_success_detects_audio(monkeypatch):
+    from wxlive import fetch as F
+
+    _stub_probe(monkeypatch, rc=0, stdout="codec_type=audio\n")
+    ok, why = F.probe_stream("http://x/y.flv")
+
+    assert ok is True and "音轨" in why

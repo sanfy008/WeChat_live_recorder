@@ -43,6 +43,36 @@ from . import fetch as F
 PAGE_SIZE = 100
 
 
+def _tx_remaining_text(url: str) -> str:
+    """URL 带 ``txTime``（十六进制 unix 秒）时，返回剩余有效期文案。
+
+    视频号 CDN 的签名地址会在 ``txTime`` 到点后 403。旧界面只显示
+    "直播中"，用户不知道还能录多久，往往等 NAS 断在半场才发现。
+    返回空串表示 URL 里没有可解析的 txTime（不显示，不猜）。
+    """
+    import time as _time
+    from urllib.parse import parse_qs, urlsplit
+
+    try:
+        query = parse_qs(urlsplit(url or "").query)
+    except ValueError:
+        return ""
+    raw = (query.get("txTime") or [""])[0].strip()
+    if not raw:
+        return ""
+    try:
+        expires_at = int(raw, 16)
+    except ValueError:
+        return ""
+    left = expires_at - _time.time()
+    if left <= 0:
+        return "地址已过期"
+    minutes = int(left // 60)
+    if minutes < 1:
+        return "剩余不足 1 分钟"
+    return f"剩余约 {minutes} 分钟"
+
+
 class FetchTabMixin:
     """需要宿主类提供：_log(str)、status_var、progress、_run_bg(fn)"""
 
@@ -60,10 +90,18 @@ class FetchTabMixin:
         # 末尾才创建 —— 于是启动时抛 AttributeError（后台线程里，
         # 界面上只表现为状态条永远停在"读取中…"，很容易误判成"读得慢"）。
         self._fetch_items = {}
+        # iid（Treeview 行 id）→ content_id。行必须用 iid 直接绑定，
+        # 不能再靠"标题+作者+发布时间"反查：日志发现的多条直播标题
+        # 可能一模一样，反查会把 A 的地址/状态写到 B 行上（串台）。
+        self._fetch_rows = {}
         self._fetch_busy = False
         self._fetch_proxy_after = None
         self._fetch_cancel = threading.Event()
         self._ui_queue = queue.Queue()
+        # 下载页自己的后台线程句柄。**绝不能复用宿主的 self.worker** ——
+        # 本页每 60 秒就有一次代理自检走 _run_bg，复用会把 gui.py 的
+        # 录制/转写线程句柄冲掉（详见 _run_bg 注释）。
+        self.fetch_worker = None
 
         # ===== 顶部：工具状态 =====
         top = ttk.Frame(f)
@@ -505,15 +543,20 @@ class FetchTabMixin:
                 self._ui(lambda m=msg: messagebox.showwarning("解析失败", m))
                 return
 
-            self._ui(lambda: self._fetch_set_state(
-                it.content_id, "可录制（含音轨）"))
+            remaining = _tx_remaining_text(url)
+            state_text = "可录制（含音轨）"
+            if remaining:
+                state_text += f"，{remaining}"
+            self._ui(lambda: self._fetch_set_state(it.content_id, state_text))
             self._log(f"[解析] 《{it.title}》OK（{src}，{why}）")
             short = url.split("?", 1)[0]
-            self._ui(lambda s2=src, w=why, u=short: messagebox.showinfo(
+            extra = f"有效期：{remaining}\n" if remaining else ""
+            self._ui(lambda s2=src, w=why, u=short, e=extra: messagebox.showinfo(
                 "解析成功",
                 f"《{it.title}》\n\n"
                 f"地址来源：{s2}\n"
-                f"探测结果：{w}\n\n"
+                f"探测结果：{w}\n"
+                f"{e}\n"
                 f"流地址（去掉签名参数）：\n{u}\n\n"
                 f"要录的话点「推送选中项到 NAS」，本机可以关掉。"))
 
@@ -613,11 +656,17 @@ class FetchTabMixin:
         self._run_bg(work)
 
     def _fetch_apply_proxy(self, text: str, diag: str) -> None:
-        """把状态与配色落到界面上。危险状态用橙色。"""
-        self.fetch_proxy_var.set(text)
+        """把状态与配色落到界面上。危险状态用橙色。
+
+        有警告时**显示诊断原话**而不是 describe 的简述：describe 只读
+        注册表、不做探活，无法表达"代理指向 2023 活着但上游 10808 挂了"
+        这类状态；照抄 describe 会把用户看到的状态条又变回"正常"。
+        """
+        warn = diag.startswith("⚠")
+        self.fetch_proxy_var.set(diag if warn else text)
         try:
-            if diag.startswith("⚠"):
-                # 警告：代理指着没人监听的端口，已经在断网了
+            if warn:
+                # 警告：代理链断了（工具没跑 / 上游 10808 不通），已经在断网
                 self.fetch_proxy_label.configure(style="Warn.TLabel")
                 self._log("[代理] " + diag)
             else:
@@ -803,6 +852,7 @@ class FetchTabMixin:
         for row in self.fetch_tree.get_children():
             self.fetch_tree.delete(row)
         self._fetch_items.clear()
+        self._fetch_rows.clear()
 
         if err:
             self.fetch_hint_var.set("读取失败")
@@ -910,6 +960,9 @@ class FetchTabMixin:
                 state_text = "直播中（日志发现）→ 推 NAS"
             else:
                 state_text = "直播中 → 推 NAS"
+            remaining = _tx_remaining_text(getattr(it, "url", "") or "")
+            if remaining:
+                state_text += f"，{remaining}"
             tags = ("live",)
         elif rec:
             dur = float(rec.get("duration") or 0.0)
@@ -918,10 +971,19 @@ class FetchTabMixin:
         else:
             state_text = "待下载"
             tags = ()
-        self.fetch_tree.insert("", "end",
+
+        # 行 id 直接绑 content_id（重复时加 #n 后缀），不再靠文本反查。
+        iid = str(it.content_id)
+        if iid in self._fetch_rows:
+            n = 2
+            while f"{iid}#{n}" in self._fetch_rows:
+                n += 1
+            iid = f"{iid}#{n}"
+        self.fetch_tree.insert("", "end", iid=iid,
                                values=(it.title, it.author or "—",
                                        it.publish_text or "—", state_text),
                                tags=tags)
+        self._fetch_rows[iid] = str(it.content_id)
         self._fetch_items[it.content_id] = it
 
     # ---------- 翻页 ----------
@@ -948,18 +1010,13 @@ class FetchTabMixin:
         self.fetch_tree.selection_set(list(all_rows - cur))
 
     def _fetch_row_cid(self, iid: str) -> str | None:
-        """行 iid → content_id。iid 与 cid 的对应由 _fetch_items 保证。"""
+        """行 iid → content_id（插入时建立的映射，不做文本反查）。"""
         try:
-            vals = self.fetch_tree.item(iid, "values")
+            if not self.fetch_tree.exists(iid):
+                return None
         except tk.TclError:
             return None
-        if len(vals) < 4:
-            return None
-        for cid, it in self._fetch_items.items():
-            if (it.title == vals[0] and (it.author or "—") == vals[1]
-                    and (it.publish_text or "—") == vals[2]):
-                return cid
-        return None
+        return self._fetch_rows.get(iid)
 
     def _fetch_selected_items(self) -> list:
         """选中行 → ContentItem 列表（按列表顺序）。"""
@@ -1275,20 +1332,24 @@ class FetchTabMixin:
     # ---------- 小工具 ----------
 
     def _fetch_set_state(self, cid, state: str) -> None:
-        """按 content_id 更新状态列（表里可能有多行同名，靠 cid 定位）。"""
+        """按 content_id 更新状态列。
+
+        iid 在插入时已经绑定 content_id（``_fetch_rows``），所以这里按
+        映射精确命中。同名主播 / 同标题直播不会再改错行。
+        """
+        key = str(cid)
         try:
-            item = self._fetch_items.get(str(cid))
-            if item is None:
-                return
-            for iid in self.fetch_tree.get_children():
-                vals = list(self.fetch_tree.item(iid, "values"))
+            for iid, mapped in list(self._fetch_rows.items()):
+                if mapped != key:
+                    continue
+                try:
+                    vals = list(self.fetch_tree.item(iid, "values"))
+                except tk.TclError:
+                    continue
                 if len(vals) < 4:
                     continue
-                if (vals[0] == item.title and vals[1] == (item.author or "—")
-                        and vals[2] == (item.publish_text or "—")):
-                    vals[3] = state
-                    self.fetch_tree.item(iid, values=vals)
-                    break
+                vals[3] = state
+                self.fetch_tree.item(iid, values=vals)
         except tk.TclError:
             pass
 
@@ -1384,6 +1445,13 @@ class FetchTabMixin:
             pass
 
     def _run_bg(self, fn) -> None:
-        """在后台线程跑 fn（宿主已有 worker 约定，这里保持一致）。"""
-        self.worker = threading.Thread(target=fn, daemon=True)
-        self.worker.start()
+        """在后台线程跑 fn（只登记到 fetch_worker）。
+
+        为什么**不能**写 ``self.worker``：宿主 ``gui.App`` 用它判断录制/转写
+        是否在跑（"停止录制"按钮、关窗确认都看它）。下载页每 60 秒一次的
+        代理自检、刷新、体检都会走这里；一旦覆写 ``self.worker``，录制中
+        点"停止录制"会被误判成"没在录制"，于是 ``stop_flag.clear()`` 后
+        又起一路录制 —— 两路同时写盘，原来那路再也停不下来。
+        """
+        self.fetch_worker = threading.Thread(target=fn, daemon=True)
+        self.fetch_worker.start()

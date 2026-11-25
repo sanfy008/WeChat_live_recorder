@@ -128,3 +128,77 @@ def test_fallback_factory_is_lazy_until_needed():
     assert e.transcribe(audio())[0]["text"] == "本地"
     assert len(created) == 1
     assert "fallback" in e.stats
+
+
+# ---------- 占位符式失败必须计入熔断（2026-11 审查） ----------
+
+
+class _LossyEngine:
+    """模拟 gemini_asr：不抛异常，但内部落占位并累积 failed_chunks。"""
+
+    def __init__(self, per_call: int = 1) -> None:
+        self.per_call = per_call
+        self.calls = 0
+        self._failed: list[tuple[float, float]] = []
+
+    def transcribe(self, audio, sample_rate=16000):  # noqa: ARG002
+        self.calls += 1
+        for _ in range(self.per_call):
+            self._failed.append((0.0, 1.0))
+        return [{"start": 0.0, "end": 1.0, "text": "占位", "words": []}]
+
+    @property
+    def stats(self):
+        return {"engine": "lossy", "failed_chunks": list(self._failed)}
+
+
+def test_content_loss_counts_toward_circuit_breaker():
+    """failed_chunks 增长必须触发熔断，否则整场都是占位却一直“成功”。"""
+    p = _LossyEngine(per_call=1)
+    f = FakeEngine("fallback", text="本地")
+    e = FallbackEngine(primary=p, fallback=f, max_consecutive_failures=3)
+
+    for _ in range(3):
+        e.transcribe(audio())
+
+    assert e.stats["degraded"] is True
+    # 兼容旧语义：调用返回了仍记 primary_ok；但内容损失单独可见
+    assert e.stats["primary_ok"] == 3
+    assert e.stats["content_failure_calls"] == 3
+    assert e.stats["failed_chunk_count"] == 3
+    assert e.stats["has_content_loss"] is True
+    # 降级后仍保留主引擎统计，供事后核账
+    assert e.stats["primary"]["failed_chunks"]
+
+    e.transcribe(audio())
+    assert p.calls == 3, "熔断后不应再调主引擎"
+    assert f.calls == 1, "熔断后的请求应走本地"
+
+
+def test_single_call_with_many_failed_chunks_degrades():
+    p = _LossyEngine(per_call=3)
+    f = FakeEngine("fallback", text="本地")
+    e = FallbackEngine(primary=p, fallback=f, max_consecutive_failures=3)
+
+    e.transcribe(audio())
+
+    assert e.stats["degraded"] is True
+    assert e.stats["content_failure_calls"] == 1
+
+
+def test_clean_chunk_resets_failure_streak():
+    class _ThenClean(_LossyEngine):
+        def transcribe(self, audio, sample_rate=16000):
+            self.calls += 1
+            if self.calls == 1:
+                self._failed.append((0.0, 1.0))
+            return [{"start": 0.0, "end": 1.0, "text": "ok", "words": []}]
+
+    p = _ThenClean()
+    f = FakeEngine("fallback", text="本地")
+    e = FallbackEngine(primary=p, fallback=f, max_consecutive_failures=2)
+
+    e.transcribe(audio())  # 1 次失败
+    e.transcribe(audio())  # 正常 → 归零
+    e.transcribe(audio())  # 仍正常
+    assert e.stats["degraded"] is False

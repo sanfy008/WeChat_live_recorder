@@ -91,6 +91,48 @@ def test_placeholder_under_one_hour():
     assert "01:05" in p and "02:05" in p
 
 
+def test_compute_completeness_clean_run():
+    result = quality.compute_completeness()
+    assert result["complete"] is True
+    assert result["reasons"] == []
+
+
+@pytest.mark.parametrize(
+    "kwargs,keyword",
+    [
+        ({"drain_incomplete": True}, "drain_timeout"),
+        ({"dropped_chunks": 3}, "capture_dropped_chunks=3"),
+        ({"asr_queue_dropped": 2}, "asr_queue_dropped=2"),
+        ({"asr_spilled": 1}, "asr_spilled=1"),
+        ({"asr_failed_chunks": 4}, "asr_failed_chunks=4"),
+        ({"has_content_loss": True}, "has_content_loss"),
+    ],
+)
+def test_compute_completeness_reports_each_loss_source(kwargs, keyword):
+    result = quality.compute_completeness(**kwargs)
+    assert result["complete"] is False
+    assert keyword in result["reasons"]
+
+
+def test_session_keeps_original_asr_text(tmp_path):
+    """expand_codes 不能覆盖原始 ASR 文本；asr_text 必须保留。"""
+    from wxlive.session import Session
+
+    s = Session(tmp_path, name="raw", record_audio=False)
+    s.add_segments(
+        [{"start": 0.0, "end": 1.0, "text": "小金龙", "words": []}],
+        expand_codes=True,
+    )
+    doc = s.close()
+    seg = doc["segments"][0]
+
+    assert seg["asr_text"] == "小金龙"
+    assert seg["raw_text"] == "小金龙"
+    assert "祈福新邨" in seg["text"]
+    # 原子写入不能留下临时文件
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
 def test_placeholder_is_stable_for_word_lexicon():
     """占位文案不能被词表改坏（实测过一遍，这里锁死）。"""
     from wxlive import lexicon

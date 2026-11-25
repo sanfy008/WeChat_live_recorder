@@ -215,6 +215,41 @@ def test_placeholder_covers_whole_chunk_not_fragments(monkeypatch):
     assert g._failed_chunks[0] == (0.0, 110.0)
 
 
+def test_partial_failure_keeps_sibling_content(monkeypatch):
+    """三分后只有最后一个子块失败时，前两块的真实内容不能被整块占位吞掉。
+
+    旧实现用 `a() + b() + c()`：c 抛异常会把 a/b 的结果一起作废，
+    最终整块 110s 变一个占位。这里锁定“只损失失败子块”的行为。
+    """
+    g = GeminiASR(model="dummy", retry_delays=(0, 0, 0))
+    good = "这一段是主播正常在讲的内容，学校名字和班型都说得很清楚。" * 3
+
+    calls = {"n": 0}
+
+    def fake_call(pcm):  # noqa: ARG001
+        calls["n"] += 1
+        # 1-4：整块的首次 + 3 次退避重试，全幻觉 → 进入三分
+        # 5-6：前两个子块正常
+        # 7 以后：最后一个子块及其所有再切分全失败
+        if calls["n"] <= 4 or calls["n"] >= 7:
+            return "抱歉，我无法访问您提到的音频文件 `[attachment audio/wav]`。"
+        return good
+
+    monkeypatch.setattr(g, "_call_once", fake_call)
+    audio = np.zeros(16000 * 110, dtype=np.float32)
+    out = g.transcribe(audio, 16000)
+
+    texts = [s["text"] for s in out]
+    assert any("正常在讲" in t for t in texts), "成功子块的内容被丢掉了"
+    assert any("转写失败" in t for t in texts), "失败子块必须留下可见占位"
+    assert len(out) > 1, "不应退化成整块一个占位"
+    # 失败区间应只覆盖最后一个子块，而不是整块 110s
+    assert len(g._failed_chunks) == 1
+    start, end = g._failed_chunks[0]
+    assert end == 110.0
+    assert 60 < start < 90, f"失败区间应从第三段开始，实际 {start}"
+
+
 def test_recovery_offsets_boundary_for_normal_audio(monkeypatch):
     """边界块被判异常但内容其实正常时，切分后必须能救回来。
 
