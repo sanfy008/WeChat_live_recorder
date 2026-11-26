@@ -342,6 +342,40 @@ def resolve_stream_url(item: ContentItem, api: str = DEFAULT_API,
     )
 
 
+_PROXY_ENV_KEYS = frozenset({"http_proxy", "https_proxy", "all_proxy"})
+
+# 4xx：地址/签名层面失败，才是"主播下播 / 地址过期"。
+_EXPIRED_HINTS = ("403", "404", "410", "forbidden")
+# 连接/代理层面失败：不能据此说主播下播。
+_NETWORK_HINTS = (
+    "proxy", "connection refused", "connection reset",
+    "network is unreachable", "no route to host", "failed to resolve",
+    "name or service not known", "temporary failure in name resolution",
+    "connection timed out", "operation timed out", "i/o error",
+    "errno 101", "errno 111",
+)
+
+
+def _env_without_http_proxy() -> dict[str, str]:
+    """复制当前环境，剥掉 http_proxy / https_proxy / all_proxy（大小写都剥）。
+
+    ffmpeg/ffprobe 的 HTTP 协议层会读这些环境变量。本机出口 10808
+    （Clash）异常时，ffprobe 连代理失败返回非 0，旧实现会把它统一说成
+    "主播已下播"，把网络问题误判成内容问题。探测直播流应该直连 CDN，
+    所以这里显式去掉代理环境（只影响本次子进程，不改全局）。
+    """
+    return {k: v for k, v in os.environ.items()
+            if k.lower() not in _PROXY_ENV_KEYS}
+
+
+def _last_error_line(stderr: str, limit: int = 200) -> str:
+    for line in reversed((stderr or "").splitlines()):
+        text = line.strip()
+        if text:
+            return text[:limit]
+    return ""
+
+
 def probe_stream(url: str, timeout: int = 12) -> tuple:
     """探测直播流当下是否真的能拉。返回 (ok, 说明)。
 
@@ -353,6 +387,10 @@ def probe_stream(url: str, timeout: int = 12) -> tuple:
     用 ffprobe 而不用 HTTP HEAD：直播是持续流，没有 Content-Length，
     HEAD 只能判断 403/404，判不出"签名有效但主播已下播"这种最常见的情况。
     ffprobe 能真的读到音轨 = 主播此刻在播。
+
+    错误分类很关键：只有 403/404/410 才提示"主播已下播/签名过期"；
+    连接被拒、超时、DNS 失败、代理异常等一律报"网络/代理异常"，
+    否则用户会被误导回微信重开一个本来还能拉的直播间。
     """
     exe = shutil.which("ffprobe")
     if not exe:
@@ -368,18 +406,30 @@ def probe_stream(url: str, timeout: int = 12) -> tuple:
     try:
         r = winproc.run(cmd, capture_output=True, text=True,
                         encoding="utf-8", errors="replace",
-                        timeout=timeout + 8)
+                        timeout=timeout + 8,
+                        env=_env_without_http_proxy())
     except subprocess.TimeoutExpired:
-        return False, "探测超时（主播可能已下播）"
+        return False, (f"探测超时（网络/代理异常，未能确认主播是否在播）："
+                       f"{timeout}s 内没有响应")
     except Exception as exc:  # noqa: BLE001
-        return False, type(exc).__name__
+        return False, f"探测失败（网络/代理异常）：{type(exc).__name__}"
 
     out = r.stdout or ""
     if r.returncode == 0 and "codec_type=audio" in out:
         return True, "可拉流（含音轨）"
     if r.returncode == 0:
         return False, "能连但没有音轨"
-    return False, "地址已失效（多半是主播已下播）"
+
+    tail = _last_error_line(r.stderr)
+    low = tail.lower()
+    if any(h in low for h in _EXPIRED_HINTS):
+        detail = f"：{tail}" if tail else ""
+        return False, f"地址已失效（HTTP 4xx，多半是主播已下播或签名过期）{detail}"
+    if any(h in low for h in _NETWORK_HINTS):
+        detail = f"：{tail}" if tail else ""
+        return False, f"探测失败（网络/代理异常，不是主播下播）{detail}"
+    detail = f"：{tail}" if tail else ""
+    return False, f"探测失败（ffprobe rc={r.returncode}）{detail}"
 
 
 def resolve_playable_stream(item: ContentItem, api: str = DEFAULT_API,

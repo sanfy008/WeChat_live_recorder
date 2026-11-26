@@ -35,6 +35,25 @@ from . import winproc
 AUDIO_EXTS = (".wav", ".m4a", ".mp3", ".aac", ".flac", ".ogg", ".opus")
 
 
+class FFmpegConfigError(RuntimeError):
+    """显式配置的 WXLIVE_FFMPEG 不可用。
+
+    单独成类是为了让调用方能区分"没装 ffmpeg"和"配置指向了一个坏路径"，
+    并且**绝不能**静默回退到容器内置版本（见 find_ffmpeg 注释）。
+    """
+
+
+def _is_executable(path: str) -> bool:
+    p = Path(path)
+    if not p.is_file():
+        return False
+    if os.name == "nt":
+        # Windows 上 os.access(X_OK) 基本只等于"存在"，而 .exe 后缀本身
+        # 已足够说明可执行性；没后缀的 .bat/.cmd 也能被 CreateProcess 处理。
+        return True
+    return os.access(str(p), os.X_OK)
+
+
 def find_ffmpeg() -> str | None:
     """找 ffmpeg。
 
@@ -47,9 +66,22 @@ def find_ffmpeg() -> str | None:
       fnOS 自带的 /usr/trim/lib/mediasrv/ffmpeg 8.1.1-mediasrv 可以。
       所以镜像里那份旧版必须能被显式覆盖掉 —— 光靠 PATH 顺序不够可靠，
       因为镜像里的 /usr/bin/ffmpeg 在 PATH 里必然排前面。
+
+    **显式配置失效时必须报错，不能回退**：
+      NAS 升级/换代后 /usr/trim 路径变化、或 bind mount 源缺失时，Docker
+      会在容器内建一个空目录，启动看起来一切正常。若此时静默回退到
+      镜像内置 ffmpeg，就会重演"任务显示 recording、产物 0 字节"的静默
+      失败（dfa199c 复盘）。所以 env 一旦设置就只认它。
     """
     env = os.environ.get("WXLIVE_FFMPEG", "").strip()
-    if env and Path(env).exists():
+    if env:
+        if not _is_executable(env):
+            raise FFmpegConfigError(
+                f"WXLIVE_FFMPEG 指向的 ffmpeg 不存在或不可执行：{env}。"
+                "请检查宿主机路径/bind mount 后重启容器（不会回退到容器内置 "
+                "ffmpeg：它缺少该直播流所需的视频/音频解码能力，会静默产出 "
+                "0 字节录音）。"
+            )
         return env
 
     p = shutil.which("ffmpeg")
@@ -70,7 +102,11 @@ def probe_url(url: str, timeout: int = 20, decrypt_key: int = 0) -> dict:
 
     用 ffprobe 而不是直接下载，避免拉整个流。
     """
-    ff = find_ffmpeg()
+    try:
+        ff = find_ffmpeg()
+    except FFmpegConfigError as exc:
+        # 配置错误要以"探测失败"的形式返回，而不是 500 —— 页面能直接展示原因
+        return {"ok": False, "error": str(exc)[:300]}
     if not ff:
         return {"ok": False, "error": "未找到 ffmpeg，请先安装并加入 PATH"}
 
@@ -394,6 +430,9 @@ class StreamRecorder:
         self.errors: list[str] = []
         # 实际交给 ffmpeg 的地址（可能是换成 IPv4 后的版本）
         self._effective_url = self.url
+        # 收尾归因用的标记（由上层设置/由看门狗设置），决定 stop_reason
+        self.user_stopped = False
+        self.stall_killed = False
 
     def _log(self, msg: str) -> None:
         if self.log_cb:
@@ -512,6 +551,7 @@ class StreamRecorder:
                         self._log("[stream] 连续断流，停止。地址可能已过期，需重新获取。")
                         # 必须真的杀掉进程：只 break 会留下"进程活着但不再写数据"的僵尸，
                         # `running` 仍为 True，上层 watcher 会永远等下去（对立性审查 H1）。
+                        self.stall_killed = True
                         self._kill_proc()
                         break
                     last_grow = time.time()
@@ -554,6 +594,11 @@ class StreamRecorder:
     @property
     def running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
+
+    @property
+    def exit_code(self) -> int | None:
+        """ffmpeg 的退出码（进程还没结束时为 None）。用于收尾归因。"""
+        return self._proc.poll() if self._proc is not None else None
 
     def status(self) -> str:
         if not self.out_path or not self.out_path.exists():

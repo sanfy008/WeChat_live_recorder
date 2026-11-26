@@ -66,8 +66,174 @@ def test_runner_recovers_interrupted_jobs_on_startup(tmp_path: Path):
     try:
         j1 = runner.get_job("j1")
         j2 = runner.get_job("j2")
-        assert j1 is not None and j1["status"] == "interrupted"
+        # 录制中的任务无法续录（流连接已随进程消失）→ failed，而不是永远 recording
+        assert j1 is not None and j1["status"] == "failed"
+        assert j1["stop_reason"] == "service_restart"
+        assert j1["truncated"] is True
+        assert "服务重启" in j1["error"]
         assert j2 is not None and j2["status"] == "completed"
+    finally:
+        runner.shutdown()
+
+
+def test_runner_resumes_queued_job_with_valid_audio(tmp_path: Path):
+    """重启后仍有有效音频的 queued/transcribing 任务要自动重新入队。"""
+    rec = tmp_path / "recordings"
+    rec.mkdir(parents=True)
+    audio = rec / "20261123_120000_断点续转_stream.wav"
+    audio.write_bytes(_make_wav_bytes(seconds=1.0))
+
+    (tmp_path / "jobs.json").write_text(json.dumps({
+        "j_resume": {
+            "id": "j_resume", "title": "断点续转", "status": "transcribing",
+            "audio_path": str(audio), "created_at": time.time(), "logs": [],
+            "progress_pct": 40.0, "error": "",
+        },
+    }, ensure_ascii=False), encoding="utf-8")
+
+    runner = NasJobRunner(data_dir=tmp_path, engine_factory=lambda t, l: _FakeEngine())
+    try:
+        deadline = time.time() + 10.0
+        job = {}
+        while time.time() < deadline:
+            job = runner.get_job("j_resume") or {}
+            if job.get("status") in ("completed", "failed"):
+                break
+            time.sleep(0.05)
+        assert job.get("status") == "completed", job
+        assert job.get("sentence_count") == 2
+    finally:
+        runner.shutdown()
+
+
+def test_runner_resume_marks_failed_when_audio_missing(tmp_path: Path):
+    """重启时 queued 但音频已丢失 → failed，不能无限排队。"""
+    (tmp_path / "jobs.json").write_text(json.dumps({
+        "j_gone": {
+            "id": "j_gone", "title": "音频丢了", "status": "queued",
+            "audio_path": str(tmp_path / "recordings" / "nope.wav"),
+            "created_at": time.time(), "logs": [],
+        },
+    }, ensure_ascii=False), encoding="utf-8")
+
+    runner = NasJobRunner(data_dir=tmp_path, engine_factory=lambda t, l: _FakeEngine())
+    try:
+        job = runner.get_job("j_gone") or {}
+        assert job.get("status") == "failed"
+        assert "有效音频" in job.get("error", "")
+    finally:
+        runner.shutdown()
+
+
+def test_start_stream_failure_marks_job_failed_not_recording(tmp_path: Path, monkeypatch):
+    """P0 回归：rec.start() 抛异常时任务必须落 failed，不能永久卡 recording。"""
+    from wxlive import stream_capture
+
+    def _boom(self):  # noqa: ANN001
+        raise OSError("模拟：宿主 ffmpeg 缺少 .so")
+
+    monkeypatch.setattr(stream_capture.StreamRecorder, "start", _boom, raising=True)
+    # 不依赖本机是否装了 ffmpeg，直接让前置检查通过
+    import wxlive.nas_runner as _nr
+    monkeypatch.setattr(_nr, "find_ffmpeg", lambda: "ffmpeg")
+
+    runner = NasJobRunner(data_dir=tmp_path, engine_factory=lambda t, l: _FakeEngine())
+    try:
+        with pytest.raises(RuntimeError, match="启动拉流录制失败"):
+            runner.start_stream_job("https://example.com/live.flv", name="启动失败场")
+
+        jobs = runner.list_jobs()
+        assert len(jobs) == 1
+        job = jobs[0]
+        assert job["status"] == "failed", job
+        assert "启动拉流录制失败" in job["error"]
+        assert job["stop_reason"] == "ffmpeg_error"
+        assert job["truncated"] is True
+        assert runner._recorders == {}
+    finally:
+        runner.shutdown()
+
+
+def test_classify_stop_reason_codes():
+    """收尾归因：404 / 403 / 网络错误 / 崩溃 / 用户停止要能区分。"""
+    from wxlive.nas_runner import classify_stop_reason
+
+    class _Rec:
+        def __init__(self, errors=(), **kw):
+            self.errors = list(errors)
+            self.user_stopped = kw.get("user_stopped", False)
+            self.stall_killed = kw.get("stall_killed", False)
+
+    assert classify_stop_reason(_Rec(["HTTP error 404 Not Found"]))[0] == "stream_ended_404"
+    assert classify_stop_reason(_Rec(["Server returned 403 Forbidden"]))[0] == "auth_expired_403"
+    assert classify_stop_reason(_Rec(["Connection timed out"]))[0] == "network_error"
+    assert classify_stop_reason(_Rec([]), exit_code=1)[0] == "ffmpeg_error"
+    assert classify_stop_reason(_Rec([]), exit_code=0)[0] == "stream_ended"
+    assert classify_stop_reason(_Rec(user_stopped=True))[0] == "user_stop"
+    assert classify_stop_reason(_Rec(stall_killed=True))[0] == "watchdog_stalled"
+
+
+def test_meta_asr_records_per_job_usage(tmp_path: Path):
+    """meta.asr 不能泄漏单例累计统计（audio_seconds=22502.3 那种）。"""
+    class _CumulativeEngine(_FakeEngine):
+        @property
+        def stats(self) -> dict:
+            # 模拟进程级单例的累计值
+            return {
+                "backend": "fake", "model": "fake-model", "num_threads": 2,
+                "audio_seconds": 22502.3, "infer_seconds": 9999.0, "rtf": 0.44,
+            }
+
+    wav_bytes = _make_wav_bytes(seconds=1.0)
+    runner = NasJobRunner(data_dir=tmp_path,
+                          engine_factory=lambda t, l: _CumulativeEngine())
+    app = create_app(runner=runner)
+    try:
+        with TestClient(app) as client:
+            r = client.post(
+                "/api/jobs/upload",
+                data={"name": "单场用量", "auto_transcribe": "true"},
+                files={"file": ("usage.wav", io.BytesIO(wav_bytes), "audio/wav")},
+            )
+            jid = r.json()["id"]
+            deadline = time.time() + 10.0
+            job = {}
+            while time.time() < deadline:
+                job = client.get(f"/api/jobs/{jid}").json()
+                if job["status"] in ("completed", "failed"):
+                    break
+                time.sleep(0.05)
+            assert job["status"] == "completed", job
+
+            doc = json.loads(Path(job["json_path"]).read_text(encoding="utf-8"))
+            asr = doc["meta"]["asr"]
+            assert asr["backend"] == "fake"
+            assert 0.5 <= asr["audio_seconds"] <= 2.0, asr
+            assert asr["infer_seconds"] < 60.0, asr
+            assert asr["rtf"] != 0.44, "rtf 用了单例累计值"
+    finally:
+        runner.shutdown()
+
+
+def test_library_download_allows_chinese_stem(tmp_path: Path):
+    """中文标题目录必须能单条下载（此前被 ASCII 正则一律 400）。"""
+    from urllib.parse import quote
+
+    runner = NasJobRunner(data_dir=tmp_path, engine_factory=lambda t, l: _FakeEngine())
+    try:
+        d = runner.transcripts_dir / "20261123_120000_家长必看专场_stream"
+        d.mkdir(parents=True)
+        (d / "a.md").write_text("# 标题\n\n中文场次正文。\n", encoding="utf-8")
+        (d / "a.json").write_text('{"segments":[]}', encoding="utf-8")
+
+        app = create_app(runner=runner)
+        with TestClient(app) as client:
+            stem = quote(d.name)
+            r = client.get(f"/api/library/{stem}/download/md")
+            assert r.status_code == 200, r.text
+            assert "中文场次正文" in r.text
+            r2 = client.get(f"/api/library/{stem}/download/json")
+            assert r2.status_code == 200, r2.text
     finally:
         runner.shutdown()
 

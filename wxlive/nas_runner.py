@@ -4,7 +4,8 @@
 1. 与 HTTP 框架（FastAPI）解耦，便于单元测试和本地/Docker 复用。
 2. 零 Windows 依赖：仅使用 ffmpeg（流拉取/转码）+ SenseVoice/ONNX + soundfile + postprocess。
 3. 崩溃安全与内存克制：
-   - 任务状态持久化到 `<data_dir>/jobs.json`，重启后自动恢复中断任务为 `interrupted`。
+   - 任务状态持久化到 `<data_dir>/jobs.json`；重启时录制中的任务标为 `failed`
+     （服务重启中断），仍有有效音频的排队/转写任务自动重新入队。
    - 音频按 300s 块流式读盘转写，不在内存中一次性加载整场录音。
    - 单 ASR Worker 串行消费转写队列，防止并发推理把 7.6GB NAS 内存撑爆。
 """
@@ -68,6 +69,86 @@ def is_placeholder_title(title: str) -> bool:
     """判断任务标题是否只是时间占位名或抓流原始数字 ID（适合 AI 自动重命名）。"""
     t = (title or "").strip()
     return (not t) or bool(_PLACEHOLDER_TITLE_RE.match(t))
+
+
+# ---------------- 录制收尾归因 ----------------
+#
+# `stop_reason` 是**机器可判**的短码，UI/自动化据此区分"正常收工"与"异常中断"；
+# `stop_reason_text` 是给人看的中文说明。历史数据里只有人类字符串，所以
+# 读取端一律 `stop_reason_text or stop_reason`。
+STOP_REASON_CODES = (
+    "user_stop",          # 用户点停止
+    "silence_timeout",    # 连续静音达到阈值 → 判定直播结束
+    "stream_ended",       # ffmpeg 正常退出（服务端关闭连接）
+    "stream_ended_404",   # 地址返回 404/410：主播下播或签名地址失效
+    "auth_expired_403",   # 401/403：签名过期或无权限
+    "network_error",      # DNS/超时/连接重置等
+    "ffmpeg_error",       # ffmpeg 非零退出且原因不明
+    "watchdog_stalled",   # 长时间无新数据，看门狗终止
+    "max_record_limit",   # 达到单任务时长/体积上限
+    "service_restart",    # 服务重启导致录制中断
+    "unknown",
+)
+
+# 这些原因属于"正常收工"，其余一律视为可能截断（truncated=True）。
+# 注意 stream_ended_404 也算截断：正常的"主播下播"通常会先出现静音判停；
+# 没看到静音就因为 404 断掉，多半是签名地址先失效了，录音可能不完整。
+COMPLETE_STOP_REASONS = {"user_stop", "silence_timeout", "stream_ended"}
+
+_NET_ERROR_MARKERS = (
+    "no route to host",
+    "network is unreachable",
+    "connection refused",
+    "connection reset",
+    "connection timed out",
+    "timed out",
+    "timeout",
+    "temporary failure in name resolution",
+    "name or service not known",
+    "broken pipe",
+)
+
+
+def classify_stop_reason(rec: Any, exit_code: int | None = None) -> tuple[str, str]:
+    """把一次录制收尾归类为 (code, 中文说明)。
+
+    只看 ffmpeg 的 stderr 尾部与退出码，**不解析 URL**：
+    签名 URL 里可能恰好出现 "403"/"404" 子串，必须匹配 ffmpeg 的实际措辞。
+    """
+    if getattr(rec, "user_stopped", False):
+        return "user_stop", "用户手动停止录制"
+    if getattr(rec, "stall_killed", False):
+        return "watchdog_stalled", "连续无新数据，看门狗判定断流并终止"
+
+    errors = getattr(rec, "errors", None) or []
+    text = "\n".join(str(e) for e in list(errors)[-20:]).lower()
+
+    if ("404 not found" in text or "server returned 404" in text
+            or "http error 404" in text or "server returned 410" in text):
+        return "stream_ended_404", "流地址返回 404/410（直播已结束或签名地址失效）"
+    if ("403 forbidden" in text or "server returned 403" in text
+            or "http error 403" in text or "401 unauthorized" in text
+            or "server returned 401" in text):
+        return "auth_expired_403", "流地址返回 401/403（签名过期或无权限）"
+
+    for marker in _NET_ERROR_MARKERS:
+        if marker in text:
+            return "network_error", f"网络错误（{marker}）"
+
+    if exit_code not in (None, 0):
+        return "ffmpeg_error", f"ffmpeg 异常退出（码 {exit_code}）"
+    return "stream_ended", "流已结束（ffmpeg 正常退出）"
+
+
+def _is_nonempty_audio(path: Path | str | None) -> bool:
+    """文件存在且超过 WAV 头长度（44 字节），才算"有有效音频"。"""
+    if not path:
+        return False
+    try:
+        p = Path(path)
+        return p.is_file() and p.stat().st_size > 44
+    except OSError:
+        return False
 
 
 def _atomic_write_json(path: Path, data: Any) -> None:
@@ -259,6 +340,10 @@ class NasJobRunner:
         )
         self._worker.start()
 
+        # 服务重启前未跑完的转写，音频还在就自动接上（_load_jobs 已判过有效性）
+        for resume_id in self._resume_queue:
+            self._asr_queue.put(resume_id)
+
         # 保留策略状态（供 UI 展示"上次清理时间/释放了多少"）
         self._last_cleanup: dict[str, Any] = {}
         self._cleanup_thread: threading.Thread | None = None
@@ -410,6 +495,8 @@ class NasJobRunner:
         """
         self._jobs_load_error = ""
         self._jobs_load_skipped = 0
+        # 启动后要自动重新入队的任务（仍有有效音频的 queued/transcribing）
+        self._resume_queue: list[str] = []
 
         if not self.jobs_path.exists():
             return {}
@@ -437,11 +524,38 @@ class NasJobRunner:
                 bad_keys.append(str(key))
                 continue
             if status in ACTIVE_STATUSES:
-                job["status"] = "interrupted"
-                job["error"] = "服务重启，任务已中断（如有已录制音频可点击重新转写）"
+                # 重启后的恢复策略：
+                #   recording    → 流连接已随进程消失，无法续录，标 failed 并保留音频
+                #   queued/transcribing → 音频文件还在，自动重新排队（无人值守场景
+                #                          升级/重启后不必人工逐个点"重新转写"）
+                #   converting/postprocessing → 标 interrupted，产物需人工确认重跑
+                if status in ("queued", "transcribing"):
+                    if _is_nonempty_audio(job.get("audio_path")):
+                        job["status"] = "queued"
+                        job["error"] = ""
+                        job["progress_pct"] = 0.0
+                        self._resume_queue.append(str(key))
+                        note = "服务重启，检测到有效音频，已自动重新加入转写队列"
+                    else:
+                        job["status"] = "failed"
+                        job["error"] = "服务重启，且找不到有效音频文件，无法继续转写"
+                        job["truncated"] = True
+                        note = "服务重启，音频缺失，任务标记为 failed"
+                elif status == "recording":
+                    job["status"] = "failed"
+                    job["error"] = "服务重启，录制已中断（音频可能不完整，可点击重新转写）"
+                    job["stop_reason"] = job.get("stop_reason") or "service_restart"
+                    job["stop_reason_text"] = (
+                        job.get("stop_reason_text") or "服务重启，录制中断")
+                    job["truncated"] = True
+                    note = "服务重启，录制中断，状态恢复为 failed"
+                else:
+                    job["status"] = "interrupted"
+                    job["error"] = "服务重启，任务已中断（可点击重新转写或重跑 AI 整理）"
+                    note = "服务重启，状态恢复为 interrupted"
                 try:
                     job.setdefault("logs", []).append(
-                        f"[{time.strftime('%H:%M:%S')}] 服务重启，状态恢复为 interrupted"
+                        f"[{time.strftime('%H:%M:%S')}] {note}"
                     )
                 except Exception:  # noqa: BLE001
                     job["logs"] = []
@@ -615,6 +729,11 @@ class NasJobRunner:
             "rtf": 0.0,
             "llm_status": "",
             "error": "",
+            # 收尾归因：录制结束后由 _watch_recorder 写入结构化原因
+            "stop_reason": "",
+            "stop_reason_text": "",
+            "truncated": False,
+            "source_path": "",
             "auto_transcribe": auto_tx,
             "logs": [],
         }
@@ -645,7 +764,31 @@ class NasJobRunner:
             self._recorders[job_id] = rec
             self._save_jobs()
 
-        rec.start()
+        # 启动失败必须立刻落到 failed：job 已经持久化为 recording，若异常直接
+        # 冒泡，任务会永久卡在"录制中"（清理跳过、删除拒绝、无 API 可清）。
+        try:
+            rec.start()
+        except Exception as exc:  # noqa: BLE001
+            err = f"启动拉流录制失败：{exc}"[:300]
+            with self._lock:
+                self._recorders.pop(job_id, None)
+            # 清掉可能已生成的空壳文件（0/44 字节）
+            try:
+                if rec.out_path and rec.out_path.exists() and rec.out_path.stat().st_size <= 44:
+                    rec.out_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._update_job(
+                job_id,
+                status="failed",
+                error=err,
+                truncated=True,
+                stop_reason="ffmpeg_error",
+                stop_reason_text=err,
+            )
+            self._append_log(job_id, err)
+            raise RuntimeError(err) from exc
+
         if rec.out_path:
             self._update_job(job_id, audio_path=str(rec.out_path))
         self._append_log(job_id, f"开始拉流录制：{title}")
@@ -768,7 +911,9 @@ class NasJobRunner:
             require_sound_before=True,
             min_record_seconds=min_secs,
         )
-        stop_reason = ""
+        # 结构化归因：code 给机读，text 给人读；两者都会持久化到 job
+        stop_code = ""
+        stop_text = ""
         # 每 3 秒做一次静音采样：块长 0.5s，3 秒窗口能覆盖 6 个块，
         # 既够判静音，又不会因为频繁 seek 拖慢磁盘。
         silence_every = 3.0
@@ -798,12 +943,14 @@ class NasJobRunner:
             # ---- 录制上限（对立性审查 H2）----
             # 永不结束且有声音的流会无限增长；磁盘写满后转写/日志全挂。
             if size > 0 and max_bytes and size >= max_bytes:
-                stop_reason = f"达到单任务体积上限 {max_gb} GB，自动停止"
-                self._append_log(job_id, stop_reason)
+                stop_code, stop_text = (
+                    "max_record_limit", f"达到单任务体积上限 {max_gb} GB，自动停止")
+                self._append_log(job_id, stop_text)
                 break
             if max_secs and (now - _t0) >= max_secs:
-                stop_reason = f"达到单任务时长上限 {max_hours} 小时，自动停止"
-                self._append_log(job_id, stop_reason)
+                stop_code, stop_text = (
+                    "max_record_limit", f"达到单任务时长上限 {max_hours} 小时，自动停止")
+                self._append_log(job_id, stop_text)
                 break
 
             # ---- 静音判停 ----
@@ -843,7 +990,7 @@ class NasJobRunner:
                                 f"（阈值 {stop_secs}s，RMS {verdict.rms}）",
                             )
                         if verdict.should_stop:
-                            stop_reason = verdict.reason
+                            stop_code, stop_text = "silence_timeout", verdict.reason
                             self._append_log(job_id, f"自动停止：{verdict.reason}")
                             break
                     elif (now - last_status_log) >= 300:
@@ -864,12 +1011,25 @@ class NasJobRunner:
 
         rec.stop()
 
-        # 如果是因为静音停的，把原因写进 job。
+        # 循环结束但没有任何显式判停 → 进程自己退出了（断流/404/403/网络错误/
+        # 崩溃）。这是最容易把"异常中断"伪装成"正常收工"的分支，必须归因。
+        # exit_code 在 stop() 之前自然退出时会保留真实退出码。
+        if not stop_code and self._shutdown_event.is_set():
+            stop_code, stop_text = "service_restart", "服务正在关闭，录制中断"
+        if not stop_code:
+            stop_code, stop_text = classify_stop_reason(rec, rec.exit_code)
+        truncated = stop_code not in COMPLETE_STOP_REASONS
+
         # 必须持久化：容器重启/进程崩溃后要能知道"这场是静音收工还是异常中断"，
         # 否则事后完全无法归因（persist=False 只写内存，重启即丢，实测复现）。
-        if stop_reason:
-            self._update_job(job_id, stop_reason=stop_reason, persist=True)
-            self._append_log(job_id, f"停止原因：{stop_reason}")
+        self._update_job(
+            job_id,
+            stop_reason=stop_code,
+            stop_reason_text=stop_text,
+            truncated=truncated,
+            persist=True,
+        )
+        self._append_log(job_id, f"停止原因：{stop_text}（{stop_code}）")
 
         with self._lock:
             self._recorders.pop(job_id, None)
@@ -883,7 +1043,10 @@ class NasJobRunner:
         if not out_path or not out_path.exists() or out_path.stat().st_size <= 44:
             err_tail = rec.errors[-1] if rec.errors else "未录到有效音频（流地址可能已失效或无音频轨）"
             self._append_log(job_id, f"录制失败：{err_tail}")
-            self._update_job(job_id, status="failed", error=err_tail)
+            self._update_job(
+                job_id, status="failed", error=err_tail, truncated=True,
+                stop_reason=stop_code, stop_reason_text=stop_text,
+            )
             return
 
         size = out_path.stat().st_size
@@ -917,6 +1080,8 @@ class NasJobRunner:
         if rec is None:
             raise ValueError("该任务当前不在录制中")
         self._append_log(job_id, "收到停止指令，正在收尾 WAV 头…")
+        # 标记成"用户主动停止"，让 watcher 的归因分支不会把它算成 ffmpeg 异常
+        rec.user_stopped = True
         rec.stop()
         # 给 watcher 一点时间完成状态切换
         for _ in range(25):
@@ -976,6 +1141,11 @@ class NasJobRunner:
             "rtf": 0.0,
             "llm_status": "",
             "error": "",
+            "stop_reason": "",
+            "stop_reason_text": "",
+            "truncated": False,
+            # 上传源文件（转码后指向原始 .mp4/.m4a 等），供保留策略清理
+            "source_path": "",
             "auto_transcribe": bool(auto_transcribe),
             "logs": [f"[{time.strftime('%H:%M:%S')}] 已接收上传文件 {dest.name}（{size / 1048576:.1f} MB）"],
         }
@@ -1048,7 +1218,14 @@ class NasJobRunner:
         if r.returncode != 0 or not target.exists() or target.stat().st_size <= 44:
             err = (r.stderr or "ffmpeg 转码失败").strip()[:200]
             raise RuntimeError(err)
-        self._update_job(job_id, audio_path=str(target), audio_bytes=target.stat().st_size)
+        # 记下源文件：转码后 audio_path 指向 .16k.wav，原始 .mp4/.m4a 不再是
+        # audio_path 的引用对象，若不登记就永远不会被保留策略清理（只增不减）。
+        self._update_job(
+            job_id,
+            audio_path=str(target),
+            audio_bytes=target.stat().st_size,
+            source_path=str(src),
+        )
         return target
 
     def _process_asr_job(self, job_id: str) -> None:
@@ -1100,7 +1277,13 @@ class NasJobRunner:
         with sf.SoundFile(str(wav_path)) as f:
             for bi in range(n):
                 if self._shutdown_event.is_set():
-                    self._update_job(job_id, status="interrupted", error="服务正在关闭")
+                    # 保持 queued（而不是 interrupted）：启动恢复逻辑会把
+                    # "有有效音频的 queued/transcribing" 自动重新入队。
+                    self._update_job(
+                        job_id, status="queued",
+                        error="服务正在关闭，已排回队列，重启后继续转写",
+                    )
+                    self._append_log(job_id, "服务关闭，任务保留在队列，重启后继续")
                     return
                 piece = f.read(block, dtype="float32", always_2d=False)
                 if piece is None or len(piece) == 0:
@@ -1143,10 +1326,29 @@ class NasJobRunner:
         )
 
         changed, llm_status = self._run_llm_postprocess(job_id, sess, title)
+
+        # engine.stats 是**进程级累计**（单例复用），直接写进每场 meta 会得到
+        # "audio_seconds=22502.3" 这种不属于本场的数字。这里只取后端静态字段，
+        # 用量一律用本场实测的 dur / asr_elapsed。
+        try:
+            eng_stats = dict(getattr(engine, "stats", {}) or {})
+        except Exception:  # noqa: BLE001
+            eng_stats = {}
+        asr_meta = {
+            k: eng_stats[k]
+            for k in ("backend", "model", "num_threads")
+            if k in eng_stats
+        }
+        asr_meta.update({
+            "audio_seconds": round(dur, 1),
+            "infer_seconds": round(asr_elapsed, 1),
+            "rtf": rtf,
+        })
+
         doc = sess.close(
             extra_meta={
                 "engine": "nas_runner",
-                "asr": getattr(engine, "stats", {}) or {},
+                "asr": asr_meta,
                 "audio_seconds": round(dur, 1),
                 "last_segment_end": round(last_ts, 1),
                 "tail_gap_seconds": round(gap, 1),
@@ -1163,14 +1365,17 @@ class NasJobRunner:
                 encoding="utf-8",
             )
 
+        dropped_source = False
         if not keep_audio and wav_path.exists():
             wav_path.unlink(missing_ok=True)
             if src != wav_path and src.exists():
                 src.unlink(missing_ok=True)
+                dropped_source = True
 
         self._update_job(
             job_id,
             persist=False,
+            **({"source_path": ""} if dropped_source or not keep_audio else {}),
             done_seconds=round(dur, 1),
             sentence_count=len(doc["segments"]),
             changed_count=changed,
@@ -1766,6 +1971,10 @@ class NasJobRunner:
             ap = Path(job.get("audio_path") or "")
             if ap.exists() and ap.parent == self.recordings_dir:
                 ap.unlink(missing_ok=True)
+            # 上传转码任务的原始 .mp4/.m4a 也要一起删，否则删任务后仍占盘
+            sp = Path(job.get("source_path") or "")
+            if sp.exists() and sp.parent == self.recordings_dir and sp != ap:
+                sp.unlink(missing_ok=True)
             mp = Path(job.get("md_path") or "")
             if mp.exists() and mp.parent.parent == self.transcripts_dir:
                 shutil.rmtree(mp.parent, ignore_errors=True)

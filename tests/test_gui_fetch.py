@@ -43,9 +43,36 @@ def app(tmp_path, monkeypatch):
     monkeypatch.setattr(F, "discover_live_streams", lambda *a, **kw: [])
     monkeypatch.setattr(F, "discover_feed_videos", lambda *a, **kw: [])
 
+    # App.__init__ 会起后台线程枚举声卡（gui._refresh_devices）。每个用例
+    # 都 new 一个 App 时，上一实例的 PortAudio 还在枚举、下一个已经终止，
+    # pyaudiowpatch 会偶发 native access violation（整个 pytest 进程崩掉）。
+    # 本文件根本不测声卡，桩掉这两个函数即可让用例稳定、且不碰真实设备。
+    import wxlive.audio_capture as AC
+
+    class _FakeDevice:
+        name = ""
+
+    monkeypatch.setattr(AC, "list_loopback_devices", lambda: [])
+    monkeypatch.setattr(AC, "pick_device", lambda hint="": _FakeDevice())
+
     from wxlive.gui import App
 
-    a = App()
+    # 本机 Python 安装目录是 junction，偶尔有其他进程在挪/扫 Python 目录，
+    # 导致 _tkinter.create 短暂读不到 tcl 库（"Can't find a usable tk.tcl"）。
+    # 这是环境级的瞬时错误，短重试即可，和被测代码无关。
+    import time as _time
+
+    last_exc = None
+    for _ in range(5):
+        try:
+            a = App()
+            break
+        except tk.TclError as exc:
+            last_exc = exc
+            _time.sleep(0.3)
+    else:
+        raise last_exc
+
     a.withdraw()          # 不弹窗
     a._fetch_state = S._empty()   # 每个用例从干净状态开始
     a.update()            # 真正跑一遍事件循环
@@ -74,7 +101,9 @@ def _pump(app, timeout: float = 5.0) -> None:
     while time.time() < deadline:
         app.update()
         q = getattr(app, "_ui_queue", None)
-        w = getattr(app, "worker", None)
+        # 下载页的后台线程登记在 fetch_worker；宿主的 self.worker 是
+        # 录制/转写线程，下载页不应该等它，也不应该覆写它。
+        w = getattr(app, "fetch_worker", None)
         busy_thread = w is not None and w.is_alive()
         pending = q is not None and not q.empty()
         if not busy_thread and not pending:
@@ -714,6 +743,120 @@ def test_proxy_restore_confirmed(app, monkeypatch):
     assert called["n"] == 1
 
 
+# ---------- 线程句柄隔离（60 秒代理自检不能劫持录制线程）----------
+
+def _dead_thread():
+    import threading
+
+    t = threading.Thread(target=lambda: None)
+    t.start()
+    t.join()
+    return t
+
+
+def test_run_bg_does_not_clobber_host_worker(app):
+    """下载页的后台任务只能写 fetch_worker，不能碰宿主的 worker。"""
+    sentinel = _dead_thread()
+    app.worker = sentinel
+
+    app._run_bg(lambda: None)
+    _pump(app)
+
+    assert app.worker is sentinel, "下载页覆写了录制/转写线程句柄"
+    assert isinstance(app.fetch_worker, object)
+    assert app.fetch_worker is not sentinel
+
+
+def test_proxy_poll_does_not_clobber_host_worker(app, monkeypatch):
+    """代理自检（每 60 秒自动触发的那条路径）同样不能动 worker。"""
+    import wxlive.systemproxy as P
+
+    monkeypatch.setattr(P, "read",
+                        lambda: {"enabled": True, "server": P.FIXED_PROXY,
+                                 "override": ""})
+    monkeypatch.setattr(P, "upstream_fixed_alive", lambda: True)
+    sentinel = _dead_thread()
+    app.worker = sentinel
+
+    app._fetch_refresh_proxy()
+    _pump(app)
+
+    assert app.worker is sentinel
+
+
+# ---------- 行 iid 绑定 ----------
+
+def test_tree_rows_use_content_id_as_iid(app, stub_list):
+    """行 iid 直接绑 content_id；同名同作者也不再靠文本反查。"""
+    from wxlive.fetch import ContentItem
+
+    holder, _ = stub_list
+    holder["page"] = _fake_page([
+        ContentItem(content_id="dup1", title="同名直播", url="http://x/1",
+                    author="同一主播"),
+        ContentItem(content_id="dup2", title="同名直播", url="http://x/2",
+                    author="同一主播"),
+    ])
+
+    app._fetch_refresh()
+    _pump(app)
+
+    rows = app.fetch_tree.get_children()
+    assert rows == ("dup1", "dup2")
+    assert app._fetch_row_cid(rows[0]) == "dup1"
+    assert app._fetch_row_cid(rows[1]) == "dup2"
+
+    app.fetch_tree.selection_set(rows[1])
+    assert app._fetch_selected_ids() == ["dup2"]
+
+    # 更新第二行状态不能串到第一行
+    app._fetch_set_state("dup2", "完成 X")
+    assert app.fetch_tree.item(rows[0], "values")[3] == "待下载"
+    assert app.fetch_tree.item(rows[1], "values")[3] == "完成 X"
+
+
+# ---------- txTime 剩余有效期 ----------
+
+def test_tx_remaining_text_reads_hex_txtime():
+    import time as _t
+
+    import wxlive.gui_fetch as GF
+
+    future = int(_t.time()) + 30 * 60 + 30
+    url = f"http://pull-m1.wxlivecdn.com/x.flv?txTime={future:X}&txSecret=a"
+    assert GF._tx_remaining_text(url) == "剩余约 30 分钟"
+
+    past = int(_t.time()) - 60
+    assert GF._tx_remaining_text(f"http://x/y.flv?txTime={past:x}") == "地址已过期"
+    assert GF._tx_remaining_text("http://x/y.flv") == ""
+
+
+def test_discovered_live_shows_remaining_validity(app, stub_list, monkeypatch):
+    """日志发现的直播在状态列里显示签名剩余分钟数。"""
+    import time as _t
+
+    import wxlive.fetch as F
+    from wxlive.fetch import ContentItem
+
+    holder, _ = stub_list
+    future = int(_t.time()) + 42 * 60 + 30
+    url = (f"http://pull-m1.wxlivecdn.com/trtc_1/orig_77_orig.flv"
+           f"?txTime={future:x}&txSecret=abc")
+    holder["lives"] = [ContentItem(content_id="77", title="直播甲",
+                                   url=url, is_live=True, live_id="77")]
+    holder["page"] = _fake_page([])
+    monkeypatch.setattr(F, "probe_stream",
+                        lambda url, timeout=6: (True, "可拉流（含音轨）"))
+
+    app._fetch_refresh()
+    _pump(app)
+
+    rows = app.fetch_tree.get_children()
+    assert len(rows) == 1
+    state = app.fetch_tree.item(rows[0], "values")[3]
+    assert "直播中" in state and "剩余约 42 分钟" in state
+
+
 def test_fetch_health_warns_when_proxy_not_2023(app, monkeypatch):
     """工具 API 正常但系统代理指着 10808 时，体检必须告警而不是报「体检通过」。"""
     import wxlive.fetch as F
@@ -984,5 +1127,3 @@ def test_push_expired_replay_fails_fast_with_clear_video_hint(
     assert "403" in warns[0][1]
     assert "视频/回放" in warns[0][1]
     assert "重新打开该直播" not in warns[0][1]
-
-

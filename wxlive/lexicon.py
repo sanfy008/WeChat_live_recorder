@@ -162,6 +162,10 @@ def to_simplified(text: str) -> str:
             _OPENCC_T2S = OpenCC("t2s")
         except Exception:
             _OPENCC_T2S = None
+            # 内置兜底表只有几十个常用字，大段繁体不会被转换。
+            # 静默降级会让人误以为整份产物已是简体，所以必须提示一次。
+            print("[lexicon][warn] 未安装 opencc，繁转简仅使用内置常用字兜底表"
+                  "（覆盖有限，建议 pip install opencc-python-reimplemented）")
     if _OPENCC_T2S is not None:
         return _OPENCC_T2S.convert(text)
     return text.translate(_TC2SC)
@@ -374,7 +378,13 @@ def _clean_map(d: dict) -> dict:
 
 
 def load(path: Path | None = None) -> dict:
-    """加载外部词表（优先），与内置表合并。"""
+    """加载外部词表（优先），与内置表合并。
+
+    显式传入的 path 不存在时必须告警：静默回退内置表会让“已配置的外部词表”
+    看起来生效、实际全是内置词。path=None 表示使用默认路径，默认不存在
+    只回退不告警（纯本地安装可能就没有 lexicon/）。
+    """
+    explicit = path is not None
     p = path or DEFAULT_PATH
     data = {"schools": list(SCHOOLS), "terms": list(TERMS),
             "codes": dict(CODES), "corrections": dict(CORRECTIONS)}
@@ -387,7 +397,9 @@ def load(path: Path | None = None) -> dict:
             data["corrections"].update(_clean_map(ext.get("corrections", {})))
             print(f"[lexicon] 已加载外部词表 {p.name}（+{len(ext.get('schools', []))} 校名）")
         except Exception as e:  # noqa: BLE001
-            print(f"[lexicon] 外部词表加载失败，用内置表: {e}")
+            print(f"[lexicon][warn] 外部词表加载失败，用内置表: {e}")
+    elif explicit:
+        print(f"[lexicon][warn] 指定的词表文件不存在，回退内置表: {p}")
     return data
 
 

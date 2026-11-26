@@ -1,0 +1,45 @@
+# 构建上下文排除项（镜像只需要 wxlive/ 与 lexicon/）
+#
+# 注意：docker-compose.yml 里 build.context 是仓库根目录（..），
+# Docker/BuildKit 默认读取**上下文根目录**的 .dockerignore，或与
+# Dockerfile 同名的 `Dockerfile.dockerignore`。本文件放在 docker/ 下，
+# 作为排除清单的维护位置；若要让它在 `context: ..` 下真正生效，
+# 需在仓库根目录放同名文件，或把 Dockerfile 改名为
+# docker/Dockerfile 并同时提供 docker/Dockerfile.dockerignore。
+# 无论用哪种方式，下面这些目录都不该进入构建上下文。
+
+# 版本库与编辑器
+.git
+.gitignore
+.gitattributes
+.vscode
+.idea
+
+# 运行时数据（录音/逐字稿/模型缓存，可能有几十 GB）
+output/
+data/
+hf_cache/
+docker/data/
+docker/hf_cache/
+
+# 测试与文档
+tests/
+docs/
+.alma-snapshots/
+*.md
+
+# Python 缓存与虚拟环境
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 打包/临时文件
+*.zip
+*.tmp
+*.log
+.~*

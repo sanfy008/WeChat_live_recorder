@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -29,6 +30,18 @@ def _ts(seconds: float) -> str:
 
 def _safe_part(s: str, fallback: str = "wechat_live") -> str:
     return "".join(c for c in (s or "") if c.isalnum() or c in "-_") or fallback
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """先写同目录临时文件再原子替换。
+
+    长直播收尾时 json/md 可能有数百 KB 到数 MB；直接 write_text 若进程
+    在这几秒内被杀，会留下半截文件。临时文件 + os.replace 保证要么旧版
+    本、要么完整新版。
+    """
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def _file_fingerprint(path: Path) -> dict:
@@ -211,6 +224,12 @@ class Session:
                 "start": round(offset + s["start"], 2),
                 "end": round(offset + s["end"], 2),
                 "text": text,
+                # asr_text 永远是引擎原始输出，后续 expand_codes / LLM 纠错
+                # 只能改 text / raw_text，不能覆盖它 —— 否则原始识别结果
+                # 一旦被展开文本替换就永久丢失，无法追溯。
+                "asr_text": s["text"],
+                # raw_text 表示“展开后、纠错前”的文本（没展开则为 None）。
+                # 纠错代码不得覆盖已有的 raw_text，见 scripts 中的处理。
                 "raw_text": s["text"] if text != s["text"] else None,
                 # 句级时间戳的可信度：云端 Gemini 不返回时间，是按字数摊的估算值
                 # （实测中位偏差 19.3s）；本地 whisper 有真实对齐。
@@ -273,7 +292,9 @@ class Session:
                 **(extra_meta or {}),
             },
         }
-        self.json_path.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write_text(
+            self.json_path, json.dumps(doc, ensure_ascii=False, indent=2)
+        )
 
         # 完整重写 md（补齐可能因节流漏掉的句子）
         # 说明：md 是"给人看 / 给 LLM 分析"的产物，用段落聚合渲染。
@@ -283,7 +304,8 @@ class Session:
 
         groups = _render.group_segments(self.segments)
         body = _render.render_paragraphs(self.segments)
-        self.md_path.write_text(
+        _atomic_write_text(
+            self.md_path,
             f"# 微信直播逐字稿\n\n"
             f"- 会话 ID：`{self.id}`\n"
             f"- 开始时间：{self.started_at.strftime('%Y-%m-%d %H:%M:%S')}\n"
@@ -294,7 +316,6 @@ class Session:
             f"> 本文件为段落聚合版（按直播转折话术断段），便于阅读与分析。\n"
             f"> 需要精确到句和时间戳，请查同名 `.json`。\n\n"
             f"---\n\n{body}\n",
-            encoding="utf-8",
         )
         return doc
 

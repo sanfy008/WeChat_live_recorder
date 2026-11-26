@@ -43,6 +43,9 @@ FIXED_PROXY = "127.0.0.1:10808"
 # 抓流工具的 MITM 端口（它接管系统代理时写这个值）
 TOOL_PROXY = "127.0.0.1:2023"
 
+_FIXED_HOST, _FIXED_PORT = "127.0.0.1", 10808
+_TOOL_HOST, _TOOL_PORT = "127.0.0.1", 2023
+
 _REG_PATH = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
 # winreg 用的相对路径（不含 HKEY_CURRENT_USER 前缀）
 _REG_SUBKEY = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
@@ -218,21 +221,39 @@ def enable_tool_proxy() -> tuple[bool, str]:
     )
 
 
-def tool_still_running() -> bool:
-    """抓流工具是否还在监听 2023（用 TCP 连接探测，不依赖进程名）。"""
+def _tcp_alive(host: str, port: int, timeout: float = 0.5) -> bool:
+    """某个回环端口是否有人监听（TCP 连接探测，不依赖进程名）。"""
     import socket
 
     try:
-        with socket.create_connection(("127.0.0.1", 2023), timeout=1.0):
+        with socket.create_connection((host, port), timeout=timeout):
             return True
     except OSError:
         return False
+
+
+def tool_still_running() -> bool:
+    """抓流工具是否还在监听 2023。"""
+    return _tcp_alive(_TOOL_HOST, _TOOL_PORT, timeout=1.0)
+
+
+def upstream_fixed_alive() -> bool:
+    """本机固定出口 10808 是否真有人监听。
+
+    为什么必须单独探：工具接管时系统代理指向 2023，而 2023 只是 MITM
+    入口，真正的出口是 10808。2023 活着 **不代表** 网络可用 —— Clash/
+    固定出口挂了时，代理链在第二跳断掉，诊断如果只看 2023 就会假报正常。
+    0.5s 足够回环连接成功或失败，不拖慢每 60 秒一次的自检。
+    """
+    return _tcp_alive(_FIXED_HOST, _FIXED_PORT, timeout=0.5)
 
 
 def diagnose(st: dict | None = None) -> str:
     """体检用：一句话说清现在该不该动手。
 
     ``st`` 同 :func:`describe`，可复用同一份状态。
+    指向 2023 或 10808 时都要探一次上游 10808 是否存活 —— 只探 2023 会
+    在 Clash 挂掉时把"工具在跑但全网不通"说成正常。
     """
     if st is None:
         st = read()
@@ -240,13 +261,19 @@ def diagnose(st: dict | None = None) -> str:
         return "⚠ 系统代理已关闭，微信流量不会经过抓流工具，抓不到内容"
     server = st["server"] or ""
     if TOOL_PROXY in server:
-        alive = tool_still_running()
-        if alive:
-            return (f"系统代理 {server}（抓流工具接管中）。"
-                    f"用完记得点「还原系统代理」")
-        return (f"⚠ 系统代理仍指向 {server}，但工具已不在运行 —— "
-                f"现在正在断网，请点「还原系统代理」")
+        if not tool_still_running():
+            return (f"⚠ 系统代理仍指向 {server}，但工具已不在运行 —— "
+                    f"现在正在断网，请点「还原系统代理」")
+        if not upstream_fixed_alive():
+            return (f"⚠ 系统代理 {server}（工具在跑），但上游出口 "
+                    f"{FIXED_PROXY} 不通 —— 现在实际上不了网，"
+                    f"请检查代理软件或点「还原系统代理」")
+        return (f"系统代理 {server}（抓流工具接管中，上游 {FIXED_PROXY} 正常）。"
+                f"用完记得点「还原系统代理」")
     if FIXED_PROXY in server:
-        return (f"系统代理 {server}，日常出口正常"
-                "（未走抓流端口 2023；要抓流请点「接管代理(抓流)」）")
+        if upstream_fixed_alive():
+            return (f"系统代理 {server}，日常出口正常"
+                    "（未走抓流端口 2023；要抓流请点「接管代理(抓流)」）")
+        return (f"⚠ 系统代理 {server}，但 {FIXED_PROXY} 端口不通 —— "
+                f"这不是正常状态，现在可能上不了网，请检查代理软件")
     return f"⚠ 系统代理是 {server}，不是预期的 {FIXED_PROXY}"

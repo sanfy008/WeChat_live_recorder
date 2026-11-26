@@ -36,6 +36,9 @@ class FallbackEngine:
         self._degraded = False
         self._primary_ok = 0
         self._primary_fail = 0
+        # 主引擎内部把“整块失败”吞成占位符时，外层看到的是调用成功。
+        # 这里单独记录发生过内容丢失的调用次数，供监控与排障使用。
+        self._content_failure_calls = 0
 
     @property
     def fallback(self):
@@ -48,15 +51,48 @@ class FallbackEngine:
     def fallback(self, value) -> None:
         self._fallback = value
 
+    def _primary_failed_count(self) -> int:
+        """主引擎累计失败块数；取不到就返回 0（不能因统计问题影响转写）。"""
+        try:
+            if self.primary is None:
+                return 0
+            st = self.primary.stats
+            if isinstance(st, dict):
+                failed = st.get("failed_chunks")
+                if isinstance(failed, list):
+                    return len(failed)
+        except Exception:  # noqa: BLE001
+            pass
+        return 0
+
     def transcribe(self, audio: np.ndarray, sample_rate: int = 16000) -> list[dict]:
         # 已降级或没有主引擎 → 直接走本地
         if self._degraded or self.primary is None:
             return self.fallback.transcribe(audio, sample_rate) if self.fallback else []
 
         try:
+            failed_before = self._primary_failed_count()
             res = self.primary.transcribe(audio, sample_rate)
-            self._failures = 0
+            new_failed = max(0, self._primary_failed_count() - failed_before)
+
+            # 兼容旧语义：调用本身返回了，就记一次 primary_ok。
+            # 但“返回了占位符”不能算健康——把失败块增量并入熔断计数。
             self._primary_ok += 1
+            if new_failed:
+                self._failures += new_failed
+                self._content_failure_calls += 1
+                print(
+                    f"[engine] ⚠ 主引擎本块内容丢失 {new_failed} 处"
+                    f"（连续失败 {self._failures}/{self.max_failures}）"
+                )
+                if self._failures >= self.max_failures and not self._degraded:
+                    self._degraded = True
+                    print(
+                        "[engine] ⚠ 主引擎内容持续失败，本场会话降级为本地引擎。"
+                        "后续片段不再尝试云端，保证录音不断流。"
+                    )
+            else:
+                self._failures = 0
             return res
         except Exception as e:  # noqa: BLE001
             self._failures += 1
@@ -84,13 +120,16 @@ class FallbackEngine:
         except Exception:
             pass
         try:
-            if self.primary is not None and not self._degraded:
+            # 降级后仍要保留主引擎统计：否则前面已经丢失的 failed_chunks
+            # 会随 degraded=True 一起从产物里消失，事后无法核账。
+            if self.primary is not None:
                 base["primary"] = self.primary.stats
         except Exception:
             pass
         base["degraded"] = self._degraded
         base["primary_ok"] = self._primary_ok
         base["primary_fail"] = self._primary_fail
+        base["content_failure_calls"] = self._content_failure_calls
 
         # ---- 不能只看 primary_ok/primary_fail ----
         # 2026-11-17 实测踩到：4 个音频块**全部**转写失败（落的都是占位符），

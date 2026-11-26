@@ -40,19 +40,22 @@
   LLM 纠错 103 行 0 失败、meta 全可追溯
 - **[S-20261117] 产物与音频分目录**：WAV → `recordings/`，
   md/json/jsonl → `transcripts/`，实际运行验证正确
+- **[S-20261126] 三路 Swarm 并行治理 + NAS 端重建验收通过**：
+  代理上游 10808 探活与 `txTime` 剩余有效期、NAS 断点续转/原片保留/`.dockerignore`、
+  统一完整性 `compute_completeness()` + `json`/`md` 原子写盘 + `asr_text` 保留 +
+  `max_tokens` 逐轮放大；全量测试 **512 passed, 2 skipped**，NAS 容器重建后健康检查/宿主机 ffmpeg 编码/中文库下载/出网全绿
 
 **🚧 Work In Progress（进行中）**
 
-- 无未提交改动（`git status` 干净）。
+- 准备执行阶段复盘存档并 `git push`。
 
 **🧱 Active Blockers（当前阻塞）**
 
-- 无硬阻塞。两个未定位/待观察项见 A3：DEBT-004（`tk.tcl` 偶发）、
-  DEBT-005（收尾超时在真实长直播下的实际触发率未知）。
+- 无硬阻塞。待观察项见 A3：DEBT-004（`tk.tcl` 偶发）、DEBT-005（真实 1h+ 长直播触发率）、DEBT-007（字段精简）、DEBT-008（GUI `_run_live`）。
 
 **🗂️ Latest Daily Review（最近一份日复盘）**
 
-- `docs/daily__pipeline_reviews/2026-11-17.md`（S-20261117-1900）
+- `docs/daily__pipeline_reviews/2026-11-26.md`（S-20261126-0030）
 
 **🚀 Next Prompt Recommendations（下一轮建议 Prompt）**
 
@@ -279,6 +282,21 @@
   - 📌 Status: `Active`
   - ⚠️ 教训：**这类问题最危险——产物看起来正常，只有对比音频时长才能发现少内容。**
 
+- **[DEC-011] 两跳代理必须连带探测上游 10808 存活，列表行以 content_id 精确绑定** | Session: S-20261126-0030 | 2026-11-26
+  - 🔍 Context: 抓流代理 2023 存活但 Clash 10808 退出时，旧诊断仍报绿；列表反查依赖“标题+作者+时间”易串台
+  - ✅ Decision: `systemproxy.py` 新增 `upstream_fixed_alive()` 探测 `127.0.0.1:10808`，`gui_fetch.py` 直接输出诊断原话并用 `iid=str(content_id)` 配合 `_fetch_rows` 映射，新增 `_tx_remaining_text()` 显示 `txTime` 剩余有效期
+  - 📌 Status: `Active`
+
+- **[DEC-012] 统一完整性判据 `compute_completeness()` + 原子写盘 + 保留 `asr_text`** | Session: S-20261126-0030 | 2026-11-26
+  - 🔍 Context: 旧版只按 `tail_gap < 120` 判完整，会漏掉丢块/队列丢弃/spill/占位符；`json`/`md` 直接覆盖写有中断损坏风险；词表展开覆盖了引擎原始输出 `raw_text`
+  - ✅ Decision: `quality.py` 统一收口 `compute_completeness()`；`session.py` 临时文件 + `os.replace` 原子写盘并保留 `asr_text`；`postprocess.py` 按 `finish_reason=="length"` 逐轮放大 `max_tokens`（8k→16k→32k）
+  - 📌 Status: `Active`
+
+- **[DEC-013] `.dockerignore` 置于仓库根目录，NAS 原片按保留天数清理** | Session: S-20261126-0030 | 2026-11-26
+  - 🔍 Context: `docker-compose.yml` 的 `build.context` 为 `..`（仓库根），BuildKit 不读 `docker/.dockerignore`；NAS 原片长期堆积需受控清理
+  - ✅ Decision: `.dockerignore` 放仓库根；`retention.py` 按任务年龄/保留天数清理原片，跳过进行中任务并把源文件加入 `referenced_audio` 防孤儿扫描二次处理
+  - 📌 Status: `Active`
+
 ### B2. 🎨 Style DNA（用户偏好档案）
 
 - `[S-20261116-2345]` **用户先提出自己的因果假设，但允许被推翻。** 本轮他说"是不是 GOI 调用了什么工具"，实际是工具在轮询自己的状态条。他接受纠正，关注点在"能不能优化"。→ 不要因为用户给了假设就顺着编解释，要独立验证。
@@ -347,6 +365,16 @@
   - 💡 Lesson: **凡是"降级不报错"的设计，都要单独检查统计口径是否还真实。**
     已加 `failed_chunk_count` / `has_content_loss` 字段修正
 
+- **[FAIL-008] `.dockerignore` 放在 `docker/` 子目录下不生效** | Session: S-20261126-0030 | 2026-11-26
+  - 🔧 Approach: Swarm-2 初稿将 `.dockerignore` 建在 `docker/.dockerignore`
+  - 💥 Failure Reason: `docker-compose.yml` 的 `build.context` 是 `..`（仓库根目录），BuildKit 只认上下文根目录的 `.dockerignore`（或 `docker/Dockerfile.dockerignore`）
+  - 💡 Lesson: **先看 `build.context` 再放 `.dockerignore`。** 已移至仓库根目录并同步至 NAS，重建时 `COPY wxlive` 实测仅 2.7s
+
+- **[FAIL-009] 本机 `curl` 探测局域网 NAS 未加 `--noproxy '*'`** | Session: S-20261126-0030 | 2026-11-26
+  - 🔧 Approach: 直接在 Windows Git Bash 下 `curl http://192.168.68.49:8910/api/health`
+  - 💥 Failure Reason: 系统代理 `10808` 会接管非 `127.0.0.1` 的局域网请求
+  - 💡 Lesson: **探测局域网服务必须加 `curl --noproxy '*'`（或容器内 localhost 复测）**
+
 ### B4. 🏗️ Technical Debt Register
 
 见 Zone A3 的台账（DEBT-001 ~ DEBT-004）。此处不重复，保持单一事实来源。
@@ -354,6 +382,44 @@
 ---
 
 ## Zone C — Session Archive（冻结区，新快照在最上方）
+
+---
+
+### 📸 Session Snapshot: S-20261126-0030 | v0.3.0 | 2026-11-26 00:30
+
+**Session Summary**: 围绕“微信直播解析 → 飞牛 NAS 远程录音转码 → 文字整理”全链路做架构体检与 GitHub 同类经验对照，分三路 Swarm（`hc:t9` / `hc:t10` / `hc:t12`）并行修复并补充测试，随后将改动同步至飞牛 NAS 重建 `wxlive-nas` 容器并完成全套验收。
+
+**Delta from Previous Save (增量变化)**
+
+- 📁 New files:
+  - `.dockerignore`（仓库根构建排除规则）
+  - `docs/daily__pipeline_reviews/2026-11-26.md`（当日复盘）
+- ✏️ Modified files:
+  - 本地抓流/代理：`wxlive/systemproxy.py`、`wxlive/gui_fetch.py`、`wxlive/fetch.py`
+  - NAS 拉流/转码/保留：`wxlive/nas_runner.py`、`wxlive/stream_capture.py`、`wxlive/server.py`、`wxlive/retention.py`
+  - ASR/后处理/完整性：`wxlive/quality.py`、`wxlive/session.py`、`wxlive/engine.py`、`wxlive/pipeline.py`、`wxlive/postprocess.py`、`wxlive/lexicon.py`、`wxlive/gemini_asr.py`、`scripts/auto_transcribe_after_stop.py`
+  - 对应测试：`tests/test_{engine,gemini_asr,gui_fetch,gui_support,lexicon_path,nas_server,postprocess_truncation,quality,retention,stream_capture}.py`
+  - 档案：`Handover Book.md`、`docs/project-state/RESUME.md`
+
+**📊 Metrics**
+
+| 指标 | 结果 |
+|---|---|
+| 全量测试 (`python -m pytest -q`) | **512 passed, 2 skipped** (55.43s) |
+| NAS 健康检查 (`/api/health`) | 200 OK (`ok: true`, `ffmpeg_path: "/host-ffmpeg/ffmpeg"`, `job_count: 10`) |
+| NAS 宿主机 ffmpeg 编码 | `8.1.1-mediasrv` 产出 `59844B` flv |
+| NAS 中文库下载回归 | `200` (`112544B`) |
+| NAS 容器出网 | `baidu.com` / `channels.weixin.qq.com` 均 `200` |
+
+**Decisions Made This Session**: DEC-011, DEC-012, DEC-013
+
+**Failed Attempts This Session**: FAIL-008, FAIL-009
+
+**📋 Session Reflect Report**
+
+- **R1 — 成功模式**: Swarm 三路按“代理抓流 / NAS 拉流保留 / ASR 后处理”边界清晰拆分并行，主会话统一收口 `.dockerignore` 位置与全量测试，最后用 NAS 实机重建闭环验收。
+- **R2 — 边界案例**: `wong` 不在 NAS `docker` 组导致普通 SSH `docker` 命令报错，经用户授权后通过 `sudo -S` 完成重建；容器内无 `curl`，改用 Python `urllib` 完成容器内出网与健康检查。
+- **R3 — 改进信号**: 真实桌面 GUI（Clash 断网态）与新版 NAS 容器真实 1h+ 直播推流仍待下一场开播实机验证。
 
 ---
 

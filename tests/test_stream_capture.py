@@ -32,6 +32,45 @@ def test_find_ffmpeg_available():
     assert stream_capture.find_ffmpeg(), "未找到 ffmpeg"
 
 
+def test_find_ffmpeg_rejects_invalid_explicit_env(monkeypatch, tmp_path):
+    """显式配置了 WXLIVE_FFMPEG 但路径不存在 → 必须报错，不能静默回退。
+
+    回归背景：NAS 升级后 /usr/trim 挂载失效，Docker 会建空目录，
+    静默回退到镜像内置 ffmpeg 会重演"0 字节静默录制"。
+    """
+    monkeypatch.setenv("WXLIVE_FFMPEG", str(tmp_path / "missing-ffmpeg"))
+    with pytest.raises(stream_capture.FFmpegConfigError, match="WXLIVE_FFMPEG"):
+        stream_capture.find_ffmpeg()
+
+
+def test_find_ffmpeg_rejects_directory_as_env(monkeypatch, tmp_path):
+    """指向目录（bind mount 源缺失的典型产物）同样必须报错。"""
+    d = tmp_path / "empty-mount"
+    d.mkdir()
+    monkeypatch.setenv("WXLIVE_FFMPEG", str(d))
+    with pytest.raises(stream_capture.FFmpegConfigError):
+        stream_capture.find_ffmpeg()
+
+
+def test_find_ffmpeg_uses_valid_explicit_env(monkeypatch):
+    """配置有效时优先使用它（这是宿主机 ffmpeg 生效的唯一入口）。"""
+    import shutil
+
+    real = shutil.which("ffmpeg")
+    if not real:
+        pytest.skip("本机没有 ffmpeg")
+    monkeypatch.setenv("WXLIVE_FFMPEG", real)
+    assert stream_capture.find_ffmpeg() == real
+
+
+def test_probe_url_reports_bad_ffmpeg_config(monkeypatch, tmp_path):
+    """探测接口不能因配置错误抛 500，要返回可读的错误。"""
+    monkeypatch.setenv("WXLIVE_FFMPEG", str(tmp_path / "nope"))
+    r = stream_capture.probe_url("http://127.0.0.1:9/x.flv", timeout=2)
+    assert r["ok"] is False
+    assert "WXLIVE_FFMPEG" in r["error"]
+
+
 # ---------------- ffmpeg 命令构建 ----------------
 
 def test_build_cmd_audio_only_and_resampled(tmp_path):

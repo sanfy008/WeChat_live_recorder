@@ -23,6 +23,7 @@ import numpy as np
 from .audio_capture import LoopbackRecorder
 from .config import Config
 from .engine import FallbackEngine
+from .quality import compute_completeness
 from .resample import StreamResampler
 from .session import Session
 from .transcriber import Transcriber
@@ -42,6 +43,21 @@ def _extract_rtf(stats: dict) -> float:
     except Exception:
         pass
     return 0.0
+
+
+def _extract_content_loss(stats) -> bool:
+    """从任意引擎 stats 里取“是否有内容丢失”；取不到按 False。"""
+    try:
+        if isinstance(stats, dict):
+            if "has_content_loss" in stats:
+                return bool(stats["has_content_loss"])
+            for key in ("primary", "fallback"):
+                sub = stats.get(key)
+                if isinstance(sub, dict) and sub.get("failed_chunks"):
+                    return True
+    except Exception:
+        pass
+    return False
 
 
 def build_engine(cfg: Config):
@@ -159,6 +175,38 @@ class Pipeline:
         self._asr_queue: queue.Queue[Segment | None] = queue.Queue(maxsize=200)
         self._stop = threading.Event()
         self._asr_thread: threading.Thread | None = None
+        # 收尾通知：不依赖“哨兵一定进得了满队列”，worker 也会轮询这个事件。
+        self._asr_stop = threading.Event()
+        # 内容丢失计数（写进产物 meta，供完整性判定与事后核账）。
+        self._stat_lock = threading.Lock()
+        self._counters: dict[str, int] = {
+            "asr_queue_dropped": 0,
+            "asr_spilled": 0,
+            "asr_failed_chunks": 0,
+        }
+
+    # ---------- 计数 ----------
+
+    def _bump(self, key: str, n: int = 1) -> None:
+        counters = getattr(self, "_counters", None)
+        if counters is None:  # 兼容只构造了部分属性的测试壳
+            return
+        lock = getattr(self, "_stat_lock", None)
+        if lock is None:
+            counters[key] = counters.get(key, 0) + n
+            return
+        with lock:
+            counters[key] = counters.get(key, 0) + n
+
+    def _counter_snapshot(self) -> dict[str, int]:
+        counters = getattr(self, "_counters", None)
+        if counters is None:
+            return {"asr_queue_dropped": 0, "asr_spilled": 0, "asr_failed_chunks": 0}
+        lock = getattr(self, "_stat_lock", None)
+        if lock is None:
+            return dict(counters)
+        with lock:
+            return dict(counters)
 
     # ---------- 转写线程 ----------
 
@@ -169,6 +217,7 @@ class Pipeline:
         if (self.cfg.asr.engine or "auto").lower() != "local":
             min_sec = self.cfg.vad.cloud_min_segment_seconds
 
+        stop_ev = getattr(self, "_asr_stop", None)
         pending: list[Segment] = []
         pending_dur = 0.0
 
@@ -178,6 +227,7 @@ class Pipeline:
                 return
             if not final and pending_dur < min_sec:
                 return
+            n_pending = len(pending)
             merged = np.concatenate([p.audio for p in pending])
             start = pending[0].start_ts
             pending, pending_dur = [], 0.0
@@ -188,16 +238,29 @@ class Pipeline:
                         res, offset=start, expand_codes=self.cfg.asr.use_lexicon
                     )
             except Exception as e:  # noqa: BLE001
-                print(f"[asr] 片段转写失败 ({start:.1f}s): {e}")
+                # 不能只打印：这段音频不会再进内容里，必须计数并写进产物 meta。
+                self._bump("asr_failed_chunks", max(1, n_pending))
+                print(f"[asr] 片段转写失败 ({start:.1f}s): {e}", flush=True)
 
         while True:
-            seg = self._asr_queue.get()
+            try:
+                seg = self._asr_queue.get(timeout=0.5)
+            except queue.Empty:
+                # 收尾通知不一定能塞进满队列，这里用事件兜底：
+                # 队列已空且收到停止请求 → flush 残余后退出。
+                if stop_ev is not None and stop_ev.is_set() and self._asr_queue.empty():
+                    flush_pending(final=True)
+                    break
+                continue
             if seg is None:
                 flush_pending(final=True)
                 break
             pending.append(seg)
             pending_dur += seg.duration
             flush_pending()
+            if stop_ev is not None and stop_ev.is_set() and self._asr_queue.empty():
+                flush_pending(final=True)
+                break
 
     # ---------- 主循环 ----------
 
@@ -242,10 +305,7 @@ class Pipeline:
                 resampled = self.resampler.process(chunk)
                 for seg in self.segmenter.feed(resampled):
                     n_segments += 1
-                    try:
-                        self._asr_queue.put(seg, timeout=5)
-                    except queue.Full:
-                        print("[warn] 转写队列已满，丢弃片段（ASR 跟不上）", flush=True)
+                    self._enqueue_live(seg)
 
                 # 每 30 秒打印一次状态
                 now = time.time()
@@ -299,7 +359,11 @@ class Pipeline:
                 self._enqueue_tail(tail, "切分器残余")
 
             self.recorder.stop()
-            self._asr_queue.put(None)
+            # 队列可能已被灌满，put(None) 不能无超时地死等。
+            # 事件会保证 worker 在队列排空后退出，哨兵只是“快速通道”。
+            if not self._signal_asr_stop():
+                print("[main][warn] 收尾哨兵未能入队（队列仍满），"
+                      "已通过停止事件通知转写线程", flush=True)
 
             # 录制时长到了不等于活儿干完了：队列里可能还压着几分钟音频。
             # 2026-11-17 实测：10 分钟录制里网关两次 RTF 飙到 3.2/3.8，
@@ -318,25 +382,86 @@ class Pipeline:
                           f"音频已完整保存，可用 wxlive transcribe 补转。",
                           flush=True)
 
+        asr_stats = self.transcriber.stats
+        counters = self._counter_snapshot()
+        dropped_chunks = getattr(self.recorder, "dropped_chunks", 0)
+        content_loss = _extract_content_loss(asr_stats)
+        # 统一完整性判定：收尾超时、采集丢块、队列丢弃、spill、占位符
+        # 任何一项成立都算不完整。以前只看收尾线程，产物会“看起来正常”。
+        completeness = compute_completeness(
+            drain_incomplete=incomplete,
+            dropped_chunks=dropped_chunks,
+            asr_queue_dropped=counters["asr_queue_dropped"],
+            asr_spilled=counters["asr_spilled"],
+            asr_failed_chunks=counters["asr_failed_chunks"],
+            has_content_loss=content_loss,
+        )
         doc = self.session.close(extra_meta={
-            "asr": self.transcriber.stats,
+            "asr": asr_stats,
             # 停止原因进产物：以后想知道"这场为什么断在这"，查 meta 即可，
             # 不必再对着 WAV 尾部的静音时长猜（2026-11-16/17 都这么猜过）。
             "stop_reason": stop_reason,
-            "dropped_chunks": getattr(self.recorder, "dropped_chunks", 0),
-            # 收尾是否跑完。False 表示产物可能缺尾部，需要人工补转。
-            "transcript_complete": not incomplete,
+            "dropped_chunks": dropped_chunks,
+            **counters,
+            "has_content_loss": content_loss,
+            "transcript_complete": completeness["complete"],
+            "completeness_reasons": completeness["reasons"],
         })
         print(f"\n完成。逐字稿: {self.session.md_path}")
         print(f"      结构化: {self.session.json_path}")
         print(f"      音频  : {self.session.audio_path}")
-        if incomplete:
-            # 结论必须显眼：否则用户会拿着缺尾部的产物当完整稿用。
-            print("\n[!] 注意：本次转写未跑完（收尾超时）。")
-            print("    音频是完整的，缺的是后半段的文字。补转办法：")
-            print(f"    .venv-trim/Scripts/python.exe -m wxlive transcribe "
-                  f"\"{self.session.audio_path}\"")
+        if not completeness["complete"]:
+            # 结论必须显眼：否则用户会拿着缺内容的产物当完整稿用。
+            print("\n[!] 注意：本次转写不完整：")
+            for reason in completeness["reasons"]:
+                print(f"    - {reason}")
+            if dropped_chunks:
+                print("    采集端有丢块，音频本身可能也不完整。")
+            else:
+                print("    音频已完整保存，缺的是部分文字。补转办法：")
+                print(f"    .venv-trim/Scripts/python.exe -m wxlive transcribe "
+                      f"\"{self.session.audio_path}\"")
         return doc
+
+    def _enqueue_live(self, seg) -> bool:
+        """主循环投递片段：**永不阻塞**。
+
+        以前用 `put(timeout=5)`：ASR 跟不上时主循环会被卡住 5 秒/片段，
+        采集队列（约 300 秒缓冲）很快灌满并开始丢音频。录音完整性优先，
+        所以这里改为非阻塞；队列满就把音频落盘待补转，并记账。
+        """
+        try:
+            self._asr_queue.put_nowait(seg)
+            return True
+        except queue.Full:
+            self._bump("asr_queue_dropped")
+            print("[warn] 转写队列已满（ASR 跟不上）；该片段不阻塞录音，"
+                  "音频落盘待补转", flush=True)
+        try:
+            self._spill_audio(seg, "主循环队列满")
+            self._bump("asr_spilled")
+        except Exception as e:  # noqa: BLE001
+            print(f"[asr][error] 主循环片段落盘失败: {e}", flush=True)
+        return False
+
+    def _signal_asr_stop(self, timeout: float = 2.0) -> bool:
+        """通知转写线程收尾。
+
+        先置停止事件（worker 即便拿不到哨兵，也会在队列排空后自行退出），
+        再尽力把 None 塞进队列，但绝不无限阻塞。
+        """
+        stop_ev = getattr(self, "_asr_stop", None)
+        if stop_ev is not None:
+            stop_ev.set()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                self._asr_queue.put(None, timeout=0.2)
+                return True
+            except queue.Full:
+                if self._asr_thread is not None and not self._asr_thread.is_alive():
+                    return True
+        return False
 
     def _enqueue_tail(self, seg, where: str) -> None:
         """收尾阶段投递片段到 ASR 队列。
@@ -355,6 +480,7 @@ class Pipeline:
         # 事后至少可以手工补转，不会"消失得无声无息"。
         try:
             self._spill_audio(seg, where)
+            self._bump("asr_spilled")
         except Exception as e:  # noqa: BLE001
             print(f"[asr][error] 收尾片段落盘也失败（{where}）: {e}", flush=True)
 
