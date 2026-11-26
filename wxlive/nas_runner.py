@@ -26,7 +26,7 @@ from typing import IO, Any, Callable
 import numpy as np
 import soundfile as sf
 
-from . import lexicon, postprocess, retention
+from . import artifacts, lexicon, postprocess, retention
 from .config import (
     DEFAULT_REASONING_EFFORT,
     DEFAULT_TEXT_MODEL,
@@ -1190,7 +1190,16 @@ class NasJobRunner:
         doc["segments"] = tmp.segments
         doc["full_text"] = "".join(s["text"] for s in tmp.segments)
         doc.setdefault("meta", {})["llm_status"] = llm_status
+        # 产物自检：行数守恒 / 失败批 0 / 三份产物齐全，产物仍可能是坏的。
+        # 2026-11-26 复盘发现某场终稿 574 句繁体、另两场幻觉句混进正文，
+        # 旧验收一条都查不出来。纯本地计算，毫秒级，只报告不改写。
+        q = artifacts.check_segments(tmp.segments)
+        doc["meta"]["quality"] = q.to_meta()
         _atomic_write_json(json_p, doc)
+        self._append_log(job_id, q.summary())
+        for _kind, _samples in q.samples.items():
+            for _s in _samples:
+                self._append_log(job_id, f"  [{_kind}] {_s[:60]}")
 
         md_p = Path(job.get("md_path") or "")
         if md_p.exists():
