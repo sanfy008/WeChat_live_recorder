@@ -573,6 +573,7 @@ class NasJobRunner:
         url: str,
         name: str = "",
         auto_transcribe: bool | None = None,
+        decrypt_key: int = 0,
     ) -> dict[str, Any]:
         # 允许直接粘贴微信"下载"按钮复制出来的整条 ffmpeg 命令；
         # 也允许特殊值 "auto"（由调用方先去本机 ffmpeg 进程里找地址）
@@ -618,6 +619,20 @@ class NasJobRunner:
             "logs": [],
         }
 
+        if decrypt_key and int(decrypt_key) > 0:
+            with self._lock:
+                self._jobs[job_id] = job
+                self._save_jobs()
+            self._append_log(job_id, f"开始下载并解密回放：{title}")
+            t = threading.Thread(
+                target=self._run_decrypted_vod_job,
+                args=(job_id, clean_url, int(decrypt_key), safe),
+                daemon=True,
+                name=f"vod-{job_id}",
+            )
+            t.start()
+            return self.get_job(job_id) or job
+
         rec = StreamRecorder(
             clean_url,
             self.recordings_dir,
@@ -643,6 +658,91 @@ class NasJobRunner:
         )
         t.start()
         return self.get_job(job_id) or job
+
+    def _run_decrypted_vod_job(
+        self,
+        job_id: str,
+        url: str,
+        decrypt_key: int,
+        safe: str,
+    ) -> None:
+        """在 NAS 上直接拉取并解密加密点播/回放 MP4，抽取 16k WAV 后入队转写。"""
+        from .sphdecrypt import open_decrypted, probe_encryption
+
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        tmp_mp4 = self.recordings_dir / f"{stamp}_{safe}.mp4.part"
+        wav_out = self.recordings_dir / f"{stamp}_{safe}_vod.wav"
+        try:
+            enc_flag, enc_len = probe_encryption(url, timeout=20)
+            key = decrypt_key if enc_flag else 0
+            stream = open_decrypted(url, enc_len if enc_flag else 0, key, timeout=60)
+            total = 0
+            last_log = 0.0
+            try:
+                with tmp_mp4.open("wb") as f:
+                    while not self._shutdown_event.is_set():
+                        chunk = stream.read(1 << 20)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        total += len(chunk)
+                        now = time.monotonic()
+                        if now - last_log >= 2.0:
+                            last_log = now
+                            self._update_job(job_id, persist=False, audio_bytes=total)
+                            self._append_log(job_id, f"已解密下载 {total / 1048576:.1f} MB…")
+            finally:
+                stream.close()
+
+            if self._shutdown_event.is_set():
+                self._update_job(job_id, status="interrupted", error="服务正在关闭")
+                return
+            if total == 0:
+                raise RuntimeError("下载到 0 字节（地址可能已过期）")
+
+            self._append_log(job_id, f"下载完成（{total / 1048576:.1f} MB），开始抽取 16k 音频…")
+            self._update_job(job_id, status="converting", audio_bytes=total)
+            ff = find_ffmpeg()
+            if not ff:
+                raise RuntimeError("系统未找到 ffmpeg")
+            cmd = [
+                ff, "-y", "-hide_banner", "-loglevel", "error",
+                "-i", str(tmp_mp4),
+                "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
+                str(wav_out),
+            ]
+            r = winproc.run(cmd, capture_output=True, text=True, timeout=1800)
+            if r.returncode != 0 or not wav_out.exists() or wav_out.stat().st_size <= 44:
+                err = (r.stderr or "ffmpeg 抽音频失败").strip()[:200]
+                raise RuntimeError(err)
+
+            size = wav_out.stat().st_size
+            with self._lock:
+                job = self._jobs.get(job_id)
+                auto_tx = job.get("auto_transcribe", True) if job else True
+            if auto_tx and not self._shutdown_event.is_set():
+                self._update_job(
+                    job_id,
+                    status="queued",
+                    audio_path=str(wav_out),
+                    audio_bytes=size,
+                    error="",
+                )
+                self._append_log(job_id, "已抽取音频并加入转写队列")
+                self._asr_queue.put(job_id)
+            else:
+                self._update_job(
+                    job_id,
+                    status="recorded",
+                    audio_path=str(wav_out),
+                    audio_bytes=size,
+                )
+        except Exception as exc:  # noqa: BLE001
+            err = str(exc)[:300] or type(exc).__name__
+            self._append_log(job_id, f"加密回放拉取失败：{err}")
+            self._update_job(job_id, status="failed", error=err)
+        finally:
+            tmp_mp4.unlink(missing_ok=True)
 
     def _watch_recorder(self, job_id: str, rec: StreamRecorder) -> None:
         """监控录制进度，并按静音判停（直播结束后自动收工）。

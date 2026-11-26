@@ -65,7 +65,7 @@ def find_ffmpeg() -> str | None:
     return None
 
 
-def probe_url(url: str, timeout: int = 20) -> dict:
+def probe_url(url: str, timeout: int = 20, decrypt_key: int = 0) -> dict:
     """探测流地址是否可拉，返回 {ok, info, error, duration, has_audio}。
 
     用 ffprobe 而不是直接下载，避免拉整个流。
@@ -73,6 +73,11 @@ def probe_url(url: str, timeout: int = 20) -> dict:
     ff = find_ffmpeg()
     if not ff:
         return {"ok": False, "error": "未找到 ffmpeg，请先安装并加入 PATH"}
+
+    if is_url(url) and (decrypt_key > 0 or "encfilekey=" in url.lower()):
+        vod = _probe_encrypted_vod(url, decrypt_key=decrypt_key, timeout=timeout)
+        if vod is not None:
+            return vod
 
     # 注意：chocolatey 装的 ffmpeg 是大写 .EXE，
     # 直接 replace("ffmpeg.exe") 匹配不到，会把 ffmpeg 当 ffprobe 调用而报
@@ -106,6 +111,57 @@ def probe_url(url: str, timeout: int = 20) -> dict:
     # 只有 ffmpeg 有。所以探测改用 ffmpeg -4 -i <url> -t 0 -f null -，
     # 它同样只解析头部、不下载整个流，且能强制 IPv4。
     return _probe_with_ffmpeg(ff, url, timeout)
+
+
+def _probe_encrypted_vod(url: str, decrypt_key: int = 0,
+                         timeout: int = 15) -> dict | None:
+    """检查加密点播/回放地址（返回 None 表示非加密流，交回普通 ffmpeg 探测）。"""
+    from .sphdecrypt import head_info, open_decrypted
+
+    try:
+        info = head_info(url, timeout=min(10, timeout))
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"连接失败：{type(exc).__name__}: {exc}"}
+
+    status = int(info.get("status") or 0)
+    if status in (401, 403, 404):
+        return {"ok": False, "error": f"HTTP {status}（地址可能已过期）"}
+    if status >= 400:
+        return {"ok": False, "error": f"HTTP {status}"}
+
+    enc_flag = int(info.get("enc_flag") or 0)
+    enc_len = int(info.get("enc_len") or 0)
+    if not enc_flag:
+        return None
+
+    if decrypt_key <= 0:
+        return {
+            "ok": False,
+            "encrypted": True,
+            "error": "该视频已加密（X-encflag=1），需要 decrypt_key 或先在电脑端解密后上传",
+        }
+
+    try:
+        with open_decrypted(url, enc_len, decrypt_key, timeout=min(15, timeout)) as st:
+            head = st.read(65536)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "encrypted": True,
+                "error": f"拉取加密头失败：{type(exc).__name__}: {exc}"}
+
+    if b"ftyp" not in head[:64]:
+        return {
+            "ok": False,
+            "encrypted": True,
+            "error": "解密后未识别出 MP4 文件头（decrypt_key 可能不匹配）",
+        }
+    size_bytes = int(info.get("content_length") or -1)
+    size_txt = f"{size_bytes / 1048576:.1f} MB" if size_bytes > 0 else "未知大小"
+    return {
+        "ok": True,
+        "encrypted": True,
+        "has_audio": True,
+        "info": f"加密 MP4 可解密（{size_txt}）",
+    }
 
 
 def _force_ipv4_url(url: str) -> str:

@@ -24,12 +24,14 @@ from .stream_capture import extract_url, find_ffmpeg, is_url, probe_url
 
 class ProbeReq(BaseModel):
     url: str
+    decrypt_key: int = 0
 
 
 class StreamStartReq(BaseModel):
     url: str
     name: str = ""
     auto_transcribe: bool | None = None
+    decrypt_key: int = 0
 
 
 class StopReq(BaseModel):
@@ -1815,7 +1817,7 @@ def create_app(
                 "ok": False,
                 "error": "没识别出流地址。可以粘贴纯 URL，或整条 `ffmpeg -i \"https://...\" ...` 命令。",
             }
-        return probe_url(url, timeout=15)
+        return probe_url(url, timeout=15, decrypt_key=req.decrypt_key)
 
     @app.get("/api/jobs")
     def api_list_jobs():
@@ -1835,6 +1837,7 @@ def create_app(
                 url=req.url,
                 name=req.name,
                 auto_transcribe=req.auto_transcribe,
+                decrypt_key=req.decrypt_key,
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))

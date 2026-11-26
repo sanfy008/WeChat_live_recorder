@@ -469,6 +469,10 @@ def list_stream_candidates(item: ContentItem, api: str = DEFAULT_API,
     except Exception:  # noqa: BLE001
         pass
 
+    preset = (getattr(item, "url", "") or "").strip()
+    if preset and _looks_like_live(preset):
+        _add(preset, "日志发现")
+
     return out
 
 
@@ -999,3 +1003,103 @@ def probe_media(path: Path) -> tuple[float, bool]:
         elif line.strip() == "codec_type=audio":
             has_audio = True
     return dur, has_audio
+
+
+def nas_supports_decrypt(base_url: str, timeout: float = 4.0) -> bool:
+    """检查目标 NAS 服务端是否原生支持 decrypt_key（ProbeReq / StreamStartReq）。"""
+    base = (base_url or "").strip().rstrip("/")
+    if not base:
+        return False
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(base + "/openapi.json", timeout=timeout) as r:
+            spec = json.loads(r.read().decode("utf-8"))
+        schemas = (spec.get("components") or {}).get("schemas") or {}
+        probe_props = (schemas.get("ProbeReq") or {}).get("properties") or {}
+        stream_props = (schemas.get("StreamStartReq") or {}).get("properties") or {}
+        return "decrypt_key" in probe_props and "decrypt_key" in stream_props
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def upload_to_nas(base_url: str, file_path: Path, name: str = "",
+                  auto_transcribe: bool = True, on_progress=None,
+                  timeout: int = 300) -> dict:
+    """把本地音频/媒体文件流式上传到 NAS `/api/jobs/upload`，返回任务 JSON。
+
+    使用 http.client 直连局域网，绕过系统代理且避免把上百 MB 文件整个读进内存。
+    """
+    import http.client
+    import uuid
+
+    p = Path(file_path)
+    if not p.is_file():
+        raise FetchError(f"待上传文件不存在：{p}")
+    size = p.stat().st_size
+    if size <= 0:
+        raise FetchError("待上传文件为空（0 字节）")
+
+    parsed = urllib.parse.urlsplit((base_url or "").strip().rstrip("/"))
+    scheme = parsed.scheme.lower()
+    if scheme not in ("http", "https") or not parsed.hostname:
+        raise FetchError(f"无效的 NAS 地址：{base_url}")
+
+    boundary = f"----wxlive-{uuid.uuid4().hex}"
+    fields = [
+        ("name", name or p.stem),
+        ("auto_transcribe", "true" if auto_transcribe else "false"),
+    ]
+    parts_head = bytearray()
+    for k, v in fields:
+        parts_head.extend(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{k}"\r\n\r\n'
+            f"{v}\r\n".encode("utf-8")
+        )
+    safe_name = f"upload{p.suffix.lower() or '.wav'}"
+    parts_head.extend(
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; filename="{safe_name}"\r\n'
+        f"Content-Type: application/octet-stream\r\n\r\n".encode("utf-8")
+    )
+    tail = f"\r\n--{boundary}--\r\n".encode("utf-8")
+    total_len = len(parts_head) + size + len(tail)
+
+    prefix = parsed.path.rstrip("/")
+    req_path = f"{prefix}/api/jobs/upload"
+    conn_cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
+    port = parsed.port or (443 if scheme == "https" else 80)
+    conn = conn_cls(parsed.hostname, port, timeout=timeout)
+    try:
+        conn.putrequest("POST", req_path)
+        conn.putheader("Content-Type", f"multipart/form-data; boundary={boundary}")
+        conn.putheader("Content-Length", str(total_len))
+        conn.endheaders()
+        conn.send(bytes(parts_head))
+
+        sent = 0
+        with p.open("rb") as f:
+            while True:
+                buf = f.read(1 << 20)
+                if not buf:
+                    break
+                conn.send(buf)
+                sent += len(buf)
+                if on_progress:
+                    on_progress(sent, size)
+        conn.send(tail)
+
+        resp = conn.getresponse()
+        body = resp.read().decode("utf-8", "replace")
+        if resp.status >= 400:
+            raise FetchError(f"NAS 上传被拒 HTTP {resp.status}：{body[:300]}")
+        return json.loads(body)
+    except FetchError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise FetchError(f"上传到 NAS 失败：{type(exc).__name__}: {exc}") from exc
+    finally:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass

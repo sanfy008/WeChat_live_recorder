@@ -817,3 +817,172 @@ def test_fetch_refresh_shows_discovered_videos_and_dedups_by_encfilekey(app, stu
     _pump(app)
     assert len(app.fetch_tree.get_children()) == 1
 
+
+def test_push_encrypted_replay_to_nas_falls_back_to_decrypt_and_upload(
+        app, stub_list, monkeypatch, tmp_path):
+    """推送加密回放时，若 NAS 暂不支持 decrypt_key，自动本机解密抽音频后上传 /api/jobs/upload。"""
+    import wxlive.fetch as F
+    import wxlive.gui_fetch as GF
+    from wxlive.fetch import ContentItem, ProbeInfo
+
+    holder, _ = stub_list
+    it = ContentItem(
+        content_id="14789966503387730000",
+        title="【小升初不焦虑】答疑专场",
+        url="https://finder.video.qq.com/251/20302/stodownload?encfilekey=ENC99&token=T1",
+        author="粤知升初",
+        is_live=False,
+        decrypt_key=1902534306,
+    )
+    holder["page"] = _fake_page([it])
+    app._fetch_refresh()
+    _pump(app)
+
+    row = app.fetch_tree.get_children()[0]
+    app.fetch_tree.selection_set([row])
+
+    monkeypatch.setattr(F, "probe_item", lambda item, timeout=20: ProbeInfo(
+        ok=True, status=200, encrypted=True, enc_len=131072, size_bytes=1024000))
+    monkeypatch.setattr(F, "nas_supports_decrypt", lambda base: False)
+
+    calls = {"dl": 0, "ex": 0, "up": []}
+
+    def fake_dl(item, key, dest, on_progress=None):
+        calls["dl"] += 1
+        assert key == 1902534306
+        dest.write_bytes(b"fake-mp4")
+        if on_progress:
+            on_progress(1024 * 1024, 0.5)
+        return dest
+
+    def fake_ex(video, wav=None, **kw):
+        calls["ex"] += 1
+        assert video.exists()
+        wav.write_bytes(b"RIFF" + b"\x00" * 64)
+        return wav
+
+    def fake_up(base, file_path, name="", auto_transcribe=True, on_progress=None, **kw):
+        assert file_path.exists()
+        calls["up"].append((base, name, auto_transcribe, file_path.suffix))
+        if on_progress:
+            on_progress(68, 68)
+        return {"id": "job_enc_1", "title": name}
+
+    monkeypatch.setattr(F, "download_decrypted", fake_dl)
+    monkeypatch.setattr(F, "extract_audio", fake_ex)
+    monkeypatch.setattr(F, "upload_to_nas", fake_up)
+
+    infos = []
+    warns = []
+    monkeypatch.setattr(GF.messagebox, "showinfo", lambda t, m, **kw: infos.append((t, m)))
+    monkeypatch.setattr(GF.messagebox, "showwarning", lambda t, m, **kw: warns.append((t, m)))
+
+    app._fetch_push_selected_to_nas()
+    _pump(app)
+
+    assert not warns, f"不应报失败弹窗: {warns}"
+    assert calls["dl"] == 1 and calls["ex"] == 1
+    assert len(calls["up"]) == 1
+    assert calls["up"][0][1] == "【小升初不焦虑】答疑专场"
+    assert calls["up"][0][3] == ".wav"
+    assert infos and "已交给 NAS" in infos[0][0]
+    assert "job_enc_1" in infos[0][1]
+
+
+def test_push_encrypted_replay_uses_native_nas_decrypt_when_supported(
+        app, stub_list, monkeypatch):
+    """若 NAS 支持 decrypt_key，则直接把 url + decrypt_key 传给 /api/probe 与 /api/jobs/stream。"""
+    import json as _j
+    import urllib.request as _ur
+    import wxlive.fetch as F
+    import wxlive.gui_fetch as GF
+    from wxlive.fetch import ContentItem, ProbeInfo
+
+    holder, _ = stub_list
+    it = ContentItem(
+        content_id="14789966503387730000",
+        title="加密回放",
+        url="https://finder.video.qq.com/251/20302/stodownload?encfilekey=ENC99",
+        is_live=False,
+        decrypt_key=987654321,
+    )
+    holder["page"] = _fake_page([it])
+    app._fetch_refresh()
+    _pump(app)
+    app.fetch_tree.selection_set([app.fetch_tree.get_children()[0]])
+
+    monkeypatch.setattr(F, "probe_item", lambda item, timeout=20: ProbeInfo(
+        ok=True, status=200, encrypted=True, enc_len=131072, size_bytes=1024000))
+    monkeypatch.setattr(F, "nas_supports_decrypt", lambda base: True)
+
+    sent = []
+
+    class _FakeResp:
+        def __init__(self, body):
+            self._b = _j.dumps(body).encode("utf-8")
+
+        def read(self):
+            return self._b
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+    class _FakeOpener:
+        def open(self, req, timeout=40):
+            payload = _j.loads(req.data.decode("utf-8"))
+            sent.append((req.full_url, payload))
+            if req.full_url.endswith("/api/probe"):
+                return _FakeResp({"ok": True, "encrypted": True})
+            return _FakeResp({"id": "job_native_1", "title": payload.get("name")})
+
+    monkeypatch.setattr(_ur, "build_opener", lambda *a, **kw: _FakeOpener())
+
+    infos = []
+    monkeypatch.setattr(GF.messagebox, "showinfo", lambda t, m, **kw: infos.append((t, m)))
+
+    app._fetch_push_selected_to_nas()
+    _pump(app)
+
+    assert len(sent) == 2
+    assert sent[0][0].endswith("/api/probe") and sent[0][1]["decrypt_key"] == 987654321
+    assert sent[1][0].endswith("/api/jobs/stream") and sent[1][1]["decrypt_key"] == 987654321
+    assert infos and "job_native_1" in infos[0][1]
+
+
+def test_push_expired_replay_fails_fast_with_clear_video_hint(
+        app, stub_list, monkeypatch):
+    """回放地址过期时直接提示回微信重开视频/回放，而不是误报"重开直播"。"""
+    import wxlive.fetch as F
+    import wxlive.gui_fetch as GF
+    from wxlive.fetch import ContentItem, ProbeInfo
+
+    holder, _ = stub_list
+    it = ContentItem(
+        content_id="123",
+        title="过期回放",
+        url="https://finder.video.qq.com/251/20302/stodownload?encfilekey=DEAD",
+        is_live=False,
+    )
+    holder["page"] = _fake_page([it])
+    app._fetch_refresh()
+    _pump(app)
+    app.fetch_tree.selection_set([app.fetch_tree.get_children()[0]])
+
+    monkeypatch.setattr(F, "probe_item", lambda item, timeout=20: ProbeInfo(
+        ok=False, status=403, reason="HTTP 403：地址可能已过期"))
+
+    warns = []
+    monkeypatch.setattr(GF.messagebox, "showwarning", lambda t, m, **kw: warns.append((t, m)))
+
+    app._fetch_push_selected_to_nas()
+    _pump(app)
+
+    assert warns
+    assert "403" in warns[0][1]
+    assert "视频/回放" in warns[0][1]
+    assert "重新打开该直播" not in warns[0][1]
+
+

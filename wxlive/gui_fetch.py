@@ -370,7 +370,10 @@ class FetchTabMixin:
         self._run_bg(work)
 
     def _fetch_nas_push(self, url: str, name: str,
-                        on_done=None) -> None:
+                        on_done=None, *,
+                        is_live: bool = True,
+                        decrypt_key: int = 0,
+                        base: str = "") -> None:
         """把一条流地址交给 NAS 开录（停录后 NAS 自动转写）。"""
         import json
         import urllib.error
@@ -378,7 +381,7 @@ class FetchTabMixin:
 
         from .stream_capture import extract_url, is_url
 
-        base = self._fetch_nas_base()
+        base = (base or "").strip().rstrip("/") or self._fetch_nas_base()
         clean = extract_url(url)
         if not is_url(clean):
             messagebox.showwarning("地址无效", "没能从这一条里识别出流地址。")
@@ -389,28 +392,39 @@ class FetchTabMixin:
         def work() -> None:
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
             try:
+                probe_payload = {"url": clean}
+                if decrypt_key:
+                    probe_payload["decrypt_key"] = int(decrypt_key)
                 probe_req = urllib.request.Request(
                     base + "/api/probe",
-                    data=json.dumps({"url": clean}).encode(),
+                    data=json.dumps(probe_payload).encode(),
                     headers={"Content-Type": "application/json"},
                 )
                 with opener.open(probe_req, timeout=40) as r:
                     probe = json.loads(r.read().decode("utf-8"))
                 if not probe.get("ok"):
                     err = probe.get("error") or "未知错误"
+                    hint = (
+                        "地址可能已过期，回微信重新打开该直播。"
+                        if is_live else
+                        "地址可能已过期或视频已加密，请回微信重新打开该视频/回放，或改用「下载选中项的音频」。"
+                    )
                     self._ui(lambda: self._fetch_nas_set_status("探测失败", warn=True))
                     self._log(f"[NAS] 探测失败：{err}")
-                    self._ui(lambda e=err: messagebox.showwarning(
-                        "NAS 探测失败", e + "\n\n地址可能已过期，回微信重新打开该直播。"))
+                    self._ui(lambda e=err, h=hint: messagebox.showwarning(
+                        "NAS 探测失败", e + "\n\n" + h))
                     return
 
+                start_payload = {
+                    "url": clean,
+                    "name": name or "",
+                    "auto_transcribe": True,
+                }
+                if decrypt_key:
+                    start_payload["decrypt_key"] = int(decrypt_key)
                 start_req = urllib.request.Request(
                     base + "/api/jobs/stream",
-                    data=json.dumps({
-                        "url": clean,
-                        "name": name or "",
-                        "auto_transcribe": True,
-                    }).encode(),
+                    data=json.dumps(start_payload).encode(),
                     headers={"Content-Type": "application/json"},
                 )
                 with opener.open(start_req, timeout=60) as r:
@@ -421,10 +435,10 @@ class FetchTabMixin:
                 msg = f"NAS 已开始录制：{title}"
                 self._ui(lambda: self._fetch_nas_set_status("录制中", warn=False))
                 self._log(f"[NAS] {msg}（任务 {jid}，停录后自动转写）")
-                self._ui(lambda: messagebox.showinfo(
+                self._ui(lambda b=base, m=msg, j=jid: messagebox.showinfo(
                     "已交给 NAS",
-                    f"{msg}\n\n任务 ID：{jid}\n本机可以停止播放/关闭页面了。\n\n"
-                    f"进度与逐字稿：{self._fetch_nas_base()}/"))
+                    f"{m}\n\n任务 ID：{j}\n本机可以停止播放/关闭页面了。\n\n"
+                    f"进度与逐字稿：{b}/"))
                 if on_done:
                     self._ui(on_done)
             except urllib.error.HTTPError as exc:
@@ -438,6 +452,143 @@ class FetchTabMixin:
                 self._ui(lambda: self._fetch_nas_set_status("推送失败", warn=True))
                 self._log(f"[NAS] 推送失败：{m}")
                 self._ui(lambda mm=m: messagebox.showwarning("推送到 NAS 失败", mm))
+
+        self._run_bg(work)
+
+    def _fetch_nas_push_video(self, it) -> None:
+        """把回放/点播视频推给 NAS。
+
+        微信视频号回放链接前 ~131KB 是 ISAAC64 加密的，直接把 URL 交给
+        `ffmpeg` 探测必然报 `Invalid data found when processing input`。
+        因此先做 HTTP 探测与加密判断：
+        - 明文视频：直接走 NAS 拉流；
+        - 加密视频且 NAS 支持 `decrypt_key`：把密钥一并交由 NAS 直拉解密；
+        - 加密视频且 NAS 暂不支持 `decrypt_key`：本机解密抽 16k WAV 后通过 `/api/jobs/upload` 传给 NAS。
+        """
+        import tempfile
+        import time
+
+        from . import fetch as F
+        from .stream_capture import extract_url, is_url
+
+        base = self._fetch_nas_base()
+        if not base:
+            self._fetch_nas_set_status("请先填 NAS 地址", warn=True)
+            messagebox.showwarning("请先填 NAS 地址", "请填写 NAS 服务地址后再推送。")
+            return
+        clean = extract_url(getattr(it, "url", "") or "")
+        if not is_url(clean):
+            messagebox.showwarning("地址无效", "没能从这一条里识别出视频地址。")
+            return
+
+        api = self.fetch_api_var.get().strip() or "http://127.0.0.1:2022"
+        self._fetch_nas_set_status("检查视频地址…")
+        self._log(f"[NAS] 《{it.title}》是回放/视频，正在检查可用性与加密状态…")
+
+        def work() -> None:
+            try:
+                info = F.probe_item(it)
+            except Exception as exc:  # noqa: BLE001
+                m = f"{type(exc).__name__}: {exc}"
+                self._ui(lambda: self._fetch_nas_set_status("探测失败", warn=True))
+                self._log(f"[NAS] 检查视频失败：{m}")
+                self._ui(lambda mm=m: messagebox.showwarning("检查视频失败", mm))
+                return
+
+            if not info.ok:
+                self._ui(lambda: self._fetch_nas_set_status("地址不可用", warn=True))
+                self._log(f"[NAS] 《{it.title}》不可用：{info.reason}")
+                self._ui(lambda r=info.reason: messagebox.showwarning(
+                    "视频地址不可用",
+                    f"《{it.title}》\n{r}\n\n请回微信重新打开该视频/回放，再点「刷新列表」。"))
+                return
+
+            is_enc = bool(info.encrypted or getattr(it, "decrypt_key", 0))
+            if not is_enc:
+                self._ui(lambda: self._fetch_nas_push(
+                    clean, it.title, is_live=False, base=base))
+                return
+
+            try:
+                key = F.get_decrypt_key(it, api=api)
+            except Exception as exc:  # noqa: BLE001
+                key = 0
+                key_err = str(exc)
+            else:
+                key_err = ""
+
+            if not key:
+                msg = key_err or "文件已加密，但未获取到解密密钥（decodeKey）。"
+                self._ui(lambda: self._fetch_nas_set_status("缺少解密密钥", warn=True))
+                self._log(f"[NAS] 无法推送加密视频：《{it.title}》{msg}")
+                self._ui(lambda m=msg: messagebox.showwarning("无法推送加密视频", m))
+                return
+
+            if F.nas_supports_decrypt(base):
+                self._log(f"[NAS] NAS 支持服务端解密，直接推送《{it.title}》…")
+                self._ui(lambda k=key: self._fetch_nas_push(
+                    clean, it.title, is_live=False, decrypt_key=k, base=base))
+                return
+
+            self._log(
+                f"[NAS] 《{it.title}》为加密回放（{info.size_text}），"
+                "当前 NAS 暂未开启服务端解密，自动在本机解密抽音频后上传 NAS…"
+            )
+            self._ui(lambda: self._fetch_nas_set_status("解密下载中…"))
+            last_ui = [0.0]
+
+            try:
+                with tempfile.TemporaryDirectory(prefix="wxlive_nas_") as tmpdir:
+                    td = Path(tmpdir)
+                    stem = F.safe_filename(it.title)
+                    tmp_mp4 = td / f"{stem}.mp4"
+                    tmp_wav = td / f"{stem}.wav"
+
+                    def on_dl(done_bytes: int, _secs: float) -> None:
+                        now = time.monotonic()
+                        if now - last_ui[0] < 0.4:
+                            return
+                        last_ui[0] = now
+                        mb = done_bytes / 1048576.0
+                        self._ui(lambda m=mb: self._fetch_nas_set_status(
+                            f"解密下载 {m:.0f} MB…"))
+
+                    F.download_decrypted(it, key, tmp_mp4, on_progress=on_dl)
+                    self._ui(lambda: self._fetch_nas_set_status("提取 16k 音频…"))
+                    wav = F.extract_audio(tmp_mp4, tmp_wav)
+                    tmp_mp4.unlink(missing_ok=True)
+
+                    last_ui[0] = 0.0
+
+                    def on_up(sent: int, total: int) -> None:
+                        now = time.monotonic()
+                        if sent < total and now - last_ui[0] < 0.4:
+                            return
+                        last_ui[0] = now
+                        pct = (sent * 100.0 / total) if total else 0.0
+                        self._ui(lambda p=pct: self._fetch_nas_set_status(
+                            f"上传 NAS {p:.0f}%…"))
+
+                    job = F.upload_to_nas(
+                        base, wav, name=it.title, auto_transcribe=True,
+                        on_progress=on_up,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                m = str(exc) or type(exc).__name__
+                self._ui(lambda: self._fetch_nas_set_status("推送失败", warn=True))
+                self._log(f"[NAS] 解密上传失败：{m}")
+                self._ui(lambda mm=m: messagebox.showwarning("推送到 NAS 失败", mm))
+                return
+
+            jid = job.get("id", "?")
+            title = job.get("title", it.title)
+            msg = f"已解密并上传给 NAS：{title}"
+            self._ui(lambda: self._fetch_nas_set_status("NAS 转写队列中"))
+            self._log(f"[NAS] {msg}（任务 {jid}，自动转写中）")
+            self._ui(lambda: messagebox.showinfo(
+                "已交给 NAS",
+                f"{msg}\n\n任务 ID：{jid}\nNAS 正在排队转写，本机可以关闭了。\n\n"
+                f"进度与逐字稿：{base}/"))
 
         self._run_bg(work)
 
@@ -467,8 +618,10 @@ class FetchTabMixin:
             if len(streams) > 1:
                 note = f"（检测到 {len(streams)} 路，取第一路）"
             self._log(f"[NAS] 找到直播流 {pick.title_hint}{note}")
-            self._ui(lambda: self._fetch_nas_set_status(f"找到：{pick.title_hint}"))
-            self._fetch_nas_push(pick.url, pick.title_hint)
+            self._ui(lambda p=pick: (
+                self._fetch_nas_set_status(f"找到：{p.title_hint}"),
+                self._fetch_nas_push(p.url, p.title_hint),
+            ))
 
         self._run_bg(work)
 
@@ -550,7 +703,7 @@ class FetchTabMixin:
                 return
 
         if not getattr(it, "is_live", False):
-            self._fetch_nas_push(it.url, it.title)
+            self._fetch_nas_push_video(it)
             return
 
         # ---- 直播：先取一个当下真的能拉的地址 ----
@@ -571,8 +724,10 @@ class FetchTabMixin:
                     "这个直播取不到可用的流地址", m))
                 return
             self._log(f"[NAS] 取址成功（{src}，{why}）")
-            self._ui(lambda s=src: self._fetch_nas_set_status(f"已取址（{s}）"))
-            self._fetch_nas_push(url, it.title)
+            self._ui(lambda s=src, u=url: (
+                self._fetch_nas_set_status(f"已取址（{s}）"),
+                self._fetch_nas_push(u, it.title),
+            ))
 
         self._run_bg(work)
 

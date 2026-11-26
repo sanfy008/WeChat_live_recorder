@@ -722,3 +722,54 @@ def test_custom_name_not_overwritten_by_auto_title(tmp_path: Path, monkeypatch):
     finally:
         runner.shutdown()
 
+
+def test_probe_encrypted_vod_with_and_without_decrypt_key(tmp_path: Path, monkeypatch):
+    """加密视频探测：缺 decrypt_key 应给出明确加密提示；提供正确 key 应通过头校验。"""
+    from wxlive import sphdecrypt, stream_capture
+
+    seed = 1902534306
+    plain_mp4 = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2" + b"\x00" * 100
+    ks = sphdecrypt.keystream(seed, 64)
+    cipher_mp4 = bytes(b ^ ks[i] for i, b in enumerate(plain_mp4[:64])) + plain_mp4[64:]
+
+    monkeypatch.setattr(sphdecrypt, "head_info", lambda url, timeout=20: {
+        "status": 200, "content_length": len(cipher_mp4),
+        "enc_flag": 1, "enc_len": 64,
+    })
+    monkeypatch.setattr(sphdecrypt, "open_decrypted", lambda url, enc_len, k, timeout=60: (
+        sphdecrypt.DecryptingStream(io.BytesIO(cipher_mp4), enc_len, k)
+    ))
+
+    url = "https://finder.video.qq.com/251/20302/stodownload?encfilekey=ABC"
+    runner = NasJobRunner(data_dir=tmp_path, engine_factory=lambda t, l: _FakeEngine())
+    try:
+        app = create_app(runner=runner)
+        with TestClient(app) as client:
+            r1 = client.post("/api/probe", json={"url": url})
+            assert r1.status_code == 200
+            d1 = r1.json()
+            assert d1["ok"] is False
+            assert d1["encrypted"] is True
+            assert "decrypt_key" in d1["error"]
+
+            r2 = client.post("/api/probe", json={"url": url, "decrypt_key": seed})
+            assert r2.status_code == 200
+            d2 = r2.json()
+            assert d2["ok"] is True
+            assert d2["encrypted"] is True
+
+            r3 = client.post("/api/probe", json={"url": url, "decrypt_key": 111111})
+            assert r3.status_code == 200
+            d3 = r3.json()
+            assert d3["ok"] is False
+            assert "不匹配" in d3["error"]
+
+            # OpenAPI schema 必须声明 decrypt_key，供 GUI 自动探测能力
+            spec = client.get("/openapi.json").json()
+            schemas = spec["components"]["schemas"]
+            assert "decrypt_key" in schemas["ProbeReq"]["properties"]
+            assert "decrypt_key" in schemas["StreamStartReq"]["properties"]
+    finally:
+        runner.shutdown()
+
+

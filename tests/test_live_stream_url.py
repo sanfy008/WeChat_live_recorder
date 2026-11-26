@@ -342,3 +342,83 @@ def test_enable_tool_proxy_refuses_when_port_dead(monkeypatch):
     assert "2023" in msg
     assert called["n"] == 0
 
+
+def test_list_stream_candidates_falls_back_to_item_url(monkeypatch):
+    """日志翻页后若 item.url 本身已有直播流地址，也应保留为候选。"""
+    cdn = "http://pull-m1.wxlivecdn.com/trtc_1400419933/orig_555_orig.flv?txSecret=ok"
+    it = F.ContentItem(content_id="555", title="t", url=cdn, is_live=True, live_id="555")
+    monkeypatch.setattr(F, "_api_get", lambda *a, **kw: {"code": 0, "data": {"entries": []}})
+    cands = F.list_stream_candidates(it)
+    assert [u for u, _ in cands] == [cdn]
+
+
+def test_upload_to_nas_and_nas_supports_decrypt(tmp_path):
+    """真实本地 HTTP 服务验证 upload_to_nas multipart 上传与 nas_supports_decrypt 能力探测。"""
+    import http.server
+    import json as _j
+    import threading
+
+    received = {}
+    openapi_payload = {
+        "components": {
+            "schemas": {
+                "ProbeReq": {"properties": {"url": {}, "decrypt_key": {}}},
+                "StreamStartReq": {"properties": {"url": {}, "name": {}, "decrypt_key": {}}},
+            }
+        }
+    }
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/openapi.json":
+                body = _j.dumps(openapi_payload).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_response(404)
+            self.end_headers()
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            received["ct"] = self.headers.get("Content-Type", "")
+            received["body"] = self.rfile.read(n)
+            resp = _j.dumps({"id": "job_srv_1", "title": "答疑回放"}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+
+        def log_message(self, *args):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    port = srv.server_address[1]
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    try:
+        base = f"http://127.0.0.1:{port}"
+        assert F.nas_supports_decrypt(base) is True
+
+        openapi_payload["components"]["schemas"]["ProbeReq"]["properties"].pop("decrypt_key")
+        assert F.nas_supports_decrypt(base) is False
+
+        wav = tmp_path / "sample.wav"
+        wav.write_bytes(b"RIFFDATA12345678")
+        prog = []
+        job = F.upload_to_nas(
+            base, wav, name="答疑回放", auto_transcribe=True,
+            on_progress=lambda s, t: prog.append((s, t)),
+        )
+        assert job["id"] == "job_srv_1"
+        assert prog and prog[-1] == (16, 16)
+        assert b"RIFFDATA12345678" in received["body"]
+        assert "答疑回放".encode("utf-8") in received["body"]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
