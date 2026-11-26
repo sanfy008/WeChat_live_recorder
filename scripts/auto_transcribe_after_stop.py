@@ -146,7 +146,7 @@ def _transcribe(src: Path, log, engine_override: str | None = None,
                 local_backend_override: str | None = None) -> int:
     import soundfile as sf
 
-    from wxlive import lexicon, postprocess, userconfig
+    from wxlive import artifacts, lexicon, postprocess, userconfig
     from wxlive.config import Config, TRANSCRIPTS_DIR, ensure_dirs, validate_reasoning_effort
     from wxlive.pipeline import build_engine
     from wxlive.resample import StreamResampler
@@ -264,12 +264,23 @@ def _transcribe(src: Path, log, engine_override: str | None = None,
             log(f"要点生成失败: {e}")
             digest_stats = {"ok": False, "error": str(e)[:200]}
 
+    # ---------- 5. 产物自检 ----------
+    # 行数守恒、失败批 0、三份产物齐全都通过，产物仍可能是坏的：
+    # 2026-11-26 复盘发现某场终稿有 574 句繁体、另两场有幻觉句混进正文，
+    # 而这套验收一条都查不出来。这一步纯本地计算（毫秒级），只报告不改写。
+    quality = artifacts.check_segments(sess.segments)
+    log(quality.summary())
+    for kind, samples in quality.samples.items():
+        for s in samples:
+            log(f"          [{kind}] {s[:60]}")
+
     text_meta = {"model": text_model, "reasoning_effort": effort,
                  "fix": fix_stats, "digest": digest_stats}
     doc = sess.close(extra_meta={
         "engine": "auto_transcribe_after_stop",
         "asr": stats,
         "text": text_meta,
+        "quality": quality.to_meta(),
         "audio_seconds": round(dur, 1),
         "last_segment_end": round(float(last_ts), 1),
         "tail_gap_seconds": round(gap, 1),
