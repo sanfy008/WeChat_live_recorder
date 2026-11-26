@@ -22,6 +22,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 import urllib.parse
 import urllib.request
@@ -83,6 +84,7 @@ class ContentItem:
     duration_seconds: float = 0.0  # 只有解析（HEAD/整段探测）后才知道
     is_live: bool = False    # 直播流：地址要另取，不能直接当文件下载
     live_id: str = ""        # 直播场次 id（orig_<id>_ 里的那段）
+    decrypt_key: int = 0     # 日志直接带回的 decodeKey（未入库回放无需再查 detail）
 
     @property
     def api_id(self) -> str:
@@ -470,6 +472,20 @@ def list_stream_candidates(item: ContentItem, api: str = DEFAULT_API,
     return out
 
 
+def url_media_key(url: str) -> str:
+    """提取媒体条目的去重键（优先 encfilekey，退化为去 query 的 URL）。"""
+    if not url:
+        return ""
+    try:
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        enc = (qs.get("encfilekey") or [""])[0].strip()
+        if enc:
+            return "enc:" + enc
+    except Exception:  # noqa: BLE001
+        pass
+    return url.split("?", 1)[0]
+
+
 def discover_live_streams(api: str = DEFAULT_API,
                           timeout: int = 20) -> list:
     """从工具日志发现**正在直播**的场次，返回已带地址的 ContentItem 列表。
@@ -483,9 +499,10 @@ def discover_live_streams(api: str = DEFAULT_API,
         liveCdnUrl 打进了工具日志。实测在完全没入库的情况下，
         从日志取出的地址用 ffprobe 能直接拉到 aac+hevc。
 
-    为什么用 keyword 过滤而不拉几千条：
-        实测工具共 2385 条日志，过滤 liveCdnUrl 后只剩 53 条，
-        耗时 0.07s。不过滤要扫全量，每次刷新都白烧 IO。
+    2026-11-26 补充：
+        同时兼容两类日志结构：
+        - set_live_feed / onJoinLive：feed.live.liveSdkInfo.liveCdnUrl
+        - onFetchFeedProfile：feed.liveInfo.liveSdkInfo.liveCdnUrl（或 streamUrl）
 
     返回的 ContentItem.__class__ 与列表项相同，但 content_id 用的是
     直播场次 id —— 界面上用 "livediscover:" 前缀做 key，避免与
@@ -507,9 +524,9 @@ def discover_live_streams(api: str = DEFAULT_API,
             continue
 
         feed = obj.get("feed") or {}
-        live = feed.get("live") or {}
+        live = feed.get("live") or feed.get("liveInfo") or {}
         sdk = live.get("liveSdkInfo") or {}
-        cdn = str(sdk.get("liveCdnUrl") or "").strip()
+        cdn = str(sdk.get("liveCdnUrl") or live.get("streamUrl") or "").strip()
         if not cdn or not _looks_like_live(cdn):
             continue
 
@@ -525,13 +542,22 @@ def discover_live_streams(api: str = DEFAULT_API,
         if not live_id:
             continue
 
-        title = str(live.get("liveDescription") or "").strip()
+        od = feed.get("objectDesc") or {}
+        title = str(live.get("liveDescription")
+                    or od.get("description") or "").strip()
         if not title:
             title = "直播_" + live_id[-6:]
         author = ""
         prof = feed.get("profile")
         if isinstance(prof, dict):
             author = str(prof.get("nickname") or "").strip()
+        if not author:
+            contact = feed.get("contact")
+            author = str(
+                feed.get("nickname")
+                or (contact.get("nickname") if isinstance(contact, dict) else "")
+                or ""
+            ).strip()
 
         out.append(ContentItem(
             content_id=live_id,
@@ -541,6 +567,101 @@ def discover_live_streams(api: str = DEFAULT_API,
             is_live=True,
             live_id=live_id,
             captured_at=int(time.time() * 1000),
+        ))
+    return out
+
+
+def discover_feed_videos(api: str = DEFAULT_API,
+                         timeout: int = 20) -> list[ContentItem]:
+    """从工具日志（set_feed）发现未入库的视频 / 直播回放。
+
+    2026-11-26 实测：在微信里打开视频号视频或直播回放、但没点工具内置下载按钮时，
+    /api/content/list 里没有记录；但 wxcd 前端已经把含 url + urlToken + decodeKey
+    的完整 feed 打进了 set_feed 日志。把它们捞出来即可直接解析与下载，不必点下载按钮。
+    """
+    data = _api_get(api, "/api/logs?page_size=60&keyword=set_feed",
+                    timeout=timeout)
+    entries = (data.get("data") or {}).get("entries") or []
+
+    out: list[ContentItem] = []
+    seen_media: set[str] = set()
+    for entry in entries:
+        raw = entry.get("raw") if isinstance(entry, dict) else None
+        if not isinstance(raw, str):
+            continue
+        try:
+            obj = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+
+        feed = obj.get("feed") or {}
+        if not isinstance(feed, dict) or feed.get("liveInfo"):
+            continue
+
+        od = feed.get("objectDesc") or {}
+        media_list = od.get("media") or []
+        if not isinstance(media_list, list) or not media_list:
+            continue
+        m = media_list[0]
+        if not isinstance(m, dict):
+            continue
+
+        full = str(m.get("fullUrl") or "").strip()
+        if not full:
+            base_url = str(m.get("url") or "").strip()
+            tok = str(m.get("urlToken") or "").strip()
+            if base_url and tok and tok not in base_url:
+                full = base_url + tok
+            else:
+                full = base_url
+
+        if not full.startswith(("http://", "https://")):
+            continue
+        if ("stodownload" not in full and not m.get("videoPlayLen")
+                and not m.get("decodeKey")):
+            continue
+
+        mkey = url_media_key(full)
+        if not mkey or mkey in seen_media:
+            continue
+        seen_media.add(mkey)
+
+        cid = str(feed.get("id") or feed.get("objectId") or "").strip()
+        if not cid:
+            cid = mkey.replace("enc:", "")[:24]
+
+        title = str(od.get("description") or "").strip() or f"视频_{cid[-6:]}"
+        contact = feed.get("contact")
+        author = str(
+            feed.get("nickname")
+            or (contact.get("nickname") if isinstance(contact, dict) else "")
+            or ""
+        ).strip()
+
+        try:
+            pub = int(feed.get("createtime") or 0)
+        except (TypeError, ValueError):
+            pub = 0
+        try:
+            dkey = int(str(m.get("decodeKey") or "0").strip() or 0)
+        except (TypeError, ValueError):
+            dkey = 0
+        try:
+            dur = float(m.get("videoPlayLen") or 0)
+        except (TypeError, ValueError):
+            dur = 0.0
+
+        out.append(ContentItem(
+            content_id=cid,
+            title=title,
+            url=full,
+            cover_url=str(m.get("coverUrl") or "").strip(),
+            author=author,
+            publish_time=pub,
+            captured_at=int(time.time() * 1000),
+            duration_seconds=dur,
+            is_live=False,
+            decrypt_key=dkey,
         ))
     return out
 
@@ -664,7 +785,13 @@ def probe_item(item: ContentItem, timeout: int = 20) -> ProbeInfo:
 
 
 def get_decrypt_key(item: ContentItem, api: str = DEFAULT_API) -> int:
-    """\u53D6\u89E3\u5BC6\u5BC6\u94A5\u3002\u89C6\u9891\u53F7\u628A key \u653E\u5728 content.metadata \u91CC\uFF08\u5341\u8FDB\u5236\u5B57\u7B26\u4E32\uFF09\u3002"""
+    """取解密密钥。优先用日志直接带回的 decrypt_key，否则查 /api/content/detail。"""
+    preset = getattr(item, "decrypt_key", 0)
+    if preset:
+        try:
+            return int(preset)
+        except (TypeError, ValueError):
+            pass
     data = _api_get(api, "/api/content/detail?id=" +
                     urllib.parse.quote(item.api_id))
     if data.get("code") not in (0, None):
@@ -678,6 +805,69 @@ def get_decrypt_key(item: ContentItem, api: str = DEFAULT_API) -> int:
         return int(str(meta.get("key") or "0"))
     except (ValueError, TypeError) as exc:
         raise FetchError(f"\u89E3\u5BC6\u5BC6\u94A5\u89E3\u6790\u5931\u8D25\uFF1A{raw!r}") from exc
+
+
+def find_wxcd_exe() -> Path | None:
+    """定位本地抓流工具可执行文件（tools/wxcd/wx_video_download.exe）。"""
+    cand = Path(__file__).resolve().parent.parent / "tools" / "wxcd" / "wx_video_download.exe"
+    return cand if cand.is_file() else None
+
+
+def restart_wxcd(api: str = DEFAULT_API, timeout: float = 12.0) -> tuple[bool, str]:
+    """重启本地抓流工具（不带 server 参数直接运行），并确认代理接管 2023。"""
+    from . import systemproxy
+
+    exe = find_wxcd_exe()
+    if exe is None:
+        return False, "找不到 tools/wxcd/wx_video_download.exe"
+
+    if sys.platform == "win32":
+        winproc.run(
+            ["taskkill", "/F", "/IM", exe.name],
+            capture_output=True, text=True, timeout=8,
+        )
+        time.sleep(0.6)
+
+    flags = 0
+    if sys.platform == "win32":
+        flags = (getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+                 | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200))
+    winproc.popen(
+        [str(exe)],
+        cwd=str(exe.parent),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=flags,
+        close_fds=True,
+    )
+
+    deadline = time.time() + max(3.0, timeout)
+    api_ready = False
+    while time.time() < deadline:
+        try:
+            st = _api_get(api, "/api/status", timeout=2)
+            info = st.get("data") or {}
+            if (info.get("api") or {}).get("listening") and (info.get("proxy") or {}).get("listening"):
+                api_ready = True
+                break
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(0.4)
+
+    if not api_ready:
+        return False, "抓流工具启动超时，2022/2023 端口未就绪"
+
+    # 工具拉起拦截器后约 1s 会写注册表系统代理；若未写则由我们补写
+    for _ in range(5):
+        if systemproxy.is_tool_takeover():
+            return True, f"抓流工具已重启，系统代理已接管为 {systemproxy.TOOL_PROXY}"
+        time.sleep(0.4)
+
+    ok, msg = systemproxy.enable_tool_proxy()
+    if ok:
+        return True, f"抓流工具已重启，{msg}"
+    return False, f"抓流工具已重启，但代理接管失败：{msg}"
 
 
 def _find_ffmpeg() -> str:

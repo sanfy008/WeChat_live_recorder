@@ -100,6 +100,12 @@ class FetchTabMixin:
         self.fetch_proxy_btn = ttk.Button(px, text="还原系统代理", width=13,
                                          command=self._fetch_restore_proxy)
         self.fetch_proxy_btn.pack(side="right")
+        self.fetch_takeover_btn = ttk.Button(px, text="接管代理(抓流)", width=14,
+                                             command=self._fetch_takeover_proxy)
+        self.fetch_takeover_btn.pack(side="right", padx=(0, 6))
+        self.fetch_restart_tool_btn = ttk.Button(px, text="重启抓流工具", width=13,
+                                                 command=self._fetch_restart_tool)
+        self.fetch_restart_tool_btn.pack(side="right", padx=(0, 6))
         ttk.Button(px, text="重新检测", width=9,
                    command=self._fetch_refresh_proxy).pack(side="right", padx=(0, 6))
 
@@ -284,16 +290,16 @@ class FetchTabMixin:
         self.fetch_note.pack(fill="x", padx=12, pady=(0, 10))
 
         txt = (
-            "【回放：已放完】\n"
-            "1. 先启动抓流工具（tools/wxcd 下用根命令启动，不要加 server 子命令）\n"
-            "2. 在微信里打开目标回放/视频，工具会自动捕获地址与解密密钥\n"
-            "3. 点「刷新列表」，选中目标（可多选 / Ctrl+A），点「下载选中项的音频」→ 本地转写\n"
+            "【准备抓流】\n"
+            "1. 看上方状态条：显示「127.0.0.1:2023（抓流工具接管中）」才能抓；"
+            "若不是，点「重启抓流工具」或「接管代理(抓流)」\n"
+            "2. 若微信直播间在接管前就开着，需关闭后在微信里重新打开（停留 3-5 秒），"
+            "再点「刷新列表」\n"
             "\n"
-            "【直播：正在播】不要用「下载」，要推给 NAS —— 本机可以关掉，NAS 挂着录\n"
-            "4. 在微信里打开直播页，点一次抓流工具的下载按钮（让它起 ffmpeg）\n"
-            "5. 点「把正在播的直播推给 NAS」，地址会自动从 ffmpeg 命令行里读出来\n"
-            "6. NAS 停录后自动转写；进度与逐字稿在 NAS 网页上看\n"
+            "【回放/视频：已放完】点「刷新列表」→ 选中 →「下载选中项的音频」→ 本地转写\n"
+            "【直播：正在播】点「刷新列表」→ 选中直播 →「推送选中项到 NAS」（本机可关，NAS 挂着录）\n"
             "\n"
+            "用完抓流或关掉工具后，点「还原系统代理」即可切回日常代理 10808\n"
             "注：「删除选中 / 清空列表」只在本工具隐藏，不动工具数据库，随时可恢复"
         )
         self.fetch_note_label = ttk.Label(self.fetch_note, text=txt, justify="left",
@@ -613,19 +619,87 @@ class FetchTabMixin:
         self._run_bg(work)
 
     def _fetch_apply_proxy(self, text: str, diag: str) -> None:
-        """把状态与配色落到界面上。危险状态用橙色。"""
+        """把状态与配色落到界面上。危险状态用橙色，抓流接管中用绿色。"""
+        from . import systemproxy
+
         self.fetch_proxy_var.set(text)
         try:
             if diag.startswith("⚠"):
                 # 警告：代理指着没人监听的端口，已经在断网了
                 self.fetch_proxy_label.configure(style="Warn.TLabel")
                 self._log("[代理] " + diag)
+            elif systemproxy.TOOL_PROXY in text:
+                self.fetch_proxy_label.configure(style="Ok.TLabel")
             else:
                 self.fetch_proxy_label.configure(style="Hint.TLabel")
             # 任何状态下都允许点还原 —— 工具接管中也可能想主动收工
             self.fetch_proxy_btn.configure(state="normal")
         except Exception:  # noqa: BLE001
             pass
+
+    def _fetch_takeover_proxy(self) -> None:
+        """把系统代理切到 127.0.0.1:2023（抓流端口）；工具没跑时引导直接重启。"""
+        from . import systemproxy
+
+        def work() -> None:
+            if not systemproxy.tool_still_running():
+                def ask_start() -> None:
+                    if messagebox.askyesno(
+                            "抓流工具未就绪",
+                            "2023 抓流端口当前没有监听。\n\n"
+                            "要现在直接启动/重启抓流工具并接管系统代理吗？"):
+                        self._fetch_restart_tool()
+                self._ui(ask_start)
+                return
+
+            ok, detail = systemproxy.enable_tool_proxy()
+            self._log("[代理] " + detail)
+            if ok:
+                self._ui(lambda d=detail: (
+                    self._fetch_refresh_proxy(),
+                    messagebox.showinfo(
+                        "已接管代理",
+                        d + "\n\n如果微信里的直播/回放刚才已经打开，"
+                        "请先关闭再重新打开停留 3-5 秒，然后点「刷新列表」。"),
+                ))
+            else:
+                self._ui(lambda d=detail: (
+                    self._fetch_refresh_proxy(),
+                    messagebox.showwarning("切换失败", d),
+                ))
+
+        self._run_bg(work)
+
+    def _fetch_restart_tool(self) -> None:
+        """一键重启抓流工具（无需命令行），自动恢复 2023 系统代理接管。"""
+        from . import fetch as F
+
+        api = self.fetch_api_var.get().strip() or "http://127.0.0.1:2022"
+        self.fetch_restart_tool_btn.configure(state="disabled")
+        self.fetch_proxy_var.set("抓流工具重启中，请稍候…")
+        self._log("[代理] 正在重启抓流工具…")
+
+        def work() -> None:
+            try:
+                ok, detail = F.restart_wxcd(api=api)
+            except Exception as exc:  # noqa: BLE001
+                ok, detail = False, f"{type(exc).__name__}: {exc}"
+
+            def done() -> None:
+                self.fetch_restart_tool_btn.configure(state="normal")
+                self._fetch_refresh_proxy()
+                self._log("[代理] " + detail)
+                if ok:
+                    messagebox.showinfo(
+                        "抓流工具已就绪",
+                        detail + "\n\n请在微信里重新打开要录的直播或回放"
+                        "（停留 3-5 秒），再回来点「刷新列表」。")
+                else:
+                    messagebox.showwarning("重启失败", detail)
+
+            self._ui(done)
+
+        self._run_bg(work)
 
     def _fetch_proxy_poll(self) -> None:
         """每 60 秒自检一次。
@@ -699,6 +773,7 @@ class FetchTabMixin:
 
     def _fetch_health_worker(self, api: str) -> None:
         from . import fetch as F
+        from . import systemproxy
 
         try:
             data = F._api_get(api, "/api/status")
@@ -711,26 +786,52 @@ class FetchTabMixin:
         proxy = info.get("proxy") or {}
         version = info.get("version") or "?"
         srv = info.get("server_statuses") or {}
+
+        st = systemproxy.read()
+        proxy_listening = bool(proxy.get("listening")) or systemproxy.tool_still_running()
+        diag = systemproxy.diagnose(st)
+        taking_over = bool(st.get("enabled")) and systemproxy.TOOL_PROXY in (st.get("server") or "")
+
         text = (
             f"抓流工具版本：{version}\n"
             f"API   {api_part.get('addr', api)} -> {api_part.get('status', '?')}\n"
-            f"代理  {proxy.get('addr', '?')} -> {proxy.get('status', '?')}\n"
+            f"抓流端口 {proxy.get('addr', '?')} -> "
+            f"{proxy.get('status') or ('listening' if proxy_listening else '?')}\n"
+            f"系统代理：{diag}\n"
             f"服务  {', '.join(f'{k}={v}' for k, v in srv.items()) or '?'}"
         )
+
+        if not proxy_listening:
+            reason = "抓流工具的 2023 代理端口未监听，建议点「重启抓流工具」。"
+            self._ui(lambda t=text, r=reason: self._fetch_show_health_warn(t, r))
+            return
+        if not taking_over:
+            reason = (
+                "抓流工具在运行，但当前 Windows 系统代理没有指向 127.0.0.1:2023，"
+                "微信流量会被直接旁路，无法解析出直播或回放。\n"
+                "请点上方「接管代理(抓流)」后再在微信里重新打开直播间。"
+            )
+            self._ui(lambda t=text, r=reason: self._fetch_show_health_warn(t, r))
+            return
+
         self._ui(lambda t=text: self._fetch_show_health_ok(t))
 
     def _fetch_show_health_ok(self, text: str) -> None:
         self._log("[体检] " + text.replace("\n", " | "))
         messagebox.showinfo("体检通过", text)
 
+    def _fetch_show_health_warn(self, text: str, reason: str) -> None:
+        self._log("[体检] 未通过：" + reason.replace("\n", " "))
+        messagebox.showwarning("体检未通过：当前抓不到流", text + "\n\n问题：\n" + reason)
+
     def _fetch_show_health_fail(self, err: str) -> None:
         self._log(f"[体检] 失败：{err}")
         messagebox.showwarning(
             "工具没在运行",
             "连不上抓流工具。\n\n"
-            "请确认：\n"
-            "1. tools/wxcd 下的 wx_video_download.exe 正在运行\n"
-            "2. 用根命令启动（不是 server 子命令，那个会强制关掉代理）\n"
+            "请尝试：\n"
+            "1. 直接点页面上的「重启抓流工具」按钮（会自动启动并接管代理）\n"
+            "2. 或确认 tools/wxcd 下的 wx_video_download.exe 正在运行\n"
             f"3. API 地址是否正确：{self.fetch_api_var.get()}\n\n"
             f"原始错误：{err}")
 
@@ -766,6 +867,11 @@ class FetchTabMixin:
         except Exception:  # noqa: BLE001
             cands = []
 
+        kw_low = (keyword or "").strip().lower()
+        if kw_low:
+            cands = [c for c in cands
+                     if kw_low in c.title.lower() or kw_low in c.author.lower()]
+
         if cands:
             from concurrent.futures import ThreadPoolExecutor
 
@@ -782,6 +888,16 @@ class FetchTabMixin:
                     else:
                         self._log(f"[直播] 跳过《{cand.title}》：{why}")
 
+        found_videos = []
+        try:
+            vcands = F.discover_feed_videos(api)[:30]
+            if kw_low:
+                vcands = [v for v in vcands
+                          if kw_low in v.title.lower() or kw_low in v.author.lower()]
+            found_videos = vcands
+        except Exception:  # noqa: BLE001
+            found_videos = []
+
         try:
             result = F.list_page(api, keyword=keyword,
                                  limit=size, offset=(page - 1) * size)
@@ -795,11 +911,16 @@ class FetchTabMixin:
             msg = f"{type(exc).__name__}: {exc}"
             self._ui(lambda m=msg: self._fetch_refresh_done(None, m))
             return
-        if result is not None and found_lives:
-            result.discovered_lives = found_lives
+        if result is not None:
+            if found_lives:
+                result.discovered_lives = found_lives
+            if found_videos:
+                result.discovered_videos = found_videos
         self._ui(lambda: self._fetch_refresh_done(result, ""))
 
     def _fetch_refresh_done(self, result, err: str) -> None:
+        from . import fetch as F
+
         for row in self.fetch_tree.get_children():
             self.fetch_tree.delete(row)
         self._fetch_items.clear()
@@ -825,15 +946,39 @@ class FetchTabMixin:
         # 而且刚在后台探活确认能拉。放在最前面，因为用户刷新的动机通常就是它。
         discovered = list(getattr(result, "discovered_lives", None) or [])
         in_page = {it.content_id for it in items}
+        in_page_media = {F.url_media_key(it.url) for it in items if it.url}
         fresh = []
         for it in discovered:
             if it.live_id in in_page or it.content_id in in_page:
                 continue          # 已经在上面的列表里，别重复
+            is_hidden = it.content_id in hidden
+            if is_hidden and not show_hidden:
+                continue
             if only_new and it.content_id in done_ids:
                 continue
-            self._fetch_add_row(it, False, discovered=True)
+            self._fetch_add_row(it, is_hidden, discovered=True)
             fresh.append(it)
+            in_page.add(it.content_id)
         shown_discovered = len(fresh)
+
+        # ---- 再渲染"从日志发现的视频 / 直播回放" ----
+        discovered_videos = list(getattr(result, "discovered_videos", None) or [])
+        fresh_videos = []
+        for it in discovered_videos:
+            mkey = F.url_media_key(it.url)
+            if it.content_id in in_page or (mkey and mkey in in_page_media):
+                continue
+            is_hidden = it.content_id in hidden
+            if is_hidden and not show_hidden:
+                continue
+            if only_new and it.content_id in done_ids:
+                continue
+            self._fetch_add_row(it, is_hidden, discovered=True)
+            fresh_videos.append(it)
+            in_page.add(it.content_id)
+            if mkey:
+                in_page_media.add(mkey)
+        shown_discovered_videos = len(fresh_videos)
 
         shown = 0
         hidden_here = 0
@@ -863,6 +1008,8 @@ class FetchTabMixin:
         bits = [f"共 {self._fetch_total} 条"]
         if shown_discovered:
             bits.append(f"{shown_discovered} 场直播是从日志发现的")
+        if shown_discovered_videos:
+            bits.append(f"{shown_discovered_videos} 条视频/回放是从日志发现的")
         if shown != len(items):
             bits.append(f"本页显示 {shown}/{len(items)}")
         if hidden_here and not show_hidden:
@@ -872,7 +1019,8 @@ class FetchTabMixin:
             bits.append(f"{n_done} 条已下载")
         self.fetch_hint_var.set("，".join(bits))
 
-        if not items:
+        total_shown = shown + shown_discovered + shown_discovered_videos
+        if not items and not discovered and not discovered_videos:
             if self.fetch_search_var.get().strip():
                 self._log(f"[下载] 搜索「{self.fetch_search_var.get()}」无结果")
             else:
@@ -880,9 +1028,9 @@ class FetchTabMixin:
                 messagebox.showinfo(
                     "还没有内容",
                     "工具里还没有捕获到任何视频。\n\n"
-                    "请在微信 PC 端打开目标回放/视频，让流量经过抓流工具，"
-                    "然后回来点「刷新列表」。")
-        elif shown == 0:
+                    "请先确认上方系统代理处于「127.0.0.1:2023（抓流工具接管中）」，\n"
+                    "然后在微信 PC 端重新打开目标直播或回放，再点「刷新列表」。")
+        elif total_shown == 0:
             # 有数据但全被过滤掉了 —— 必须说清楚，否则用户以为坏了
             self._log("[下载] 有内容但被视图过滤掉了")
             messagebox.showinfo(
@@ -915,6 +1063,9 @@ class FetchTabMixin:
             dur = float(rec.get("duration") or 0.0)
             state_text = f"已下载 {dur/60:.0f} 分钟" if dur else "已下载"
             tags = ("done",)
+        elif discovered:
+            state_text = "待下载（日志发现）"
+            tags = ()
         else:
             state_text = "待下载"
             tags = ()

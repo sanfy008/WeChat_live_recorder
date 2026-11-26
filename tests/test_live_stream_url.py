@@ -252,3 +252,93 @@ def test_discover_tolerates_broken_rows(monkeypatch):
     })
     items = F.discover_live_streams()
     assert len(items) == 1 and items[0].live_id == "333"
+
+
+# ---------------- 6. 2026-11-26 兼容 onFetchFeedProfile + set_feed 回放发现 + 代理接管 ----------------
+
+def test_discover_live_streams_supports_on_fetch_feed_profile(monkeypatch):
+    """onFetchFeedProfile 把直播信息放在 feed.liveInfo（而不是 feed.live）。"""
+    import json as _j
+
+    cdn = "https://pull-m1.wxlivecdn.com/trtc_1400419933/orig_2079010816536721148_orig.flv?txSecret=xyz"
+    raw = _j.dumps({
+        "feed": {
+            "nickname": "小升初升学",
+            "objectDesc": {"description": "期末备考规划"},
+            "liveInfo": {
+                "liveStatus": 1,
+                "liveSdkInfo": {"liveCdnUrl": cdn},
+            },
+        }
+    }, ensure_ascii=False)
+    monkeypatch.setattr(F, "_api_get", lambda api, path, timeout=20: {
+        "code": 0, "data": {"entries": [{"raw": raw}]}
+    })
+    items = F.discover_live_streams()
+    assert len(items) == 1
+    assert items[0].title == "期末备考规划"
+    assert items[0].author == "小升初升学"
+    assert items[0].live_id == "2079010816536721148"
+    assert items[0].url == cdn
+
+
+def test_discover_feed_videos_parses_set_feed_and_decrypt_key(monkeypatch):
+    """未点下载的视频/回放，应能从 set_feed 日志补全 url+urlToken 与 decodeKey。"""
+    import json as _j
+
+    raw_video = _j.dumps({
+        "feed": {
+            "id": "14883581847679010000",
+            "createtime": 1774261218,
+            "nickname": "回放老师",
+            "objectDesc": {
+                "description": "小升初数学直播回放",
+                "media": [{
+                    "url": "https://finder.video.qq.com/251/20302/stodownload?encfilekey=ABC123&idx=1",
+                    "urlToken": "&token=TOK999",
+                    "decodeKey": 1840104542,
+                    "videoPlayLen": 3600,
+                    "coverUrl": "https://finder.video.qq.com/251/20304/stodownload?encfilekey=COV",
+                }],
+            },
+        }
+    }, ensure_ascii=False)
+    # 带 liveInfo 的条目应被忽略（由 discover_live_streams 处理）
+    raw_live = _j.dumps({
+        "feed": {
+            "id": "999",
+            "liveInfo": {"liveStatus": 1},
+            "objectDesc": {"media": [{"url": "https://wx.qlogo.cn/avatar"}]},
+        }
+    })
+    monkeypatch.setattr(F, "_api_get", lambda api, path, timeout=20: {
+        "code": 0, "data": {"entries": [{"raw": raw_live}, {"raw": raw_video}, {"raw": raw_video}]}
+    })
+
+    items = F.discover_feed_videos()
+    assert len(items) == 1
+    it = items[0]
+    assert it.title == "小升初数学直播回放"
+    assert it.author == "回放老师"
+    assert it.url.endswith("&token=TOK999")
+    assert it.decrypt_key == 1840104542
+    assert it.is_live is False
+
+    # get_decrypt_key 应直接返回 preset decrypt_key，不请求 /api/content/detail
+    monkeypatch.setattr(F, "_api_get", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("不应调 detail")))
+    assert F.get_decrypt_key(it) == 1840104542
+
+
+def test_enable_tool_proxy_refuses_when_port_dead(monkeypatch):
+    """2023 没在监听时绝不能把系统代理切过去（会直接断网）。"""
+    from wxlive import systemproxy as sp
+
+    monkeypatch.setattr(sp, "tool_still_running", lambda: False)
+    called = {"n": 0}
+    monkeypatch.setattr(sp, "_reg_set", lambda *a, **kw: called.__setitem__("n", called["n"] + 1) or True)
+
+    ok, msg = sp.enable_tool_proxy()
+    assert ok is False
+    assert "2023" in msg
+    assert called["n"] == 0
+

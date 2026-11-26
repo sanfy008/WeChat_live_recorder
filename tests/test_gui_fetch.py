@@ -36,11 +36,12 @@ def app(tmp_path, monkeypatch):
     monkeypatch.setattr(GF.messagebox, "askyesno", lambda *a, **kw: True)
     monkeypatch.setattr(GF.messagebox, "askyesnocancel", lambda *a, **kw: True)
 
-    # 刷新列表现在还会调 fetch.discover_live_streams（从工具日志找正在播的
-    # 直播）。这里必须一并桩掉，否则每个 GUI 用例都会真的去连 127.0.0.1:2022，
-    # 把真实直播混进断言里 —— 正是本文件开头警告过的那个坑。
+    # 刷新列表现在还会调 fetch.discover_live_streams / discover_feed_videos。
+    # 这里必须一并桩掉，否则每个 GUI 用例都会真的去连 127.0.0.1:2022，
+    # 把真实直播/回放混进断言里 —— 正是本文件开头警告过的那个坑。
     import wxlive.fetch as F
     monkeypatch.setattr(F, "discover_live_streams", lambda *a, **kw: [])
+    monkeypatch.setattr(F, "discover_feed_videos", lambda *a, **kw: [])
 
     from wxlive.gui import App
 
@@ -110,9 +111,11 @@ def stub_list(monkeypatch):
         return holder["page"]
 
     monkeypatch.setattr(F, "list_page", fake)
-    # 发现直播默认空；需要验证"日志发现"渲染的用例自己覆盖 holder["lives"]
+    # 发现直播/回放默认空；需要验证"日志发现"渲染的用例自己覆盖 holder["lives"] / holder["videos"]
     monkeypatch.setattr(F, "discover_live_streams",
                         lambda *a, **kw: holder.get("lives") or [])
+    monkeypatch.setattr(F, "discover_feed_videos",
+                        lambda *a, **kw: holder.get("videos") or [])
     return holder, calls
 
 
@@ -709,3 +712,108 @@ def test_proxy_restore_confirmed(app, monkeypatch):
     app._fetch_restore_proxy()
     _pump(app)
     assert called["n"] == 1
+
+
+def test_fetch_health_warns_when_proxy_not_2023(app, monkeypatch):
+    """工具 API 正常但系统代理指着 10808 时，体检必须告警而不是报「体检通过」。"""
+    import wxlive.fetch as F
+    import wxlive.gui_fetch as GF
+    import wxlive.systemproxy as P
+
+    monkeypatch.setattr(F, "_api_get", lambda *a, **kw: {
+        "code": 0,
+        "data": {
+            "version": "261106",
+            "api": {"addr": "127.0.0.1:2022", "status": "running"},
+            "proxy": {"addr": "127.0.0.1:2023", "listening": True, "status": "running"},
+            "server_statuses": {"api": "running", "interceptor": "running"},
+        },
+    })
+    monkeypatch.setattr(P, "read", lambda: {
+        "enabled": True, "server": P.FIXED_PROXY, "override": ""
+    })
+    monkeypatch.setattr(P, "tool_still_running", lambda: True)
+
+    warns = []
+    oks = []
+    monkeypatch.setattr(GF.messagebox, "showwarning", lambda t, m, **kw: warns.append((t, m)))
+    monkeypatch.setattr(GF.messagebox, "showinfo", lambda t, m, **kw: oks.append((t, m)))
+
+    app._fetch_check_health()
+    _pump(app)
+
+    assert not oks, "系统代理没走 2023 时不应报体检通过"
+    assert warns and "抓不到流" in warns[0][0]
+
+
+def test_fetch_health_passes_when_proxy_is_2023(app, monkeypatch):
+    """工具在线且系统代理指着 2023 时，体检通过。"""
+    import wxlive.fetch as F
+    import wxlive.gui_fetch as GF
+    import wxlive.systemproxy as P
+
+    monkeypatch.setattr(F, "_api_get", lambda *a, **kw: {
+        "code": 0,
+        "data": {
+            "version": "261106",
+            "api": {"addr": "127.0.0.1:2022", "status": "running"},
+            "proxy": {"addr": "127.0.0.1:2023", "listening": True, "status": "running"},
+            "server_statuses": {"api": "running", "interceptor": "running"},
+        },
+    })
+    monkeypatch.setattr(P, "read", lambda: {
+        "enabled": True, "server": P.TOOL_PROXY, "override": ""
+    })
+    monkeypatch.setattr(P, "tool_still_running", lambda: True)
+
+    oks = []
+    monkeypatch.setattr(GF.messagebox, "showinfo", lambda t, m, **kw: oks.append((t, m)))
+
+    app._fetch_check_health()
+    _pump(app)
+
+    assert oks and "体检通过" in oks[0][0]
+
+
+def test_fetch_refresh_shows_discovered_videos_and_dedups_by_encfilekey(app, stub_list, monkeypatch):
+    """set_feed 发现的回放/视频：在 list_page 为空时不弹「还没有内容」，且按 encfilekey 去重。"""
+    import wxlive.gui_fetch as GF
+    from wxlive.fetch import ContentItem
+
+    holder, _ = stub_list
+    # Case 1: content/list 为空，但日志发现一条回放
+    holder["page"] = _fake_page([])
+    holder["videos"] = [
+        ContentItem(
+            content_id="14883581847679010000",
+            title="小升初数学回放",
+            url="https://finder.video.qq.com/251/20302/stodownload?encfilekey=ENC1&token=T1",
+            author="名师",
+            decrypt_key=123456,
+        )
+    ]
+    infos = []
+    monkeypatch.setattr(GF.messagebox, "showinfo", lambda t, m, **kw: infos.append((t, m)))
+
+    app._fetch_refresh()
+    _pump(app)
+
+    rows = app.fetch_tree.get_children()
+    assert len(rows) == 1
+    assert app.fetch_tree.item(rows[0], "values")[0] == "小升初数学回放"
+    assert "日志发现" in app.fetch_tree.item(rows[0], "values")[3]
+    assert not infos, "日志已经发现了回放，不该弹「还没有内容」"
+
+    # Case 2: 同一条视频也出现在 content/list 里（id 精度不同但 encfilekey 相同）→ 去重只留 1 行
+    holder["page"] = _fake_page([
+        ContentItem(
+            content_id="14883581847679010351",
+            title="小升初数学回放",
+            url="https://finder.video.qq.com/251/20302/stodownload?encfilekey=ENC1&token=T2",
+            author="名师",
+        )
+    ])
+    app._fetch_refresh()
+    _pump(app)
+    assert len(app.fetch_tree.get_children()) == 1
+

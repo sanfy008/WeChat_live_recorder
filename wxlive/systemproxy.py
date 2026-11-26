@@ -163,13 +163,26 @@ def describe(st: dict | None = None) -> str:
     if st is None:
         st = read()
     if not st["enabled"]:
-        return "系统代理：已关闭（直连）"
+        return "系统代理：已关闭（直连，抓不到微信内容）"
     server = st["server"] or "?"
     if TOOL_PROXY in server:
         return f"系统代理：{server}（抓流工具接管中，关掉工具会断网）"
     if FIXED_PROXY in server:
-        return f"系统代理：{server}（正常）"
+        return f"系统代理：{server}（日常出口正常，未经过抓流工具）"
     return f"系统代理：{server}（不是预期的 {FIXED_PROXY}）"
+
+
+def _apply_proxy(target: str, ok_msg: str) -> tuple[bool, str]:
+    """写入 ProxyEnable=1 与 ProxyServer=target，刷新 WinINET 并读回校验。"""
+    ok_enable = _reg_set("ProxyEnable", "1", kind="REG_DWORD")
+    ok_server = _reg_set("ProxyServer", target)
+    if ok_enable and ok_server:
+        refresh_wininet()
+        after = read()
+        if after["enabled"] and after["server"] == target:
+            return True, ok_msg
+        return False, f"写入后读回不一致：{after['server']!r}"
+    return False, "写注册表失败（可能需要管理员权限）"
 
 
 def restore_fixed() -> tuple[bool, str]:
@@ -182,15 +195,27 @@ def restore_fixed() -> tuple[bool, str]:
     if st["enabled"] and st["server"] == FIXED_PROXY:
         return True, "系统代理已经是 " + FIXED_PROXY + "，无需还原"
 
-    ok_enable = _reg_set("ProxyEnable", "1", kind="REG_DWORD")
-    ok_server = _reg_set("ProxyServer", FIXED_PROXY)
-    if ok_enable and ok_server:
-        refresh_wininet()
-        after = read()
-        if after["enabled"] and after["server"] == FIXED_PROXY:
-            return True, "已还原系统代理为 " + FIXED_PROXY
-        return False, f"写入后读回不一致：{after['server']!r}"
-    return False, "写注册表失败（可能需要管理员权限）"
+    return _apply_proxy(FIXED_PROXY, "已还原系统代理为 " + FIXED_PROXY)
+
+
+def enable_tool_proxy() -> tuple[bool, str]:
+    """把系统代理切到抓流工具端口 127.0.0.1:2023。
+
+    切之前必须确认 2023 正在监听，绝不能把系统代理指向死端口导致断网。
+    """
+    if not tool_still_running():
+        return False, (
+            f"抓流工具未在 {TOOL_PROXY} 监听，不能切换代理（否则会断网）。"
+            "请先点「重启抓流工具」。"
+        )
+    st = read()
+    if st["enabled"] and st["server"] == TOOL_PROXY:
+        return True, f"系统代理已经是 {TOOL_PROXY}（抓流工具接管中）"
+
+    return _apply_proxy(
+        TOOL_PROXY,
+        f"已切换系统代理为 {TOOL_PROXY}（抓流工具接管中）",
+    )
 
 
 def tool_still_running() -> bool:
@@ -212,15 +237,16 @@ def diagnose(st: dict | None = None) -> str:
     if st is None:
         st = read()
     if not st["enabled"]:
-        return "系统代理已关闭，微信流量不会经过抓流工具，抓不到内容"
+        return "⚠ 系统代理已关闭，微信流量不会经过抓流工具，抓不到内容"
     server = st["server"] or ""
     if TOOL_PROXY in server:
         alive = tool_still_running()
         if alive:
-            return (f"系统代理 {server}（工具在跑）。"
-                    f"用完记得关工具或点「还原系统代理」")
+            return (f"系统代理 {server}（抓流工具接管中）。"
+                    f"用完记得点「还原系统代理」")
         return (f"⚠ 系统代理仍指向 {server}，但工具已不在运行 —— "
                 f"现在正在断网，请点「还原系统代理」")
     if FIXED_PROXY in server:
-        return f"系统代理 {server}，正常"
+        return (f"系统代理 {server}，日常出口正常"
+                "（未走抓流端口 2023；要抓流请点「接管代理(抓流)」）")
     return f"⚠ 系统代理是 {server}，不是预期的 {FIXED_PROXY}"
