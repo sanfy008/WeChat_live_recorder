@@ -1001,7 +1001,7 @@ class App(FetchTabMixin, tk.Tk):
             try:
                 lexicon.apply_loaded(lexicon.load(
                     Path(cfg.asr.lexicon_path) if cfg.asr.lexicon_path else None))
-                vocab = "、".join(lexicon.SCHOOLS[:60] + lexicon.TERMS[:40])
+                vocab = lexicon.build_vocabulary(60, 40)
             except Exception:
                 vocab = ""
             fixed = postprocess.fix_errors(

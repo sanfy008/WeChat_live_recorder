@@ -12,11 +12,11 @@ from wxlive import lexicon
 
 
 def test_fix_xiaoshi_corrections():
-    """省实相关的实测错字都要能修回来。"""
+    """省实永平相关的实测错字都要能修回来。"""
     cases = {
-        "省市用品有付费MK吗": "省实有付费MK吗",
-        "盛世用平有附中MK吗": "省实有附中MK吗",
-        "陈氏用品有复分MK吗": "省实有复分MK吗",
+        "省市用品有付费MK吗": "省实永平有付费MK吗",
+        "盛世用平有附中MK吗": "省实永平有附中MK吗",
+        "陈氏用品有复分MK吗": "省实永平有复分MK吗",
     }
     for wrong, right in cases.items():
         assert lexicon.correct_text(wrong) == right, f"失败: {wrong}"
@@ -228,13 +228,13 @@ def test_xiaojinlong_is_qifu_not_jinguangfu():
 
 
 def test_qingwan_mapping():
-    """清湾 = 清华附中湾区学校（QW/QHFZ），与"清实"不是一回事。"""
+    """清湾 = 清华附中湾区学校（QHFZ）。QW 与华侨外国语冲突归入 ambiguous_codes，清实保留在 _待确认。"""
     from wxlive import lexicon
     lexicon.apply_loaded(lexicon.load())
-    assert lexicon.CODES["QW"] == "清湾"
     assert lexicon.CODES["QHFZ"] == "清湾"
-    # 直播口语"清实"归到清湾（B 级推断，图谱未载）
-    assert lexicon.CODES.get("清实") == "清湾"
+    assert "QW" not in lexicon.CODES
+    assert "清湾" in lexicon.AMBIGUOUS_CODES.get("QW", [])
+    assert "清实" not in lexicon.CODES
 
 
 def test_expand_does_not_rescan_expanded_text():
@@ -297,7 +297,7 @@ def test_full_real_transcript_no_artifacts():
 # ========== 2026-11-16 King 人工订正（官方暗语图谱 OCR 校准） ==========
 
 def test_banxing_codes_from_official_chart():
-    """官方特色班(ZDB)解码表必须齐全。"""
+    """官方特色班(ZDB)解码表必须齐全（多义碰撞项归入 ambiguous_codes）。"""
     from wxlive import lexicon
     lexicon.apply_loaded(lexicon.load())
     expect = {
@@ -308,19 +308,21 @@ def test_banxing_codes_from_official_chart():
         "BSNS": "白省南山班",
         "HHL": "广大附黄华路课改班",
         "大奥": "广大附大学城奥班",
-        "小奥": "南沙广附实验小奥",
         "LG": "六中课改班", "龙哥": "六中课改班",
         "HSYSB": "海实院士班",
         "ZA": "执信奥班",
         "金奥": "金广附奥班",
         "XC": "广中小创班",
-        "ZG": "择高班",
         "DC": "真光大成智慧班",
     }
     merged = lexicon.load()
     for k, v in expect.items():
         got = merged["codes"].get(k)
         assert got == v, f"{k} 应为 {v}，实为 {got}"
+    # 小奥 / ZG / JW 属于多义碰撞项，进入 ambiguous_codes
+    for amb_k in ("小奥", "ZG", "JW"):
+        assert amb_k not in merged["codes"]
+        assert amb_k in merged["ambiguous_codes"]
 
 
 def test_20261120_xsc_terms_and_safe_corrections():
@@ -365,16 +367,18 @@ def test_ranking_chart_classes_and_codes():
 
 
 def test_zeigao_is_class_not_school():
-    """"择高班"是班型代码(ZG)，不是某所学校。"""
+    """"择高班"是班型代码（ZG 与真光中学多义碰撞），不应把"泽高"绑定到某校。"""
     from wxlive import lexicon
     lexicon.apply_loaded(lexicon.load())
-    assert lexicon.CODES.get("ZG") == "择高班"
+    assert "择高班" in lexicon.AMBIGUOUS_CODES.get("ZG", [])
+    assert lexicon.CODES.get("ZG") is None
+    assert lexicon.CODES.get("择高班") == "择高班"
     # "泽高"是"择高"的同音误写，不应绑定到具体学校
     assert lexicon.CODES.get("泽高") is None, "泽高不应映射到学校"
 
 
 def test_key_schools_ocr_verified():
-    """官方图谱核对过的关键映射。"""
+    """官方图谱核对过的关键映射（v5 消歧后的单义表 + 多义隔离）。"""
     from wxlive import lexicon
     lexicon.apply_loaded(lexicon.load())
     expect = {
@@ -386,15 +390,116 @@ def test_key_schools_ocr_verified():
         "ZDF": "中大附中", "周大福": "中大附中", "金店": "中大附中",
         "YCSY": "育才实验", "浴室": "育才实验",
         "LZ": "六中", "芝麻鸡": "六中",
-        "TY": "铁一中学", "鸡腿": "铁一中学",
+        "鸡腿": "铁一中学",
         "BT": "白云铁一", "白切鸡": "白云铁一",
         "BYHF": "白云华赋", "烧鸡": "白云华赋",
         "HF": "华附奥校", "帮主": "华附奥校", "神学院": "华附奥校",
-        "PWWGY": "培文外国语", "培文": "培文外国语",
+        "培文": "培文外国语",
         "HPHC": "黄埔华初", "华初": "黄埔华初",
         "DJWGY": "东江外国语", "东江": "东江外国语",
+        "钢钉": "荔湾省实", "花地湾": "荔湾省实",
+        "云景PY": "云英实验", "ZCZX": "执信中学增城实验学校",
+        "ZXTH": "天河执信", "2J": "二中基地班", "2B": "二中本部",
     }
     merged = lexicon.load()
     for k, v in expect.items():
         got = merged["codes"].get(k)
         assert got == v, f"{k} 应为 {v}，实为 {got}"
+    # TY / PWWGY 存在多义碰撞，不可穿透复活
+    for amb in ("TY", "PWWGY"):
+        assert amb not in merged["codes"]
+        assert amb in merged["ambiguous_codes"]
+
+
+# ================= v5 边界/截断/消歧/防穿透回归测试 =================
+
+def test_v5_expand_ascii_alnum_boundary_and_url_mask():
+    """65TY / 2022Z / URL 均不能被误展开。"""
+    from wxlive import lexicon
+    lexicon.apply_loaded(lexicon.load())
+    assert lexicon.expand_codes("65TY怎么样") == "65TY怎么样"
+    assert lexicon.expand_codes("2022Z招生") == "2022Z招生"
+    url = "https://example.com/HS/DA/65TY/百六?q=730家"
+    assert lexicon.expand_codes(url) == url
+    assert lexicon.correct_text(url) == url
+
+
+def test_v5_expand_no_self_parens_and_suffix_protection(tmp_path):
+    """YMO 不产生 YMO（YMO）；石楼中学/铁一中学/培文外国语/省实永平不被切碎。"""
+    import json
+    from wxlive import lexicon
+    lexicon.apply_loaded(lexicon.load())
+    assert lexicon.expand_codes("YMO和WMO怎么选") == "YMO和WMO怎么选"
+    assert lexicon.expand_codes("铁一中学和培文外国语和省实永平") == "铁一中学和培文外国语和省实永平"
+
+    # 自定义词表模拟 石楼 -> 石楼中学，验证不会产生 石楼（石楼中学）中学
+    p = tmp_path / "suffix.json"
+    p.write_text(
+        json.dumps({"schools": ["石楼中学"], "codes": {"石楼": "石楼中学"}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    lexicon.apply_loaded(lexicon.load(p))
+    try:
+        assert lexicon.expand_codes("石楼中学怎么样") == "石楼中学怎么样"
+        assert lexicon.expand_codes("石楼怎么样") == "石楼（石楼中学）怎么样"
+    finally:
+        lexicon.apply_loaded(lexicon.load())
+
+
+def test_v5_asr_priority_prevents_slice_truncation():
+    """asr_priority_schools/terms 前置，确保外部高频校名不会被 [:40]/[:60] 切片截断。"""
+    from wxlive import lexicon
+    lexicon.apply_loaded(lexicon.load())
+    hint = lexicon.build_prompt_hint()
+    vocab = lexicon.build_vocabulary(60, 40)
+    for must_have in ("天河华实", "黄埔华初", "荔湾省实", "云英实验", "云雅实验", "祈福新邨"):
+        assert must_have in hint, f"prompt_hint 截断丢失 {must_have}"
+        assert must_have in vocab, f"build_vocabulary 截断丢失 {must_have}"
+
+
+def test_v5_ambiguous_codes_block_builtin_bleed_through():
+    """外部 ambiguous_codes 必须阻止内置硬编码 TY/YY/ZG/ZX/JW/QW 穿透复活。"""
+    from wxlive import lexicon
+    lexicon.apply_loaded(lexicon.load())
+    for code in ("TY", "YY", "ZG", "ZX", "JW", "QW"):
+        assert code not in lexicon.CODES, f"内置多义代码 {code} 穿透复活"
+        assert code in lexicon.AMBIGUOUS_CODES
+    assert lexicon.expand_codes("今年TY和YY和ZG") == "今年TY和YY和ZG"
+
+
+def test_v5_no_noop_and_no_bai6zhong_chain():
+    """内置表无 NO-OP，白六中不被截断成白六，且纠偏满足幂等性。"""
+    from wxlive import lexicon
+    for k, v in lexicon.CORRECTIONS.items():
+        assert k != v, f"存在 NO-OP: {k}"
+    lexicon.apply_loaded(lexicon.load())
+    assert lexicon.correct_text("百六中怎么样") == "白六中怎么样"
+    assert lexicon.correct_text("白六中怎么样") == "白六中怎么样"
+    assert lexicon.correct_text("一百六十个人") == "一百六十个人"
+    assert "广钢实验" not in lexicon.SCHOOLS
+    assert "广钢实验" not in lexicon.CODES.values()
+
+
+def test_v5_expand_does_not_chop_formal_schools_or_terms():
+    """正式校名/目标名内部与后缀短代码不得切碎或自括号（如华侨外国语/滨海实验/黄埔华初/黄广T5）。"""
+    from wxlive import lexicon
+    lexicon.apply_loaded(lexicon.load())
+    unchanged = [
+        "华侨外国语",
+        "滨海实验",
+        "黄埔华初",
+        "花执灵格风",
+        "白云培英",
+        "从化天省",
+        "黄埔华附（大壮）",
+        "黄广T5",
+        "天省趣跑",
+        "广大附黄华路课改班",
+    ]
+    for sample in unchanged:
+        assert lexicon.expand_codes(sample) == sample, f"正式名被切碎: {sample!r} -> {lexicon.expand_codes(sample)!r}"
+    # 独立暗语仍正常展开且 BL 为多义不强绑定
+    assert lexicon.expand_codes("刺猬") == "刺猬（天河省实）"
+    assert lexicon.expand_codes("BL怎么看") == "BL怎么看"
+    assert "BL" not in lexicon.CODES and "BL" in lexicon.AMBIGUOUS_CODES
+    assert lexicon.CODES.get("GWFS") == "广外附中"

@@ -247,7 +247,7 @@ def _transcribe(src: Path, log, engine_override: str | None = None,
         try:
             lexicon.apply_loaded(lexicon.load(
                 Path(cfg.asr.lexicon_path) if cfg.asr.lexicon_path else None))
-            vocab = "、".join(lexicon.SCHOOLS[:60] + lexicon.TERMS[:40])
+            vocab = lexicon.build_vocabulary(60, 40)
         except Exception:
             vocab = ""
         try:

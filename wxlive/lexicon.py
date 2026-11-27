@@ -82,17 +82,15 @@ TERMS = [
 # ---------------------------------------------------------------- ASR 实测错误 → 正确
 # 这些是本项目用真实直播音频测出来的，不是猜的
 CORRECTIONS: dict[str, str] = {
-    "省市用品": "省实",
-    "盛世用平": "省实",
-    "省实用品": "省实",
-    "陈氏用品": "省实",
+    "省市用品": "省实永平",
+    "盛世用平": "省实永平",
+    "省实用品": "省实永平",
+    "陈氏用品": "省实永平",
     "云城培营": "云城培英",
     "云山赔英": "云城培英",
-    "云城培英": "云城培英",
     "云省培英": "云城培英",
     "云神培林": "云城培英",
     "金广复": "金广附",
-    "金广附和": "金广附和",
     "指标的道校": "指标到校",
     "指标道校": "指标到校",
     "名額指標": "名额指标",
@@ -119,10 +117,15 @@ CORRECTIONS: dict[str, str] = {
     "二线的准营线": "二线的准一线",
     # 同一简称的多种写法归一（实测同一场直播里"白六"和"百六"混用，会破坏检索）
     "百六": "白六",
-    "白六中": "白六",
-    "华初中学": "华初",
+    "华初中学": "黄埔华初",
     "东江外国语学校": "东江外国语",
 }
+
+AMBIGUOUS_CODES: dict[str, list[str]] = {}
+ASR_PRIORITY_SCHOOLS: list[str] = []
+ASR_PRIORITY_TERMS: list[str] = []
+SCHOOL_ALIASES: dict[str, list[str]] = {}
+_URL_SPAN_RE = re.compile(r"(https?://\S+)")
 
 # 单独出现的"家"需谨慎替换（"大家""家长"都是正常词），
 # 所以只在数字后紧跟"家"时替换
@@ -184,9 +187,12 @@ def build_prompt_hint(max_terms: int = 120) -> str:
 
     注意控制长度：prompt 太长会稀释模型注意力，实测 100-150 个词效果最好。
     也绝不能写成"以下是……"这种叙述句 —— whisper 会把它当上文复读。
+    优先使用外部词表指定的 asr_priority_schools / asr_priority_terms，避免 [:40] 切片截断外部校名。
     """
-    schools = "、".join(SCHOOLS[:40])
-    terms = "、".join(TERMS[: max_terms - 40])
+    school_pool = ASR_PRIORITY_SCHOOLS or SCHOOLS
+    term_pool = ASR_PRIORITY_TERMS or TERMS
+    schools = "、".join(school_pool[:50])
+    terms = "、".join(term_pool[: max(0, max_terms - 50)])
     return (
         f"本音频为广州小升初(XSC)升学规划直播。"
         f"专有名词参考：{schools}。"
@@ -195,23 +201,38 @@ def build_prompt_hint(max_terms: int = 120) -> str:
     )
 
 
+def build_vocabulary(school_limit: int = 60, term_limit: int = 40) -> str:
+    """生成供 LLM 纠错使用的领域词表串（优先取 asr_priority_* 防止外部 139+ 校名被切片截断）。"""
+    school_pool = ASR_PRIORITY_SCHOOLS or SCHOOLS
+    term_pool = ASR_PRIORITY_TERMS or TERMS
+    picked = list(dict.fromkeys(school_pool[:school_limit] + term_pool[:term_limit]))
+    return "、".join(picked)
+
+
 def correct_text(text: str) -> str:
     """按实测错误表做纠正。长词优先，避免"省实"被"省"截断。
 
-    数字保护：中文数字/阿拉伯数字紧邻时不做替换。
-    实测坑：CORRECTIONS 里有 "百六→白六"（白六中简称），
-    若不保护，"一百六十个人"会被改成"一白六十个人"、"三百六十五天"
-    变成"三白六十五天"。这类文本在讲分数、人数、天数时很常见。
+    数字保护与 URL 保护：
+    - 中文数字/阿拉伯数字紧邻时不做替换（"一百六十" 不误改为 "一白六十"）
+    - URL 片段原样跳过
     """
     if not text:
         return text
-    out = text
-    for wrong in sorted(CORRECTIONS, key=len, reverse=True):
-        right = CORRECTIONS[wrong]
-        if wrong == right or wrong not in out:
+    sorted_rules = sorted(CORRECTIONS, key=len, reverse=True)
+    parts = _URL_SPAN_RE.split(text)
+    out_parts: list[str] = []
+    for idx, part in enumerate(parts):
+        if idx % 2 == 1:
+            out_parts.append(part)
             continue
-        out = _replace_guarded(out, wrong, right)
-    return _num_jia_fix(out)
+        out = part
+        for wrong in sorted_rules:
+            right = CORRECTIONS[wrong]
+            if wrong == right or wrong not in out:
+                continue
+            out = _replace_guarded(out, wrong, right)
+        out_parts.append(_num_jia_fix(out))
+    return "".join(out_parts)
 
 
 # 中文数字与阿拉伯数字。仅当替换词**首字符或尾字符本身是数字**时才做邻接检查，
@@ -281,48 +302,97 @@ _NO_EXPAND = {
 _SUFFIX_GUARDED = {"金奥", "小奥", "大奥", "奥班", "龙哥", "白省", "白雅", "白六"}
 
 
+def _find_protected_spans(text: str, protected_desc: list[str]) -> list[tuple[int, int]]:
+    """查找文本中已出现的正式校名/完整目标名跨度（长词优先去重叠），防止短代码切碎正式名称。"""
+    n = len(text)
+    occupied = [False] * n
+    spans: list[tuple[int, int]] = []
+    for term in protected_desc:
+        tlen = len(term)
+        if tlen > n:
+            continue
+        is_ascii = term.isascii()
+        start = 0
+        while True:
+            idx = text.find(term, start)
+            if idx == -1:
+                break
+            end = idx + tlen
+            if is_ascii:
+                prev_ch = text[idx - 1] if idx > 0 else ""
+                next_ch = text[end] if end < n else ""
+                if (prev_ch.isascii() and (prev_ch.isalnum() or prev_ch == "_")) or (
+                    next_ch.isascii() and (next_ch.isalnum() or next_ch == "_")
+                ):
+                    start = idx + 1
+                    continue
+            if not any(occupied[idx:end]):
+                for k in range(idx, end):
+                    occupied[k] = True
+                spans.append((idx, end))
+            start = end
+    return spans
+
+
 def expand_codes(text: str, keep_original: bool = True) -> str:
     """把暗语展开成正式校名，便于后续 LLM 理解和检索。
 
     keep_original=True 时输出 `暗语（正式名）`，保留原文可追溯。
 
-    实现要点（2026-11-16 实测踩坑后重写）：
-    不能用「逐词全局 replace」，实测会产生三类错：
-      1. 括号嵌套：code 的正式名里也含 code（如 清实→清远实验（清实））
-         → 二次扫描会把括号里的又展开一遍，变成 `清实（清远实验（清实））`
-      2. 长短覆盖：先替换 `小金` 会破坏 `小金龙`，
-         变成 `小金（金广附）龙（金广附）`
-      3. 重复展开：替换出来的正式名若含别的 code，又被匹配一次
-
-    正确做法：**单次从左到右扫描**，在最左位置优先匹配最长的 code，
-    替换后跳过整段（含括号），不再回头处理已展开内容。
+    实现要点：
+    1. 单次从左到右扫描 + 最左最长优先，不回头处理已展开内容
+    2. 屏蔽 URL（https?://...），避免链接内部字母被误展开
+    3. ASCII 代码按 `isalnum() or == '_'` 检验词边界，避免 `65TY`/`2022Z` 误展开
+    4. 若 `matched == target`（如 `YMO` -> `YMO`），不加自括号 `YMO（YMO）`
+    5. 正式校名与目标名保护：若命中跨度被更长的已知校名/别名/目标名覆盖（如 `华侨外国语` 内的 `侨外`、`滨海实验` 内的 `海实`、`黄埔华初` 内的 `华初`、`石楼中学` 内的 `石楼`），跳过短代码展开
     """
     if not text:
         return text
 
-    # 按长度降序，保证"最左最长优先"。
-    # 跳过"已经是通用叫法"的条目：如 金广附→金广实验学校、省实→广东实验中学，
-    # 这些叫法本身就足够清楚，展开成括号只会增加噪音。
     codes = sorted((c for c in CODES if c not in _NO_EXPAND), key=len, reverse=True)
+    protected_set: set[str] = (
+        {s.strip() for s in SCHOOLS if isinstance(s, str) and s.strip()}
+        | _NO_EXPAND
+        | {v.strip() for v in CODES.values() if isinstance(v, str) and v.strip()}
+    )
+    for can, aliases in SCHOOL_ALIASES.items():
+        if isinstance(can, str) and len(can.strip()) >= 4:
+            protected_set.add(can.strip())
+        for a in aliases:
+            if isinstance(a, str) and len(a.strip()) >= 4 and not a.strip().isascii():
+                protected_set.add(a.strip())
+    protected_desc = sorted(protected_set, key=len, reverse=True)
+    protected_spans = _find_protected_spans(text, protected_desc)
+
+    url_spans = {m.start(): m.end() for m in _URL_SPAN_RE.finditer(text)}
     n = len(text)
     out: list[str] = []
     i = 0
     while i < n:
+        if i in url_spans:
+            end = url_spans[i]
+            out.append(text[i:end])
+            i = end
+            continue
+
         matched: str | None = None
         for code in codes:
             if not text.startswith(code, i):
                 continue
-            # 纯字母代码要求词边界，避免 "SS" 误伤其他英文
+            clen = len(code)
+            # 纯字母数字代码要求词边界，避免 "SS" / "65TY" / "2022Z" 误伤
             if code.isascii():
                 prev_ch = text[i - 1] if i > 0 else ""
-                next_ch = text[i + len(code)] if i + len(code) < n else ""
-                if prev_ch.isascii() and prev_ch.isalpha():
+                next_ch = text[i + clen] if i + clen < n else ""
+                if prev_ch.isascii() and (prev_ch.isalnum() or prev_ch == "_"):
                     continue
-                if next_ch.isascii() and next_ch.isalpha():
+                if next_ch.isascii() and (next_ch.isalnum() or next_ch == "_"):
                     continue
+            # 更长正式校名/目标名跨度保护：禁止内部/后缀短代码切碎正式名称
+            cend = i + clen
+            if any((not (cend <= ps or i >= pe)) and clen < (pe - ps) for ps, pe in protected_spans):
+                continue
             # 后缀冲突保护：`金奥` 不能吃掉 `小金奥班` 里的 `金奥`。
-            # 判据：左侧紧邻字符与 code 拼起来，若能构成词表里某个词的
-            # 前缀（如 "小"+"金奥" 是 "小金奥班" 的前缀），说明我们切在词中间。
             if code in _SUFFIX_GUARDED:
                 prev_ch = text[i - 1] if i > 0 else ""
                 if prev_ch:
@@ -343,9 +413,19 @@ def expand_codes(text: str, keep_original: bool = True) -> str:
         if matched in target:
             target = target.replace(f"（{matched}）", "").strip()
 
-        # 幂等保护：源文本若已是 `code（正式名）` 形式，直接原样保留，
-        # 不再追加一层。实测坑：转录稿反复过词表会变成
-        # `小金龙（金广附）（金广附）`，句子越跑越脏。
+        # 自映射（如 YMO -> YMO）直接原样保留，不加括号
+        if target == matched:
+            out.append(matched)
+            i += len(matched)
+            continue
+
+        # 中文后缀保护：若原文此处已是完整目标名（如 "石楼中学"），原样跳过
+        if target.startswith(matched) and text.startswith(target, i):
+            out.append(target)
+            i += len(target)
+            continue
+
+        # 幂等保护：源文本若已是 `code（正式名）` 形式，直接原样保留，不再追加一层。
         already = f"{matched}（{target}）"
         if text.startswith(already, i):
             out.append(already)
@@ -359,12 +439,7 @@ def expand_codes(text: str, keep_original: bool = True) -> str:
 
 
 def _clean_map(d: dict) -> dict:
-    """过滤掉分组标记与空值。
-
-    词表里允许用 `"分组名": null` 或 `"_说明": ...` 做可读性分隔，
-    但这些不是真实映射，必须剔除，否则会参与匹配、甚至在
-    `sorted(CODES, key=len)` 时因 None 崩溃。
-    """
+    """过滤掉分组标记、空值与 k == v 的无意义 NO-OP。"""
     out = {}
     for k, v in (d or {}).items():
         if not isinstance(k, str):
@@ -377,25 +452,81 @@ def _clean_map(d: dict) -> dict:
     return out
 
 
+def _clean_ambiguous(d: dict) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+    for k, v in (d or {}).items():
+        if not isinstance(k, str) or not k.strip() or k.startswith("_"):
+            continue
+        if isinstance(v, list):
+            cands = [str(x).strip() for x in v if str(x).strip()]
+            if cands:
+                out[k.strip()] = cands
+    return out
+
+
 def load(path: Path | None = None) -> dict:
     """加载外部词表（优先），与内置表合并。
 
-    显式传入的 path 不存在时必须告警：静默回退内置表会让“已配置的外部词表”
-    看起来生效、实际全是内置词。path=None 表示使用默认路径，默认不存在
-    只回退不告警（纯本地安装可能就没有 lexicon/）。
+    - 支持 asr_priority_schools / asr_priority_terms 并将高优校名/术语前置，防止切片截断
+    - 支持 ambiguous_codes，并从合并后的 codes 中剔除外部已标明多义的代码，阻止内置硬编码穿透复活
+    - 支持 corrections_common + corrections_asr_only 合并
     """
     explicit = path is not None
     p = path or DEFAULT_PATH
-    data = {"schools": list(SCHOOLS), "terms": list(TERMS),
-            "codes": dict(CODES), "corrections": dict(CORRECTIONS)}
+    data: dict = {
+        "schools": list(SCHOOLS),
+        "terms": list(TERMS),
+        "codes": dict(CODES),
+        "corrections": {k: v for k, v in CORRECTIONS.items() if k != v},
+        "ambiguous_codes": dict(AMBIGUOUS_CODES),
+        "asr_priority_schools": list(ASR_PRIORITY_SCHOOLS),
+        "asr_priority_terms": list(ASR_PRIORITY_TERMS),
+        "school_aliases": {},
+    }
     if p.exists():
         try:
             ext = json.loads(p.read_text(encoding="utf-8"))
-            data["schools"] = list(dict.fromkeys(data["schools"] + ext.get("schools", [])))
-            data["terms"] = list(dict.fromkeys(data["terms"] + ext.get("terms", [])))
-            data["codes"].update(_clean_map(ext.get("codes", {})))
-            data["corrections"].update(_clean_map(ext.get("corrections", {})))
-            print(f"[lexicon] 已加载外部词表 {p.name}（+{len(ext.get('schools', []))} 校名）")
+            prio_schools = [s for s in ext.get("asr_priority_schools", []) if isinstance(s, str) and s.strip()]
+            prio_terms = [t for t in ext.get("asr_priority_terms", []) if isinstance(t, str) and t.strip()]
+            ext_schools = [s for s in ext.get("schools", []) if isinstance(s, str) and s.strip()]
+            ext_terms = [t for t in ext.get("terms", []) if isinstance(t, str) and t.strip()]
+
+            data["asr_priority_schools"] = list(dict.fromkeys(prio_schools))
+            data["asr_priority_terms"] = list(dict.fromkeys(prio_terms))
+            data["schools"] = list(dict.fromkeys(prio_schools + data["schools"] + ext_schools))
+            data["terms"] = list(dict.fromkeys(prio_terms + data["terms"] + ext_terms))
+            raw_aliases = ext.get("school_aliases", {})
+            if isinstance(raw_aliases, dict):
+                data["school_aliases"] = {
+                    k.strip(): [a.strip() for a in v if isinstance(a, str) and a.strip()]
+                    for k, v in raw_aliases.items()
+                    if isinstance(k, str) and k.strip() and not k.startswith("_") and isinstance(v, list)
+                }
+
+            ext_codes = _clean_map(ext.get("codes", {}))
+            data["codes"].update(ext_codes)
+
+            amb = _clean_ambiguous(ext.get("ambiguous_codes", {}))
+            data["ambiguous_codes"] = amb
+            amb_norm = {k.upper() if k.isascii() else k for k in amb}
+            pending = {
+                k for k in (ext.get("_待确认") or {})
+                if isinstance(k, str) and not k.startswith("_")
+            }
+            for ck in list(data["codes"].keys()):
+                ck_norm = ck.upper() if ck.isascii() else ck
+                if ck_norm in amb_norm or ck in pending:
+                    data["codes"].pop(ck, None)
+
+            ext_corr: dict[str, str] = {}
+            ext_corr.update(_clean_map(ext.get("corrections", {})))
+            ext_corr.update(_clean_map(ext.get("corrections_common", {})))
+            ext_corr.update(_clean_map(ext.get("corrections_asr_only", {})))
+            for k, v in ext_corr.items():
+                if k != v:
+                    data["corrections"][k] = v
+
+            print(f"[lexicon] 已加载外部词表 {p.name}（+{len(ext_schools)} 校名，{len(amb)} 多义隔离）")
         except Exception as e:  # noqa: BLE001
             print(f"[lexicon][warn] 外部词表加载失败，用内置表: {e}")
     elif explicit:
@@ -405,8 +536,12 @@ def load(path: Path | None = None) -> dict:
 
 def apply_loaded(data: dict) -> None:
     """把 load() 的结果写回模块级表，供全局使用。"""
-    global SCHOOLS, TERMS, CODES, CORRECTIONS
+    global SCHOOLS, TERMS, CODES, CORRECTIONS, AMBIGUOUS_CODES, ASR_PRIORITY_SCHOOLS, ASR_PRIORITY_TERMS, SCHOOL_ALIASES
     SCHOOLS = data["schools"]
     TERMS = data["terms"]
     CODES = data["codes"]
     CORRECTIONS = data["corrections"]
+    AMBIGUOUS_CODES = data.get("ambiguous_codes", {})
+    ASR_PRIORITY_SCHOOLS = data.get("asr_priority_schools", [])
+    ASR_PRIORITY_TERMS = data.get("asr_priority_terms", [])
+    SCHOOL_ALIASES = data.get("school_aliases", {})

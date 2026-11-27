@@ -155,7 +155,7 @@ def transcribe(src: Path) -> Session:
     lines = [s["text"] for s in sess.segments]
     if lines:
         log("LLM 纠错中…")
-        vocab = "、".join(lexicon.SCHOOLS[:60] + lexicon.TERMS[:40])
+        vocab = lexicon.build_vocabulary(60, 40)
         try:
             fixed = postprocess.fix_errors(
                 lines, model=text_model,
