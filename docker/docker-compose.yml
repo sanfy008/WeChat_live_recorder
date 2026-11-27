@@ -18,6 +18,10 @@ services:
       - WXLIVE_LLM_API_KEY=${WXLIVE_LLM_API_KEY:-}
       - WXLIVE_LLM_MODEL=${WXLIVE_LLM_MODEL:-workbuddy/deepseek-v4.1-flash}
       - WXLIVE_LLM_EFFORT=${WXLIVE_LLM_EFFORT:-low}
+      # 可选：访问令牌与反代域名白名单（留空则保持局域网免密兼容）
+      - WXLIVE_TOKEN=${WXLIVE_TOKEN:-}
+      - WXLIVE_READ_AUTH=${WXLIVE_READ_AUTH:-false}
+      - WXLIVE_ALLOWED_HOSTS=${WXLIVE_ALLOWED_HOSTS:-}
       # 用宿主机的 ffmpeg（见下方挂载说明），并把 WXLIVE_FFMPEG 指过去，
       # 让 find_ffmpeg() 优先用它，而不是镜像自带的旧版。
       - WXLIVE_FFMPEG=/host-ffmpeg/ffmpeg

@@ -939,3 +939,54 @@ def test_probe_encrypted_vod_with_and_without_decrypt_key(tmp_path: Path, monkey
         runner.shutdown()
 
 
+def test_allowed_hosts_and_read_auth_and_legacy_max_effort(tmp_path: Path):
+    """验证 WXLIVE_ALLOWED_HOSTS、WXLIVE_READ_AUTH、旧 max 档位降级与 UI Token 注入。"""
+    # 预写一个含历史 max 档位的 settings.json，确认不会拖垮其它设置加载
+    (tmp_path / "settings.json").write_text(
+        json.dumps({"llm_reasoning_effort": "max", "retention_days": 90}),
+        encoding="utf-8",
+    )
+    runner = NasJobRunner(data_dir=tmp_path, engine_factory=lambda t, l: _FakeEngine())
+    try:
+        s = runner.get_settings()
+        assert s["llm_reasoning_effort"] == "low"
+        assert s["retention_days"] == 90
+
+        app = create_app(
+            runner=runner,
+            require_token="tok-123",
+            allowed_hosts="one.20161213.xyz",
+            require_read_auth=True,
+        )
+        with TestClient(app) as client:
+            # 白名单域名放行，未知域名仍 400
+            assert client.get(
+                "/api/health", headers={"Host": "one.20161213.xyz:16666"}
+            ).status_code == 200
+            assert client.get(
+                "/api/health", headers={"Host": "evil.example.com"}
+            ).status_code == 400
+
+            # Web UI 外壳和 /api/health 保持可访问，且告知需要鉴权
+            home = client.get("/")
+            assert home.status_code == 200
+            assert "X-WXLIVE-Token" in home.text
+            assert '<option value="max">' not in home.text
+
+            h = client.get("/api/health").json()
+            assert h["auth_required"] is True
+            assert h["read_auth_required"] is True
+
+            # 开启 read_auth 后，读 API 未带 token → 401，带上放行
+            assert client.get("/api/jobs").status_code == 401
+            assert client.get(
+                "/api/jobs", headers={"X-WXLIVE-Token": "tok-123"}
+            ).status_code == 200
+            assert client.get(
+                "/api/jobs", params={"token": "tok-123"}
+            ).status_code == 200
+    finally:
+        runner.shutdown()
+
+
+

@@ -1055,14 +1055,16 @@ def probe_media(path: Path) -> tuple[float, bool]:
     return dur, has_audio
 
 
-def nas_supports_decrypt(base_url: str, timeout: float = 4.0) -> bool:
+def nas_supports_decrypt(base_url: str, timeout: float = 4.0, token: str = "") -> bool:
     """检查目标 NAS 服务端是否原生支持 decrypt_key（ProbeReq / StreamStartReq）。"""
     base = (base_url or "").strip().rstrip("/")
     if not base:
         return False
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    headers = {"X-WXLIVE-Token": token.strip()} if (token or "").strip() else {}
+    req = urllib.request.Request(base + "/openapi.json", headers=headers)
     try:
-        with opener.open(base + "/openapi.json", timeout=timeout) as r:
+        with opener.open(req, timeout=timeout) as r:
             spec = json.loads(r.read().decode("utf-8"))
         schemas = (spec.get("components") or {}).get("schemas") or {}
         probe_props = (schemas.get("ProbeReq") or {}).get("properties") or {}
@@ -1074,7 +1076,7 @@ def nas_supports_decrypt(base_url: str, timeout: float = 4.0) -> bool:
 
 def upload_to_nas(base_url: str, file_path: Path, name: str = "",
                   auto_transcribe: bool = True, on_progress=None,
-                  timeout: int = 300) -> dict:
+                  timeout: int = 300, token: str = "") -> dict:
     """把本地音频/媒体文件流式上传到 NAS `/api/jobs/upload`，返回任务 JSON。
 
     使用 http.client 直连局域网，绕过系统代理且避免把上百 MB 文件整个读进内存。
@@ -1124,6 +1126,9 @@ def upload_to_nas(base_url: str, file_path: Path, name: str = "",
         conn.putrequest("POST", req_path)
         conn.putheader("Content-Type", f"multipart/form-data; boundary={boundary}")
         conn.putheader("Content-Length", str(total_len))
+        tok = (token or "").strip()
+        if tok:
+            conn.putheader("X-WXLIVE-Token", tok)
         conn.endheaders()
         conn.send(bytes(parts_head))
 

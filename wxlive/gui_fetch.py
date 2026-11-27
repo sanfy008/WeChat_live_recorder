@@ -29,6 +29,7 @@ App 继承本 mixin 后调用 _build_fetch_tab() 即可。
 
 from __future__ import annotations
 
+import os
 import queue
 import threading
 import tkinter as tk
@@ -282,7 +283,12 @@ class FetchTabMixin:
 
         ttk.Label(nas, text="NAS").pack(side="left")
         self.fetch_nas_var = tk.StringVar(value="http://192.168.68.49:8910")
-        ttk.Entry(nas, textvariable=self.fetch_nas_var, width=30).pack(side="left", padx=(4, 8))
+        ttk.Entry(nas, textvariable=self.fetch_nas_var, width=26).pack(side="left", padx=(4, 6))
+
+        ttk.Label(nas, text="令牌").pack(side="left")
+        self.fetch_nas_token_var = tk.StringVar(value=os.environ.get("WXLIVE_TOKEN", ""))
+        ttk.Entry(nas, textvariable=self.fetch_nas_token_var, width=12, show="*").pack(
+            side="left", padx=(3, 8))
 
         self.fetch_nas_health_btn = ttk.Button(
             nas, text="体检", width=6, command=self._fetch_nas_health)
@@ -372,6 +378,19 @@ class FetchTabMixin:
     def _fetch_nas_base(self) -> str:
         return (self.fetch_nas_var.get() or "").strip().rstrip("/")
 
+    def _fetch_nas_token(self) -> str:
+        var = getattr(self, "fetch_nas_token_var", None)
+        if var is not None:
+            return (var.get() or "").strip()
+        return os.environ.get("WXLIVE_TOKEN", "").strip()
+
+    def _fetch_nas_headers(self, extra: dict | None = None) -> dict:
+        headers = dict(extra or {})
+        tok = self._fetch_nas_token()
+        if tok:
+            headers["X-WXLIVE-Token"] = tok
+        return headers
+
     def _fetch_nas_set_status(self, text: str, warn: bool = False) -> None:
         try:
             self.fetch_nas_var_status.set(text)
@@ -387,12 +406,14 @@ class FetchTabMixin:
         if not base:
             self._fetch_nas_set_status("请先填 NAS 地址", warn=True)
             return
+        headers = self._fetch_nas_headers()
         self._fetch_nas_set_status("检测中…")
 
         def work() -> None:
             try:
                 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-                with opener.open(base + "/api/health", timeout=10) as r:
+                req = urllib.request.Request(base + "/api/health", headers=headers)
+                with opener.open(req, timeout=10) as r:
                     h = json.loads(r.read().decode("utf-8"))
                 ok = bool(h.get("ok"))
                 msg = (f"在线 · ffmpeg={'有' if h.get('ffmpeg_available') else '缺'}"
@@ -420,6 +441,7 @@ class FetchTabMixin:
         from .stream_capture import extract_url, is_url
 
         base = (base or "").strip().rstrip("/") or self._fetch_nas_base()
+        headers = self._fetch_nas_headers({"Content-Type": "application/json"})
         clean = extract_url(url)
         if not is_url(clean):
             messagebox.showwarning("地址无效", "没能从这一条里识别出流地址。")
@@ -436,7 +458,7 @@ class FetchTabMixin:
                 probe_req = urllib.request.Request(
                     base + "/api/probe",
                     data=json.dumps(probe_payload).encode(),
-                    headers={"Content-Type": "application/json"},
+                    headers=headers,
                 )
                 with opener.open(probe_req, timeout=40) as r:
                     probe = json.loads(r.read().decode("utf-8"))
@@ -463,7 +485,7 @@ class FetchTabMixin:
                 start_req = urllib.request.Request(
                     base + "/api/jobs/stream",
                     data=json.dumps(start_payload).encode(),
-                    headers={"Content-Type": "application/json"},
+                    headers=headers,
                 )
                 with opener.open(start_req, timeout=60) as r:
                     job = json.loads(r.read().decode("utf-8"))
@@ -520,6 +542,7 @@ class FetchTabMixin:
             return
 
         api = self.fetch_api_var.get().strip() or "http://127.0.0.1:2022"
+        nas_token = self._fetch_nas_token()
         self._fetch_nas_set_status("检查视频地址…")
         self._log(f"[NAS] 《{it.title}》是回放/视频，正在检查可用性与加密状态…")
 
@@ -562,7 +585,11 @@ class FetchTabMixin:
                 self._ui(lambda m=msg: messagebox.showwarning("无法推送加密视频", m))
                 return
 
-            if F.nas_supports_decrypt(base):
+            supports_decrypt = (
+                F.nas_supports_decrypt(base, token=nas_token)
+                if nas_token else F.nas_supports_decrypt(base)
+            )
+            if supports_decrypt:
                 self._log(f"[NAS] NAS 支持服务端解密，直接推送《{it.title}》…")
                 self._ui(lambda k=key: self._fetch_nas_push(
                     clean, it.title, is_live=False, decrypt_key=k, base=base))
@@ -607,9 +634,10 @@ class FetchTabMixin:
                         self._ui(lambda p=pct: self._fetch_nas_set_status(
                             f"上传 NAS {p:.0f}%…"))
 
+                    up_kw = {"token": nas_token} if nas_token else {}
                     job = F.upload_to_nas(
                         base, wav, name=it.title, auto_transcribe=True,
-                        on_progress=on_up,
+                        on_progress=on_up, **up_kw,
                     )
             except Exception as exc:  # noqa: BLE001
                 m = str(exc) or type(exc).__name__

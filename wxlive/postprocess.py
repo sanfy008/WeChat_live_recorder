@@ -56,6 +56,8 @@ FIX_RETRY_DELAYS = (1.0, 4.0)
 # 实测 8000 会在 3000 字左右触顶返回 finish_reason="length"。
 DIGEST_MAX_TOKENS = 16000
 DIGEST_MAX_CONTINUATIONS = 3
+# 要点分段摘要与终稿的瞬时超时/网关抖动退避间隔（共 3 次尝试）。
+DIGEST_RETRY_DELAYS = (2.0, 6.0)
 
 
 CONTINUE_PROMPT = (
@@ -302,12 +304,55 @@ def fix_errors(lines: list[str], model: str = DEFAULT_MODEL,
     return final
 
 
+def _complete_multi_with_retry(
+    messages: list[dict],
+    *,
+    model: str,
+    endpoint: str,
+    api_key: str,
+    max_tokens: int,
+    timeout: int,
+    reasoning_effort: str,
+    max_continuations: int,
+    retry_delays: tuple[float, ...],
+    label: str = "摘要",
+) -> tuple[str, dict, int]:
+    """带退避重试的多轮补全。用于抵御长文分块摘要/终稿时的偶发 read timeout/502。"""
+    last_exc: Exception | None = None
+    retries = 0
+    for attempt in range(len(retry_delays) + 1):
+        if attempt:
+            retries += 1
+            delay = retry_delays[attempt - 1]
+            if delay > 0:
+                time.sleep(delay)
+        try:
+            text, meta = _complete_multi(
+                messages,
+                model=model,
+                endpoint=endpoint,
+                api_key=api_key,
+                max_tokens=max_tokens,
+                timeout=timeout,
+                reasoning_effort=reasoning_effort,
+                max_continuations=max_continuations,
+            )
+            if attempt:
+                print(f"[post] {label} 重试第 {attempt} 次恢复")
+            return text, meta, retries
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+    assert last_exc is not None
+    raise last_exc
+
+
 def build_digest(segments: list[dict], model: str = DEFAULT_MODEL,
                  endpoint: str = DEFAULT_ENDPOINT, api_key: str = "magpie-alma",
                  title: str = "",
                  group_seconds: float = 60.0,
                  reasoning_effort: str = DEFAULT_REASONING_EFFORT,
-                 out_stats: dict | None = None) -> str:
+                 out_stats: dict | None = None,
+                 retry_delays: tuple[float, ...] | None = None) -> str:
     """生成结构化要点。长文本超限时自动按段摘要再归并。
 
     ## 为什么按段落喂而不是逐句喂
@@ -331,11 +376,14 @@ def build_digest(segments: list[dict], model: str = DEFAULT_MODEL,
 
     started = time.monotonic()
     reasoning_effort = validate_reasoning_effort(reasoning_effort)
+    delays = tuple(retry_delays) if retry_delays is not None else DIGEST_RETRY_DELAYS
     stats: dict = {
         "model": model,
         "reasoning_effort": reasoning_effort,
         "seconds": 0.0,
         "ok": False,
+        "chunk_retries": 0,
+        "digest_retries": 0,
     }
 
     def finish(text: str, ok: bool) -> str:
@@ -370,24 +418,35 @@ def build_digest(segments: list[dict], model: str = DEFAULT_MODEL,
         partials = []
         chunk_errors: list[str] = []
         chunk_continuations = 0
+        chunk_retries = 0
         for i, c in enumerate(chunks):
             p = (f"下面是直播的部分记录（第{i+1}/{len(chunks)}部分），请提炼要点，"
                  f"保留具体学校名、分数、建议，不要泛泛而谈：\n\n{c}")
             try:
-                part, pmeta = _complete_multi(
-                    [{"role": "user", "content": p}], model=model,
-                    endpoint=endpoint, api_key=api_key, max_tokens=4000,
-                    timeout=240, reasoning_effort=reasoning_effort,
-                    max_continuations=2)
+                part, pmeta, r_cnt = _complete_multi_with_retry(
+                    [{"role": "user", "content": p}],
+                    model=model,
+                    endpoint=endpoint,
+                    api_key=api_key,
+                    max_tokens=4000,
+                    timeout=240,
+                    reasoning_effort=reasoning_effort,
+                    max_continuations=2,
+                    retry_delays=delays,
+                    label=f"第{i+1}/{len(chunks)}部分摘要",
+                )
+                chunk_retries += r_cnt
                 chunk_continuations += pmeta["continuations"]
                 if pmeta["truncated"]:
                     chunk_errors.append(
                         f"第{i+1}部分摘要续写 {pmeta['continuations']} 次后仍被截断")
                 partials.append(part)
             except Exception as e:  # noqa: BLE001
+                chunk_retries += len(delays)
                 chunk_errors.append(f"第{i+1}部分摘要失败: {str(e)[:60]}")
                 partials.append(f"(第{i+1}部分摘要失败: {str(e)[:60]})")
         stats["chunk_continuations"] = chunk_continuations
+        stats["chunk_retries"] = chunk_retries
         stats["failed_chunks"] = chunk_errors
         text = "\n\n".join(f"### 片段{i+1}\n{p}" for i, p in enumerate(partials))
         text = text[:60000]
@@ -409,12 +468,21 @@ def build_digest(segments: list[dict], model: str = DEFAULT_MODEL,
     stats.setdefault("continuations", 0)
     stats.setdefault("truncated", False)
     try:
-        digest, dmeta = _complete_multi(
-            [{"role": "user", "content": prompt}], model=model,
-            endpoint=endpoint, api_key=api_key, max_tokens=DIGEST_MAX_TOKENS,
-            timeout=600, reasoning_effort=reasoning_effort,
-            max_continuations=DIGEST_MAX_CONTINUATIONS)
+        digest, dmeta, d_retries = _complete_multi_with_retry(
+            [{"role": "user", "content": prompt}],
+            model=model,
+            endpoint=endpoint,
+            api_key=api_key,
+            max_tokens=DIGEST_MAX_TOKENS,
+            timeout=600,
+            reasoning_effort=reasoning_effort,
+            max_continuations=DIGEST_MAX_CONTINUATIONS,
+            retry_delays=delays,
+            label="要点终稿",
+        )
+        stats["digest_retries"] = d_retries
     except Exception as e:  # noqa: BLE001
+        stats["digest_retries"] = len(delays)
         stats["error"] = str(e)[:150]
         return finish(f"(要点整理失败: {str(e)[:150]})", False)
 

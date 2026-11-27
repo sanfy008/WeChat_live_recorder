@@ -17,9 +17,10 @@ DEFAULT_TEXT_MODEL = "workbuddy/deepseek-v4.1-flash"
 DEFAULT_REASONING_EFFORT = "low"
 
 # workbuddy/deepseek-v4.1-flash 的合法思考档位。
-# 除这四档之外的取值会被网关静默接受，所以必须显式校验：
-# 实测 group/deepseek 传 medium 返回 200 但行为不稳，max 直接 403。
-VALID_REASONING_EFFORTS = ("none", "low", "high", "max")
+# 除这三档之外的取值会被网关静默接受，所以必须显式校验：
+# 实测 group/deepseek 传 medium 返回 200 但行为不稳；
+# 2026-11-26 39 轮复测确认 max 耗时 10x 且 403/502 静默零纠错，已禁用。
+VALID_REASONING_EFFORTS = ("none", "low", "high")
 
 
 def validate_reasoning_effort(value: str | None) -> str:
@@ -132,8 +133,8 @@ class TextConfig:
     """文本后处理参数（LLM 纠错 / 要点整理）。"""
 
     model: str = DEFAULT_TEXT_MODEL
-    # 思考档位。见 VALID_REASONING_EFFORTS —— 只有这四档合法，
-    # 且必须显式校验，非法档会被网关静默接受（实测 medium 返回 200 但行为不稳）。
+    # 思考档位。见 VALID_REASONING_EFFORTS —— 只有这三档合法，
+    # 且必须显式校验，非法档会被网关静默接受（实测 medium 返回 200 但行为不稳，max 已禁用）。
     reasoning_effort: str = DEFAULT_REASONING_EFFORT
 
 

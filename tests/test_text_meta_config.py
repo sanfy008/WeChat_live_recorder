@@ -164,7 +164,7 @@ def test_build_config_overwrites_stale_text_values(tmp_path, monkeypatch):
 
 # ---------------- 3. 非法思考档位被拒 ----------------
 
-@pytest.mark.parametrize("bad", ["medium", "", "LOWW", "0"])
+@pytest.mark.parametrize("bad", ["medium", "max", "", "LOWW", "0"])
 def test_validate_reasoning_effort_rejects(bad):
     with pytest.raises(ValueError):
         config.validate_reasoning_effort(bad)

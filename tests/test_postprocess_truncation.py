@@ -261,15 +261,42 @@ def test_digest_chunk_failure_marks_unhealthy(monkeypatch):
 
     monkeypatch.setattr(postprocess, "_call", call)
     stats: dict = {}
-    out = postprocess.build_digest(_long_segments(), out_stats=stats)
+    out = postprocess.build_digest(_long_segments(), out_stats=stats, retry_delays=())
 
     assert out == "归并结果"
     assert stats["ok"] is False
     assert stats["failed_chunks"]
     assert "分块超时" in stats["error"]
 
-    # 分块摘要并发/串行都不应被当成成功
+    # 无重试时 1 次分块 + 1 次归并 = 2 次调用
     assert calls["n"] == 2
+
+
+def test_digest_chunk_retries_and_recovers(monkeypatch):
+    """分块摘要偶发超时/502 时应退避重试并恢复，不能直接把残缺正文写进成品。"""
+    attempts = {"chunk": 0, "merge": 0}
+
+    def call(model, prompt, endpoint, api_key, **kwargs):
+        if "部分记录" in prompt:
+            attempts["chunk"] += 1
+            if attempts["chunk"] < 2:
+                raise TimeoutError("The read operation timed out")
+            kwargs["out_meta"]["finish_reason"] = "stop"
+            return "恢复后的分块摘要"
+        attempts["merge"] += 1
+        kwargs["out_meta"]["finish_reason"] = "stop"
+        return "完整归并结果"
+
+    monkeypatch.setattr(postprocess, "_call", call)
+    stats: dict = {}
+    out = postprocess.build_digest(
+        _long_segments(), out_stats=stats, retry_delays=(0.0, 0.0)
+    )
+
+    assert out == "完整归并结果"
+    assert stats["ok"] is True
+    assert stats["chunk_retries"] == 1
+    assert attempts == {"chunk": 2, "merge": 1}
 
 
 def test_digest_chunk_truncated_marks_unhealthy(monkeypatch):

@@ -371,7 +371,10 @@ class NasJobRunner:
                     if key in raw and raw[key] is not None:
                         setattr(cfg, key, raw[key])
                 cfg.local_threads = max(1, min(16, int(cfg.local_threads)))
-                cfg.llm_reasoning_effort = validate_reasoning_effort(cfg.llm_reasoning_effort)
+                try:
+                    cfg.llm_reasoning_effort = validate_reasoning_effort(cfg.llm_reasoning_effort)
+                except ValueError:
+                    cfg.llm_reasoning_effort = DEFAULT_REASONING_EFFORT
                 cfg.retention_days = max(0, int(cfg.retention_days))
                 cfg.cleanup_interval_hours = max(1, int(cfg.cleanup_interval_hours))
                 cfg.silence_stop_seconds = max(10, int(cfg.silence_stop_seconds))
@@ -1410,7 +1413,7 @@ class NasJobRunner:
         if use_lexicon:
             try:
                 lexicon.apply_loaded(lexicon.load(None))
-                vocab = "、".join(lexicon.SCHOOLS + lexicon.TERMS)
+                vocab = lexicon.build_vocabulary(60, 40)
             except Exception:
                 vocab = ""
 

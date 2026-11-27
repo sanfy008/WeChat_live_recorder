@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import hmac
 import os
 import shutil
 from contextlib import asynccontextmanager
@@ -553,6 +554,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
       <span id="pill-engine" class="tpill">SenseVoice: 待加载</span>
       <span id="pill-disk" class="tpill">磁盘: --</span>
       <span id="pill-cleanup" class="tpill clickable" onclick="switchTab('storage')">清理: --</span>
+      <span id="pill-auth" class="tpill clickable" style="display:none;" onclick="openTokenModal()">🔑 令牌</span>
     </div>
   </div>
 </header>
@@ -686,7 +688,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="stat-tile">
         <span class="stat-label">导出备份</span>
         <div class="row" style="margin-top:4px;">
-          <a href="/api/library/export" class="btn primary sm">打包导出全部（ZIP）</a>
+          <a id="lib-export-link" href="/api/library/export" class="btn primary sm">打包导出全部（ZIP）</a>
           <button class="sm" onclick="refreshLibrary()">刷新列表</button>
         </div>
         <span class="stat-sub">含全部 .md / .json / .jsonl 产物</span>
@@ -901,7 +903,6 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
               <option value="none">none（无推理）</option>
               <option value="low">low（推荐：快且稳）</option>
               <option value="high">high（深度慢）</option>
-              <option value="max">max</option>
             </select>
           </div>
         </div>
@@ -960,6 +961,22 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="row" style="justify-content:flex-end;">
       <button onclick="closeConfirm(false)">取消</button>
       <button id="confirm-ok-btn" class="danger" onclick="closeConfirm(true)">确认</button>
+    </div>
+  </div>
+</div>
+
+<!-- Token Modal -->
+<div id="token-modal" class="modal-bg" onclick="if(event.target===this)closeTokenModal(false)">
+  <div class="modal">
+    <div style="font-size:16px;font-weight:700;margin-bottom:8px;">访问令牌（WXLIVE_TOKEN）</div>
+    <div style="font-size:12.5px;color:var(--text-2);line-height:1.6;margin-bottom:10px;" id="token-modal-desc">
+      服务端已启用令牌鉴权。输入后仅保存在当前浏览器 localStorage，用于所有操作请求。
+    </div>
+    <input id="token-input" type="password" placeholder="输入 X-WXLIVE-Token" onkeydown="if(event.key==='Enter')closeTokenModal(true);else if(event.key==='Escape')closeTokenModal(false);">
+    <div class="row" style="justify-content:flex-end;margin-top:14px;">
+      <button onclick="clearSavedToken()">清除</button>
+      <button onclick="closeTokenModal(false)">取消</button>
+      <button class="primary" onclick="closeTokenModal(true)">保存并刷新</button>
     </div>
   </div>
 </div>
@@ -1044,9 +1061,86 @@ function showNotice(elId, kind, msg) {
   document.getElementById(elId).innerHTML =
     `<div class="notice ${cls}"><span>${esc(msg)}</span><button class="sm ghost" onclick="this.parentElement.remove()">✕</button></div>`;
 }
+const TOKEN_KEY = 'wxlive_token';
+let authRequired = false;
+let readAuthRequired = false;
+let tokenPromptShown = false;
+
+function getToken() {
+  try { return (localStorage.getItem(TOKEN_KEY) || '').trim(); } catch (e) { return ''; }
+}
+function setToken(v) {
+  try {
+    const clean = (v || '').trim();
+    if (clean) localStorage.setItem(TOKEN_KEY, clean);
+    else localStorage.removeItem(TOKEN_KEY);
+  } catch (e) {}
+  updateAuthUI();
+}
+function withToken(url) {
+  const t = getToken();
+  if (!t) return url;
+  return url + (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(t);
+}
+function authHeaders(extra = {}) {
+  const h = Object.assign({}, extra || {});
+  const t = getToken();
+  if (t) h['X-WXLIVE-Token'] = t;
+  return h;
+}
+function updateAuthUI() {
+  const pill = document.getElementById('pill-auth');
+  const t = getToken();
+  if (pill) {
+    if (authRequired || t) {
+      pill.style.display = '';
+      pill.textContent = t ? '🔑 已设令牌' : '🔑 需设令牌';
+      pill.className = 'tpill clickable ' + (t ? 'ok' : 'warn');
+    } else {
+      pill.style.display = 'none';
+    }
+  }
+  const exp = document.getElementById('lib-export-link');
+  if (exp) exp.href = withToken('/api/library/export');
+}
+function openTokenModal(reason = '') {
+  tokenPromptShown = true;
+  const desc = document.getElementById('token-modal-desc');
+  if (desc) {
+    desc.textContent = reason || '服务端已启用令牌鉴权。输入后仅保存在当前浏览器 localStorage，用于所有操作请求。';
+  }
+  const inp = document.getElementById('token-input');
+  inp.value = getToken();
+  document.getElementById('token-modal').classList.add('open');
+  setTimeout(() => { inp.focus(); inp.select(); }, 30);
+}
+function closeTokenModal(save) {
+  document.getElementById('token-modal').classList.remove('open');
+  if (!save) return;
+  const val = document.getElementById('token-input').value.trim();
+  setToken(val);
+  tokenPromptShown = false;
+  toast(val ? '令牌已保存' : '已清除令牌');
+  refreshAll();
+  if (activeTab === 'settings') loadSettingsForm(false);
+}
+function clearSavedToken() {
+  document.getElementById('token-input').value = '';
+  setToken('');
+  document.getElementById('token-modal').classList.remove('open');
+  tokenPromptShown = false;
+  toast('已清除本地令牌');
+}
+
 async function api(path, opts = {}) {
-  const res = await fetch(path, opts);
+  const merged = Object.assign({}, opts, { headers: authHeaders(opts.headers) });
+  const res = await fetch(path, merged);
   const data = await res.json().catch(() => ({}));
+  if (res.status === 401) {
+    authRequired = true;
+    updateAuthUI();
+    if (!tokenPromptShown) openTokenModal(data.detail || '需要访问令牌（WXLIVE_TOKEN）才能执行该操作');
+  }
   if (!res.ok) throw new Error(data.detail || data.error || ('HTTP ' + res.status));
   return data;
 }
@@ -1127,6 +1221,12 @@ function setJobFilter(f) {
 async function refreshHealth() {
   try {
     const h = await api('/api/health');
+    authRequired = !!h.auth_required;
+    readAuthRequired = !!h.read_auth_required;
+    updateAuthUI();
+    if (readAuthRequired && !getToken() && !tokenPromptShown) {
+      openTokenModal('服务端已开启全接口鉴权，请输入访问令牌以查看数据');
+    }
     const pf = document.getElementById('pill-ffmpeg');
     pf.textContent = 'ffmpeg: ' + (h.ffmpeg_available ? '可用' : '缺失');
     pf.className = 'tpill ' + (h.ffmpeg_available ? 'ok' : 'warn');
@@ -1243,9 +1343,9 @@ async function renderDetail(j) {
   if (j.has_json && j.status === 'completed') {
     acts.push(`<button class="sm" onclick="repostprocess('${esc(j.id)}')">重跑 AI 整理</button>`);
   }
-  if (j.has_md) acts.push(`<a class="btn sm" href="/api/jobs/${encodeURIComponent(j.id)}/download/md">MD</a>`);
-  if (j.has_json) acts.push(`<a class="btn sm" href="/api/jobs/${encodeURIComponent(j.id)}/download/json">JSON</a>`);
-  if (j.has_audio && j.status !== 'recording') acts.push(`<a class="btn sm" href="/api/jobs/${encodeURIComponent(j.id)}/download/wav">WAV</a>`);
+  if (j.has_md) acts.push(`<a class="btn sm" href="${withToken(`/api/jobs/${encodeURIComponent(j.id)}/download/md`)}">MD</a>`);
+  if (j.has_json) acts.push(`<a class="btn sm" href="${withToken(`/api/jobs/${encodeURIComponent(j.id)}/download/json`)}">JSON</a>`);
+  if (j.has_audio && j.status !== 'recording') acts.push(`<a class="btn sm" href="${withToken(`/api/jobs/${encodeURIComponent(j.id)}/download/wav`)}">WAV</a>`);
   if (!['recording','transcribing','converting','postprocessing'].includes(j.status)) {
     acts.push(`<button class="danger sm" onclick="delJob('${esc(j.id)}')">删除</button>`);
   }
@@ -1381,6 +1481,8 @@ function uploadFile() {
   btn.disabled = true;
   const xhr = new XMLHttpRequest();
   xhr.open('POST', '/api/jobs/upload');
+  const _tok = getToken();
+  if (_tok) xhr.setRequestHeader('X-WXLIVE-Token', _tok);
   xhr.upload.onprogress = e => {
     if (e.lengthComputable) prog.textContent = `正在上传：${Math.round(e.loaded / e.total * 100)}%`;
   };
@@ -1458,8 +1560,8 @@ function renderLibrary() {
       ${it.preview ? `<div class="lib-preview">${esc(it.preview)}</div>` : ''}
       <div class="row" style="margin-top:8px;gap:6px;" onclick="event.stopPropagation()">
         ${it.has_md ? `<button class="sm primary" onclick="openLibItem('${esc(it.stem)}')">阅读</button>` : ''}
-        ${it.has_md ? `<a class="btn sm" href="/api/library/${stemEnc}/download/md">MD</a>` : ''}
-        ${it.has_json ? `<a class="btn sm" href="/api/library/${stemEnc}/download/json">JSON</a>` : ''}
+        ${it.has_md ? `<a class="btn sm" href="${withToken(`/api/library/${stemEnc}/download/md`)}">MD</a>` : ''}
+        ${it.has_json ? `<a class="btn sm" href="${withToken(`/api/library/${stemEnc}/download/json`)}">JSON</a>` : ''}
       </div>
     </div>`;
   }).join('');
@@ -1478,8 +1580,8 @@ async function openLibItem(stem) {
   document.getElementById('lib-det-meta').innerHTML = meta.map(m => `<span class="chip">${esc(m)}</span>`).join('');
   const stemEnc = encodeURIComponent(stem);
   const acts = [`<button class="sm" onclick="copyLibMd('${esc(stem)}')">复制全文</button>`];
-  if (it.has_md) acts.push(`<a class="btn sm" href="/api/library/${stemEnc}/download/md">下载 MD</a>`);
-  if (it.has_json) acts.push(`<a class="btn sm" href="/api/library/${stemEnc}/download/json">下载 JSON</a>`);
+  if (it.has_md) acts.push(`<a class="btn sm" href="${withToken(`/api/library/${stemEnc}/download/md`)}">下载 MD</a>`);
+  if (it.has_json) acts.push(`<a class="btn sm" href="${withToken(`/api/library/${stemEnc}/download/json`)}">下载 JSON</a>`);
   document.getElementById('lib-det-actions').innerHTML = acts.join('');
 
   if (!it.has_md) {
@@ -1489,7 +1591,8 @@ async function openLibItem(stem) {
   if (!libCache[stem]) {
     document.getElementById('lib-md-rendered').innerHTML = '<p style="color:var(--muted);">正在加载逐字稿…</p>';
     try {
-      const res = await fetch(`/api/library/${stemEnc}/download/md`);
+      const res = await fetch(`/api/library/${stemEnc}/download/md`, {headers: authHeaders()});
+      if (res.status === 401 && !tokenPromptShown) openTokenModal('需要访问令牌以读取逐字稿');
       if (!res.ok) throw new Error('HTTP ' + res.status);
       libCache[stem] = await res.text();
     } catch (e) {
@@ -1613,7 +1716,8 @@ async function loadSettingsForm(showToast = false) {
     document.getElementById('set-apikey').placeholder = s.has_api_key ? `已保存 (${s.llm_api_key_masked})` : '输入 API Key';
     clearKeyPending = false;
     document.getElementById('set-model').value = s.llm_model || '';
-    document.getElementById('set-effort').value = s.llm_reasoning_effort || 'low';
+    const eff = ['none', 'low', 'high'].includes(s.llm_reasoning_effort) ? s.llm_reasoning_effort : 'low';
+    document.getElementById('set-effort').value = eff;
     document.getElementById('set-auto-stop-silence').checked = s.auto_stop_on_silence !== false;
     document.getElementById('set-min-minutes').value = Math.round(((s.min_record_seconds ?? 300) / 60) * 10) / 10;
     document.getElementById('set-silence-seconds').value = (s.silence_stop_seconds ?? 40);
@@ -1691,6 +1795,7 @@ async function refreshAll() {
   await Promise.all([refreshHealth(), refreshJobs(), refreshLibrary(), refreshCleanup()]);
 }
 (function init() {
+  updateAuthUI();
   const h = (location.hash || '').replace(/^#/, '');
   if (h) switchTab(h, false);
   refreshAll();
@@ -1720,10 +1825,29 @@ def _valid_library_stem(stem: str) -> bool:
     return True
 
 
+def _parse_allowed_hosts(raw: str | list[str] | tuple[str, ...] | None) -> set[str]:
+    if raw is None:
+        raw = os.environ.get("WXLIVE_ALLOWED_HOSTS", "")
+    items = raw.split(",") if isinstance(raw, str) else list(raw)
+    out: set[str] = set()
+    for item in items:
+        h = str(item or "").strip().lower()
+        if not h:
+            continue
+        if "://" in h:
+            h = h.split("://", 1)[1]
+        h = h.split("/", 1)[0].split(":", 1)[0].strip()
+        if h:
+            out.add(h)
+    return out
+
+
 def create_app(
     data_dir: Path | str | None = None,
     runner: NasJobRunner | None = None,
     require_token: str | None = None,
+    allowed_hosts: str | list[str] | tuple[str, ...] | None = None,
+    require_read_auth: bool | None = None,
 ) -> FastAPI:
     """创建 FastAPI 实例；支持注入 runner / data_dir 以便测试隔离。
 
@@ -1734,14 +1858,24 @@ def create_app(
 
     所以加一层可选 token：
     - `require_token` 为空字符串/None → 不校验（保持兼容，本地/隧道场景）
-    - 非空 → 所有 `POST/PUT/DELETE` 必须带 `X-WXLIVE-Token` 头或 `?token=` 查询参数
+    - 非空 → 所有 `POST/PUT/DELETE/PATCH` 必须带 `X-WXLIVE-Token` 头或 `?token=` 查询参数
+    - 若同时开启 `WXLIVE_READ_AUTH=1`（或 `require_read_auth=True`），则除 `/` 与 `/api/health` 外，
+      所有只读 `/api/*` 请求也必须携带令牌（适合公网反代暴露场景）
 
-    启动时用 `--token` 或环境变量 `WXLIVE_TOKEN` 开启。
-    另外始终校验 `Host` 头，挡住 DNS rebinding（只放行 IP 字面量与 localhost）。
+    启动时用 `--token` 或环境变量 `WXLIVE_TOKEN` 开启；
+    反向代理透传域名时可通过 `WXLIVE_ALLOWED_HOSTS`（逗号分隔）配置域名白名单。
+    另外始终校验 `Host` 头，挡住 DNS rebinding（只放行 IP 字面量、localhost 与配置白名单）。
     """
     job_runner = runner or NasJobRunner(data_dir=data_dir)
     _token = (require_token if require_token is not None
               else os.environ.get("WXLIVE_TOKEN", "")).strip()
+    if require_read_auth is not None:
+        _read_auth = bool(require_read_auth)
+    else:
+        _read_auth = os.environ.get("WXLIVE_READ_AUTH", "").strip().lower() in (
+            "1", "true", "yes", "on"
+        )
+    _extra_hosts = _parse_allowed_hosts(allowed_hosts)
     _MUTATING = {"POST", "PUT", "DELETE", "PATCH"}
 
     @asynccontextmanager
@@ -1762,7 +1896,7 @@ def create_app(
         """
         host = (request.headers.get("host") or "").split(":")[0].strip().lower()
 
-        # 允许：IP 字面量、localhost、容器内主机名
+        # 允许：IP 字面量、localhost、容器内主机名、以及 WXLIVE_ALLOWED_HOSTS 白名单
         import re as _re
         is_ip = bool(_re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", host or ""))
         is_ipv6 = ":" in (request.headers.get("host") or "")
@@ -1778,6 +1912,7 @@ def create_app(
                 # 不放行的话所有单元测试都会被自己的防护挡住
                 "testserver",
             )
+            or host in _extra_hosts
             or host.endswith(".local")
         )
         if not allowed_host:
@@ -1785,18 +1920,28 @@ def create_app(
 
             return JSONResponse(
                 {"detail": f"拒绝的 Host 头：{host}（防 DNS rebinding）。"
-                           "如需域名访问请通过反向代理并配置白名单。"},
+                           "如需域名访问请配置 WXLIVE_ALLOWED_HOSTS 环境变量。"},
                 status_code=400,
             )
 
-        # token 校验只作用于写操作；GET 保持开放，便于直接用浏览器/curl 查看
-        if _token and request.method in _MUTATING:
+        # token 校验：默认作用于写操作；若开启 WXLIVE_READ_AUTH，也保护敏感只读 API
+        # （保留 `/` 网页外壳和 `/api/health` 以便前端弹出令牌输入框）
+        needs_token = False
+        if _token:
+            if request.method in _MUTATING:
+                needs_token = True
+            elif _read_auth:
+                path = request.url.path or "/"
+                if path.startswith("/api/") and path != "/api/health":
+                    needs_token = True
+
+        if needs_token:
             provided = (
                 request.headers.get("X-WXLIVE-Token")
                 or request.query_params.get("token")
                 or ""
             )
-            if provided != _token:
+            if not provided or not hmac.compare_digest(provided, _token):
                 from fastapi.responses import JSONResponse
 
                 return JSONResponse(
@@ -1836,6 +1981,8 @@ def create_app(
             "disk_free_gb": round(usage.free / (1024**3), 1),
             "job_count": len(jobs),
             "active_count": active,
+            "auth_required": bool(_token),
+            "read_auth_required": bool(_token and _read_auth),
         }
 
     @app.post("/api/probe")
