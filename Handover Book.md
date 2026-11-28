@@ -59,13 +59,22 @@
 
 **🚧 Work In Progress（进行中）**
 
-- **[S-20261128] v0.5.0 已交付并可用**：NAS 令牌可见/可存、体检能鉴别令牌对错、版本号收口单一真相源 + 标题栏源码指纹。全量 **581 passed**。
-- 手机端开启 Token 后的真机滑切直推闭环待实播验收（上轮遗留，本轮未动）。
+- **[S-20261128] v0.5.0 已交付并可用**：NAS 令牌可见/可存、体检能鉴别令牌对错、版本号收口单一真相源 + 标题栏源码指纹。全量 **591 passed**。
+- **[S-20261128] 2.6 小时真实长播全链路跑通**（`20261128_073432_00dbef`《让孩子爱上学习》）：
+  录制 158.5 分 → ASR 266.4s（RTF 0.028）→ 纠错 349 句 → 摘要 4 分钟。
+  `transcript_complete=True`、`tail_gap=1.5s`、`llm_status=ok`、1980 句、繁体 0、幻觉 0。
+  **补齐了缺两轮的「真实 1h+ 长播」样本**，DEBT-005 转为 `Partially-closed`。
+- **[S-20261128] 新增两个只读运维脚本**：`scripts/watch_nas_job.py`（盯任务到终态）、
+  `scripts/audit_nas_job.py`（结构层/内容层两段验收，10 个单测）。
+- **手机端优化验收完成**（King 于 08:30 告知），DEBT-009 → `User-verified`。
 
 **🧱 Active Blockers（当前阻塞）**
 
-- 无硬阻塞。待观察/待验证项见 A3：DEBT-004（`tk.tcl` 偶发）、DEBT-005（真实 1h+ 长直播触发率）、DEBT-007（字段精简）、DEBT-008（GUI `_run_live`）、DEBT-009（手机端微信版本耦合与加密回放提取）。
-- ~~DEBT-010（`git push` 同步）~~ → 本轮已推送，关闭。
+- **🔴 DEBT-011（本轮新发现，高优先）**：NAS 容器镜像未重建，`meta.quality` 自检数据全缺。
+  需 `docker compose up -d --build`，`restart` 无效。
+- 其余待观察项见 A3：DEBT-004（`tk.tcl` 偶发）、DEBT-005（还差 1-2 场长播确认）、
+  DEBT-007（字段精简）、DEBT-008（GUI `_run_live`）。
+- ~~DEBT-009（手机端）~~ → 已验收，关闭。~~DEBT-010（`git push`）~~ → 已推送，关闭。
 
 **🗂️ Latest Daily Review（最近一份日复盘）**
 
@@ -73,12 +82,16 @@
 
 **🚀 Next Prompt Recommendations（下一轮建议 Prompt）**
 
-1. **手机端带 Token 滑切直播间真机验收 + 新版 NAS 完整长播观察**（连续两轮遗留）
-   > "确认手机端已从 NAS `.env` 读入 `WXLIVE_TOKEN` 后，在微信视频号连续滑切 3 个直播间并点「NAS 解析」推送到 `http://one.20161213.xyz:16666`。核验三件事：①弹窗标题与实际录制音频一致（无串台）；②带 `X-WXLIVE-Token` 请求全部 200；③录完后 `meta.transcript_complete == true`、`meta.quality.ok == true`、且长直播下 `llm_status` 非 `partial`。"
-2. **今日直播产物取数（`20261128_073432_00dbef`）**
-   > "读 NAS 上 `20261128_073432_00dbef` 的 meta：核对 `transcript_complete`、`meta.quality.ok`、`trad_residual`/`hallucination_residual` 是否为 0、`llm_status` 是否非 partial。这是「新版容器首场真实长播」样本，补上 A3 里『真实长跑样本不足』的缺口。"
+1. **🔴 重建 NAS 容器镜像（DEBT-011，最高优先）**
+   > "在 NAS 上 `cd /vol1/1000/docker/wxlive-nas/docker && sudo docker compose up -d --build`。
+   > 注意 `restart` 无效。重建后按三层验收：①宿主机 `wxlive/artifacts.py` 的 MD5 与本地一致；
+   > ②`docker exec wxlive-nas python -c 'import wxlive.artifacts; print(hasattr(wxlive.artifacts,\"check_segments\"))'` 返回 True；
+   > ③推一场短录（或对已有任务点『重新后处理』），确认产物 json 的 `meta` 里有 `quality` 键，
+   > 且任务日志出现 `check_segments` 的 summary 行。"
+2. **再收集 1-2 场真实长播（1h+）确认 DEBT-005 不是偶然**
+   > "当前只有 `20261128_073432_00dbef`（2h38m）一个样本，`transcript_complete=True` / `tail_gap=1.5s`。N=1 不足以定论。下一场长播结束用 `python scripts/audit_nas_job.py --job <id>` 取数，对比 `tail_gap_seconds` 与 `rtf`，两场都正常即可关闭 DEBT-005。"
 3. **字段精简（DEBT-007，已分析未实施，连续两轮遗留）**
-   > "删掉 segments 里的 `speaker`（实测 0/1048 非空）和逐句 `ts_source`（提到 meta 记一次）；`raw_text` 改为非空才写；json 写出从 `indent=2` 改 `separators`。目标 336KB → 132KB。改完必须验证 1048 句一条不少。"
+   > "删掉 segments 里的 `speaker`（实测 0/1048 非空）和逐句 `ts_source`（提到 meta 记一次）；`raw_text` 改为非空才写；json 写出从 `indent=2` 改 `separators`。改完必须验证句子一条不少——现在有了 1980 句的真实长播产物作基准，比之前的 1048 句样本更有说服力。"
 4. **`txTime` 剩余有效期 + Clash 断网橙色告警条真机实测**（连续两轮遗留）
    > "在正式目录启动桌面 GUI：①查看直播条目上的 `txTime` 剩余有效期显示；②退出 Clash 让 10808 断掉，确认顶部代理状态条变橙色告警且「一键还原」可用；③恢复 Clash 后告警解除。"
 
@@ -133,11 +146,17 @@
   - 🗓️ S-20261117 复查：**仍未定位**。本轮三种结果都出现过
     （`277 passed,1 error` / `292 passed,1 error` / `293 passed`）。
 
-- **[DEBT-005]** 收尾超时的实际触发率未知 | Introduced: S-20261117 | Status: `Open`
+- **[DEBT-005]** 收尾超时的实际触发率未知 | Introduced: S-20261117 | Status: **`Partially-closed`**（2026-11-28 首个真实长场样本通过）
   - 📍 Location: `wxlive/pipeline.py`（`drain_timeout` / `transcript_complete`）
   - ⚡ Impact: Medium。已知 10 分钟测试里会触发；真实 1–2.4 小时场景未测
   - 💡 Suggested Fix: 收集 2–3 次真实长场次的 `meta.transcript_complete`，
     若频繁为 False 则需要更激进的方案（如录制结束自动排队补转）
+  - ✅ **2026-11-28 首个样本（`20261128_073432_00dbef`，2 小时 38.5 分）通过**：
+    `transcript_complete=True`、`tail_gap_seconds=1.5s`、`rtf=0.028`、
+    `llm_status=ok`、1980 句、无 `error`。
+    → 说明 1h+ 场景下收尾**没有**出现截断，D-011 的 `drain_timeout` 改造有效。
+  - ⏳ 仍需再收集 **1-2 场**长播确认不是偶然（N=1 不足以定论）。
+  - ⚠️ 该场 `meta.quality` 缺失，原因是 NAS 容器未重建（见 DEBT-011），与本条无关。
 
 - **[DEBT-006]** 看门狗只检测 stream 存活，不检测"活着但静音" | Introduced: S-20261117 | Status: `Open`（**有意不改**）
   - 📍 Location: `wxlive/audio_capture.py::_guard_loop`
@@ -165,6 +184,24 @@
   - ✅ 关闭依据：King 于 2026-11-28 08:30 明确告知「手机端已经完成优化验收」。
     **证据级别：用户口头确认**，手机端为独立项目不在本仓库，本机无法复现验证。
     风险描述保留 —— 「微信大版本升级即失效」是结构性约束，不会因本次验收消失。
+
+- **[DEBT-011]** NAS 容器镜像未重建，导致 `meta.quality` 自检数据缺失 | Introduced: S-20261128-0824 | Status: **`Open`（高优先，需下一轮首件事）**
+  - 📍 Location: NAS `wxlive-nas` 容器镜像（`/vol1/1000/docker/wxlive-nas/docker/docker-compose.yml`）
+  - ⚡ Impact: **High**。`nas_runner.py:1505` 的 `doc["meta"]["quality"] = q.to_meta()`
+    自 `49cecb6`（2026-11-26 12:28）就在代码里，但容器未重建 → 该行从未执行。
+    后果：产出物**永久缺失 `quality` 字段**（`trad_residual` / `hallucination_residual` /
+    `ok`），无法跨场次比对内容质量，也无法自动发现「574 句繁体」「幻觉混入正文」这类缺陷。
+  - 🔍 决定性证据（非推断）：`20261128_073432_00dbef` 的任务日志从
+    「ASR 完成 1980 句，RTF=0.03」**直接跳到**「AI 要点生成完毕 → 全部完成」，
+    中间没有 `q.summary()` 那行输出；且产物 json 的 `meta` 键里无 `quality`。
+    同时宿主机 `artifacts.py` 存在、`nas_runner.py` 含 `check_segments` → 文件是对的，镜像旧。
+  - 💡 Suggested Fix:
+    ```
+    cd /vol1/1000/docker/wxlive-nas/docker && sudo docker compose up -d --build
+    ```
+    **`docker restart` 无效** —— 容器是 `COPY` 代码进镜像的，不是挂载。
+    验收三层：①宿主机文件 MD5 与本地一致 ②容器内 `import wxlive.artifacts` 成功
+    ③跑一场短录，产物 `meta` 含 `quality` 键且日志出现 `summary()` 行。
 
 - **[DEBT-010]** 公网只读免密暴露面与本地 9 个提交未推送远端 | Introduced: S-20261127-1430 | Status: `Open`
   - 📍 Location: NAS `.env` (`WXLIVE_READ_AUTH=false`) / 本地 `main` 分支
@@ -516,12 +553,26 @@
 - 测试零污染：跑 `tests/test_gui_fetch.py` 前后生产日志行数均为 **206**
 - 运行确认：GUI 进程 PID 25768 @ 08:20:10，日志 `启动 … v0.5.0 · 源码指纹 4b20f7 · PID 25768`
 
+**后续追加（本 Session 后半段，King 要求盯直播 + 整体规划）**
+
+- **[新增] 2.6 小时真实长播全链路验收**：`20261128_073432_00dbef`《让孩子爱上学习》，
+  07:34:32 → 10:13:02（158.5 分钟 / 290.3 MB / 16k）。
+  ASR 266.4s（RTF 0.028）、1980 句、纠错 349 句（17.6%，与 18% 基线吻合）、
+  后处理约 4 分钟。`transcript_complete=True`、`tail_gap=1.5s`、`llm_status=ok`。
+  独立内容层扫描：繁体 0、幻觉 0、正文密度 5.91 字/秒、无复读。
+  → **DEBT-005 转 `Partially-closed`**（还需 1-2 场确认）。
+- **[新增] 发现 DEBT-011（High）**：NAS 容器镜像未重建 → `meta.quality` 永久缺失。
+  决定性证据是任务日志从「ASR 完成」直接跳到「全部完成」，中间没有 `q.summary()` 输出。
+- **[新增] 两个只读运维脚本**：`scripts/watch_nas_job.py`、`scripts/audit_nas_job.py`
+  （+`tests/test_audit_nas_job.py` 10 用例）。
+- **手机端优化验收完成**（King 于 08:30 告知）→ DEBT-009 `User-verified`。
+
 **Open Items Carried Forward**
 
-- 手机端带 Token 滑切真机验收（连续两轮遗留）
+- 🔴 DEBT-011 重建 NAS 容器镜像（下一轮首件事）
+- 再收集 1-2 场长播确认 DEBT-005
 - `txTime` 剩余有效期 + Clash 断网告警条真机实测（连续两轮遗留）
 - DEBT-007 字段精简（连续两轮遗留）
-- 今日直播 `20261128_073432_00dbef` 的 `meta.quality` / `transcript_complete` 取数（新增）
 
 ---
 

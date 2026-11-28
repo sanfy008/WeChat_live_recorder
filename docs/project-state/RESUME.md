@@ -25,10 +25,14 @@ evidence_level: mixed
   - **不给 Tk 测试加 skip 消掉 `tk.tcl` 偶发 error**
   - **不把句级时间戳改成精确值**（保持 `ts_source="estimated"`）
 - **Acceptance check**:
-  - 本地全量测试：`cd /d/File/01_Vibe_Coding/14-WeChat_live && .venv-trim/Scripts/python.exe -m pytest -q` → **581 passed**
+  - 本地全量测试：`cd /d/File/01_Vibe_Coding/14-WeChat_live && .venv-trim/Scripts/python.exe -m pytest -q` → **591 passed**
   - 令牌三向探针（真实 NAS）：空令牌→`在线，但令牌没通过 · 令牌为空`/`verified=False`；错令牌→`…与服务端不一致`/`False`；正确令牌→`在线 · 令牌有效 · ffmpeg=有`/`True`
   - 推送链路：带真实令牌 `POST /api/probe` → **200**（修复前必然 401）
-  - 版本一致性：包 `0.5.0` == 标题栏 `v0.5.0` == RESUME `v0.5.0`；真实窗口标题 `微信直播录音转写 v0.5.0 · 72698a`
+  - 版本一致性：包 `0.5.0` == 标题栏 `v0.5.0` == RESUME `v0.5.0`
+  - **长播验收（新判据）**：`python scripts/audit_nas_job.py --job <id>`
+    → 结构层看 `stop_reason`/`truncated`/`llm_status`/`sentence_count`；
+    内容层看 `quality.trad_residual==0` 且 `hallucination_residual==0`；
+    完整性看 `tail_gap_seconds` ≤ 30s
 - **Non-goals（故意不做）**:
   - **不覆盖 `README.md`**（Windows 下与 `ReadMe.md` 为同一文件，保留 GitHub 用户文档，DEC-003）
   - **不开启 `WXLIVE_READ_AUTH=true`**（用户明确偏好网页免密只读浏览，仅对写操作/推送强制 `WXLIVE_TOKEN`，DEC-016）
@@ -47,14 +51,42 @@ evidence_level: mixed
 - [verified] **运行中的 GUI 确认为 v0.5.0**：进程 PID `25768` @ `08:20:10`，日志 `启动 微信直播录音转写 v0.5.0 · 源码指纹 4b20f7 · PID 25768`
 - [verified] **测试零污染**：跑 `tests/test_gui_fetch.py` 前后生产日志行数均为 `206`（原会写入 107 条假「启动」）
 - [verified] **新测试有效性反证**：`git stash` 回退修复后 6 个 NAS 用例 6/6 失败，恢复后 6/6 通过
+- [verified] **2.6 小时真实长播全链路跑通**（`20261128_073432_00dbef`《让孩子爱上学习》）：
+  录制 158.5 分钟 / 290.3 MB / 16 kHz → ASR 266.4s（RTF **0.028**）→ 纠错 349/1980 句（17.6%）→ 摘要约 4 分钟。
+  `transcript_complete=True`、`tail_gap_seconds=1.5s`、`llm_status=ok`、`error` 空。
+  独立内容层扫描（不依赖服务端自报）：`_TC2SC` 繁体残留 **0 处**、
+  幻觉痕迹 **0 处**、正文密度 **5.91 字/秒**（历史 5.4）、相邻重复句 0、最长句 119 字。
 
 **未验证（明确标注）**:
 
 - [user-confirmed] 手机端 `wechat_live_nas_pusher` 读入 NAS `.env` 令牌并修复串台后的真实直播间滑切推送与公网带令牌闭环 — **King 于 2026-11-28 08:30 明确告知「手机端已经完成优化验收」**。
   证据级别：用户口头确认，非本机可复现（手机端代码不在本仓库，`wechat_live_nas_pusher` 为独立项目）。
   台账动作：DEBT-009 由 `Open` 转为 `User-verified`，仍保留「微信大版本升级即失效」的风险描述。
-- [inferred] 新版容器下 2 小时以上长直播的 `summarize_digest` 分块重试与 `meta.quality` 落盘表现 — 今日 `20261128_073432_00dbef` 正在录制，可作为首场样本，但产物未取数
+- [verified] 2 小时以上长直播的分块摘要：`20261128_073432_00dbef`（158.5 分钟）
+  `llm_status=ok`（非 partial），摘要耗时约 4 分钟 → **分块重试机制在该场次有效**
+- [unknown] `meta.quality` 落盘 —— **该场产物完全没有这个字段**。
+  不是"值不对"，是代码根本没执行（容器未重建），见上「最高优先待办」DEBT-011。
+  内容层结论已用独立扫描替代（繁体 0 / 幻觉 0 / 密度 5.91），
+  但**服务端自检这一路仍然是断的**，需重建镜像后再验
 - [inferred] `txTime` 剩余有效期显示与 Clash 断网态橙色告警条的真实点击验证 — 仅自动化单测覆盖（**连续两轮遗留**）
+
+## 最高优先待办（下一轮第一件事）
+
+**🔴 DEBT-011：重建 `wxlive-nas` 容器镜像**
+
+```
+cd /vol1/1000/docker/wxlive-nas/docker && sudo docker compose up -d --build
+```
+
+`nas_runner.py:1505` 的 `doc["meta"]["quality"] = q.to_meta()` 自 `49cecb6`（11-26 12:28）
+就在代码里，但容器是 `COPY` 代码进镜像的 —— **`docker restart` 无效，必须 `--build`**。
+导致 2026-11-28 那场 2.6 小时长播的产物 `meta` 里**完全没有 `quality` 字段**，
+内容层自检（繁体/幻觉）永久缺数据。
+
+三层验收：
+1. 宿主机 `wxlive/artifacts.py` 的 MD5 与本地一致
+2. `docker exec wxlive-nas python -c "import wxlive.artifacts; print(hasattr(wxlive.artifacts,'check_segments'))"` → True
+3. 跑一场短录，产物 `meta` 含 `quality` 键，且任务日志出现 `summary()` 输出行
 
 ## Blockers and Do-Not-Repeat
 
