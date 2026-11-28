@@ -44,39 +44,43 @@
   代理上游 10808 探活与 `txTime` 剩余有效期、NAS 断点续转/原片保留/`.dockerignore`、
   统一完整性 `compute_completeness()` + `json`/`md` 原子写盘 + `asr_text` 保留 +
   `max_tokens` 逐轮放大；全量测试 **512 passed, 2 skipped**，NAS 容器重建后健康检查/宿主机 ffmpeg 编码/中文库下载/出网全绿
+- **[S-20261126 午间] 思考强度实测定锚 + 产物自检落地**：
+  39 轮档位实测确认保持 `low`（`max` 耗时 10x 且静默零纠错）；新增 `wxlive/artifacts.py` 与 `scripts/lexicon_retro.py`，补全 `_TC2SC` 7 个漏网繁体字并拦截幻觉残余
+- **[S-20261126~1127] 加密回放直推 + 手机端联调 + 全端鉴权与摘要重试闭环（v0.4.0）**：
+  PC 端补齐代理 2023 一键接管、加密回放 `decrypt_key` 自动解密推送至 NAS（`0b08ed4`、`834d5d3`）；扩充 XSC 词表并统一 `build_vocabulary(60, 40)` 注入（`adfa9b9`）；补齐 `summarize_digest` 分块退避重试、禁用 `max` 思考档位、打通 `WXLIVE_TOKEN` / `WXLIVE_ALLOWED_HOSTS` / `WXLIVE_READ_AUTH` 全端鉴权（`043429f`）；排查今早 `08:07` 串台假停播并输出手机端交接清单，随后在 NAS 重建容器并生效强随机 `WXLIVE_TOKEN` + `WXLIVE_ALLOWED_HOSTS=one.20161213.xyz` + `WXLIVE_READ_AUTH=false`，全量测试 **570 passed**
+- **[S-20261128] NAS 令牌可用性修复 + 版本号治理（v0.5.0）**：把「推送 401 / 找不到令牌框」
+  从「缺功能」翻案为「旧进程跑旧代码」，并顺着修掉三个隐藏缺陷 ——
+  ①令牌框 `width=12` 装不下 43 位令牌且无显示开关；②地址/令牌从不落盘（每次重填）；
+  ③「体检」只打免令牌的 `/api/health`，令牌错也显示"在线"（**假绿灯**）。
+  体检改为 health + 空 body `POST /api/probe` 两步探针，`401`=令牌问题、`422`=通过；
+  真实 NAS 三向验证（空/错/对）全部符合预期。版本号收口到 `wxlive.__version__`
+  单一真相源，标题栏改为 `v0.5.0 · <源码指纹>`，指纹可在「改了代码没重启」时一眼识别旧窗口。
+  全量 **581 passed**（`21858e6`、`a0a8d31`、`05127e2`）
 
 **🚧 Work In Progress（进行中）**
 
-- 准备执行阶段复盘存档并 `git push`。
+- **[S-20261128] v0.5.0 已交付并可用**：NAS 令牌可见/可存、体检能鉴别令牌对错、版本号收口单一真相源 + 标题栏源码指纹。全量 **581 passed**。
+- 手机端开启 Token 后的真机滑切直推闭环待实播验收（上轮遗留，本轮未动）。
 
 **🧱 Active Blockers（当前阻塞）**
 
-- 无硬阻塞。待观察项见 A3：DEBT-004（`tk.tcl` 偶发）、DEBT-005（真实 1h+ 长直播触发率）、DEBT-007（字段精简）、DEBT-008（GUI `_run_live`）。
+- 无硬阻塞。待观察/待验证项见 A3：DEBT-004（`tk.tcl` 偶发）、DEBT-005（真实 1h+ 长直播触发率）、DEBT-007（字段精简）、DEBT-008（GUI `_run_live`）、DEBT-009（手机端微信版本耦合与加密回放提取）。
+- ~~DEBT-010（`git push` 同步）~~ → 本轮已推送，关闭。
 
 **🗂️ Latest Daily Review（最近一份日复盘）**
 
-- `docs/daily__pipeline_reviews/2026-11-26.md`（S-20261126-0030）
+- `docs/daily__pipeline_reviews/2026-11-28.md`（S-20261128-0824）
 
 **🚀 Next Prompt Recommendations（下一轮建议 Prompt）**
 
-1. **验证 transcript_complete 在真实长直播下是否可靠**
-   > "下次真机跑一场 1 小时以上的直播。若出现 RTF 飙高或队列积压，
-   > 确认三件事：①日志有没有打 `[main][warn] 收尾超时`；
-   > ②产物 meta 里 `transcript_complete` 是否为 False；
-   > ③`output/spilled/` 有没有落下未转的片段。
-   > 三处对得上才算修复有效。"
-2. **字段精简（已分析，未实施）**
-   > "删掉 segments 里的 `speaker`（实测 0/1048 非空）和逐句 `ts_source`
-   > （1048/1048 全是常量 estimated，提到 meta 记一次）；
-   > `raw_text` 改为非空才写；json 写出从 `indent=2` 改 `separators`。
-   > 目标 336KB → 132KB。改完必须验证 1048 句一条不少。"
-3. **GUI「录制+转写」路径端到端实测**
-   > "用 GUI 点'录制+转写'跑一次短录制（5 分钟），验证产物落在 transcripts/、
-   > 音频落在 recordings/、'打开逐字稿'能打开。本轮只测了 CLI pipeline，
-   > GUI 那条 `_run_live` 路径还没真实点击验证过。"
-4. **全仓排查同类初始化顺序 bug（自 S-20261116 起挂起）**
-   > "检查 wxlive/gui*.py 里所有 `_build_*_tab()` 方法，找出'方法体中段调用了
-   > 依赖后置字段的回调'的模式。参考 gui_fetch.py 的 `_ui_queue` 那个 bug。"
+1. **手机端带 Token 滑切直播间真机验收 + 新版 NAS 完整长播观察**（连续两轮遗留）
+   > "确认手机端已从 NAS `.env` 读入 `WXLIVE_TOKEN` 后，在微信视频号连续滑切 3 个直播间并点「NAS 解析」推送到 `http://one.20161213.xyz:16666`。核验三件事：①弹窗标题与实际录制音频一致（无串台）；②带 `X-WXLIVE-Token` 请求全部 200；③录完后 `meta.transcript_complete == true`、`meta.quality.ok == true`、且长直播下 `llm_status` 非 `partial`。"
+2. **今日直播产物取数（`20261128_073432_00dbef`）**
+   > "读 NAS 上 `20261128_073432_00dbef` 的 meta：核对 `transcript_complete`、`meta.quality.ok`、`trad_residual`/`hallucination_residual` 是否为 0、`llm_status` 是否非 partial。这是「新版容器首场真实长播」样本，补上 A3 里『真实长跑样本不足』的缺口。"
+3. **字段精简（DEBT-007，已分析未实施，连续两轮遗留）**
+   > "删掉 segments 里的 `speaker`（实测 0/1048 非空）和逐句 `ts_source`（提到 meta 记一次）；`raw_text` 改为非空才写；json 写出从 `indent=2` 改 `separators`。目标 336KB → 132KB。改完必须验证 1048 句一条不少。"
+4. **`txTime` 剩余有效期 + Clash 断网橙色告警条真机实测**（连续两轮遗留）
+   > "在正式目录启动桌面 GUI：①查看直播条目上的 `txTime` 剩余有效期显示；②退出 Clash 让 10808 断掉，确认顶部代理状态条变橙色告警且「一键还原」可用；③恢复 Clash 后告警解除。"
 
 ### A3. 🔍 Quality & Gap Analysis（质量缺口）
 
@@ -97,6 +101,13 @@
 - **[S-20261117 新增] 产物完整性缺自动校验。** 现在要靠人拿
   `音频时长` vs `转写末句时间` 对比才能发现截断。
   应加一条自动检查：两者差值 > 阈值就告警。
+- **[S-20261128 新增] 假绿灯仍是最高频的一类错误。** 本轮又抓到一例：
+  「体检」打的是免令牌的 `/api/health`，令牌错也显示"在线"，一推送就 401。
+  **可复用判据：绿灯必须来自与失败同一层的检查**；
+  用上一层（机器在线）的绿灯推断下一层（鉴权通过）= 假绿灯。
+- **[S-20261128 新增] 前端硬编码版本号必然过期。** 标题栏 `1.0` 从首次提交
+  起 12 天没动过，同期包版本已到 0.4。**判据：版本号只允许一处定义**，
+  并加测试断言"标题栏版本 == 包版本"+"源码里不存在硬编码版本字面量"。
 
 **🏗️ 技术债务台账**
 
@@ -147,12 +158,23 @@
   - ⚡ Impact: Medium。`audio_dir` 修复对它有效，但未经真实点击验证
   - 💡 Suggested Fix: GUI 点一次 5 分钟录制，确认产物落点与"打开逐字稿"
 
+- **[DEBT-009]** 手机端插件硬编码微信 `8.0.62`（`versionCode=2881`）R8 混淆符号且暂缺加密回放提取 | Introduced: S-20261127-1430 | Status: `Open`
+  - 📍 Location: 手机端 `wechat_live_nas_pusher` (`HookEntry.java`)
+  - ⚡ Impact: Medium。微信大版本升级即失效，且手机端暂不能直接推送加密回放的 `decrypt_key`
+  - 💡 Suggested Fix: 手机端补齐微信版本校验、特征签名动态查找及回放 `decodeKey` 提取
+
+- **[DEBT-010]** 公网只读免密暴露面与本地 9 个提交未推送远端 | Introduced: S-20261127-1430 | Status: `Open`
+  - 📍 Location: NAS `.env` (`WXLIVE_READ_AUTH=false`) / 本地 `main` 分支
+  - ⚡ Impact: Medium。公网知晓地址/端口者可免密浏览任务与下载逐字稿；本地提交尚无远端备份
+  - 💡 Suggested Fix: 立即 `git push` 同步远端；若后续公网访问人数扩大，可随时切回 `WXLIVE_READ_AUTH=true` 或在反代层加独立鉴权
+
 ### A4. 📊 Skill Dashboard（效用仪表板）
 
 | Skill 名称 | 累计触发 | 用户满意 | 用户纠正 | 效用评分 |
 |---|---|---|---|---|
 | king-workstyle | 多次（跨会话） | — | — | ⭐⭐⭐⭐⭐ |
-| project-save | 2 | — | — | — |
+| project-save | 3 | — | — | — |
+| wxlive-nas-deploy-verify | 2（S-20261126 午间 / S-20261127） | — | — | ⭐⭐⭐⭐⭐ |
 | wechat-live-recorder | 多次 | — | — | ⭐⭐⭐⭐⭐ |
 | windows-audio-capture | 多次 | — | — | ⭐⭐⭐⭐⭐ |
 | tkinter-gui-testing | 多次 | — | — | ⭐⭐⭐⭐⭐ |
@@ -188,6 +210,10 @@
 | 15:45 | — | 合成信号直接走代码路径 | **成功**：绕开不确定的播放端 | keep |
 | 17:00 | — | 全流程实测：看到 md/jsonl 正常即认为跑通 | **错判**：音频 592s 而转写只到 404.9s，json 根本未生成 | discard |
 | 17:05 | — | 补转 405s 之后 + 重建完整产物 | **成功**：证实音频完好，问题在收尾被截断 | keep |
+| 11-26 12:20 | — | 39 轮档位实测 + `group/deepseek` `max` 档对比 | **证伪 `max`**：`high` 与 `low` 在 A/A 噪声内；`max` 耗时 10 倍且 2 批零纠错，全端禁用 `max` | keep |
+| 11-27 11:00 | — | 检查 NAS 08:07 任务《小林升学》不自动停止原因 | **证伪“静音判停坏了”**：末尾 RMS 0.017~0.096 且实时音频是英语课《滚雪球造句法》，根因是手机端未修串台前推错了流 | keep |
+| 11-27 12:55 | wxlive-nas-deploy-verify | 公网鉴权初配 `WXLIVE_READ_AUTH=true` | **违背浏览习惯**：打开网页即弹密码框，用户反馈太繁琐 | discard |
+| 11-27 13:02 | wxlive-nas-deploy-verify | 调整为 `WXLIVE_READ_AUTH=false` + `WXLIVE_TOKEN` 锁写操作 + `WXLIVE_ALLOWED_HOSTS` | **采纳**：网页免密只读 200，写操作无令牌 401 / 有令牌通过 | keep |
 
 ---
 
@@ -297,6 +323,24 @@
   - ✅ Decision: `.dockerignore` 放仓库根；`retention.py` 按任务年龄/保留天数清理原片，跳过进行中任务并把源文件加入 `referenced_audio` 防孤儿扫描二次处理
   - 📌 Status: `Active`
 
+- **[DEC-014] 全端禁用 LLM `max` 思考档位，统一收紧至 `none/low/high`** | Session: S-20261127-1430 | 2026-11-27
+  - 🔍 Context: 2026-11-26 午间 39 轮实测确认 `high` 与 `low` 差异落在 A/A 噪声内（0.9933 vs 基线 0.9908），而 `max` 在 `group/deepseek` 上耗时 10 倍（493.8s）且 2 批全部失败、零纠错静默通过
+  - ✅ Decision: `wxlive/config.py` 将 `VALID_REASONING_EFFORTS` 收紧为 `("none", "low", "high")`，`server.py` 设置下拉移除 `max`，`nas_runner.py` 读取旧 `settings.json` 中的 `max` 时安全降级为 `low`
+  - ❌ Alternatives: 仅在文档口头提醒勿选 `max`（用户或旧配置仍会踩到 10 倍耗时零纠错陷阱）
+  - 📌 Status: `Active`
+
+- **[DEC-015] 统一 `lexicon.build_vocabulary(60, 40)` 注入并补齐分块摘要退避重试** | Session: S-20261127-1430 | 2026-11-27
+  - 🔍 Context: 昨晚 2.6h 长直播 `20261126_200453_2cea98` ASR 完整但 `build_digest` 第 5 块 `read timeout` 直接落成 `partial`；同时扩充后的 `lexicon/xsc.json` 需要各端统一控制提示词词表规模
+  - ✅ Decision: `postprocess.py` 新增 `_complete_multi_with_retry` 与 `DIGEST_RETRY_DELAYS = (2.0, 6.0)`；`lexicon.py` 新增 `build_vocabulary(60, 40)` 并统一接入 `auto_pipeline.py`、`auto_transcribe_after_stop.py`、`gui.py`、`nas_runner.py`
+  - ❌ Alternatives: 仅增大单次 timeout（无法抵御网关偶发连接中断或 502）
+  - 📌 Status: `Active`
+
+- **[DEC-016] 公网 NAS 采用“网页免密只读 + 写操作/推送强制 Token + Host 白名单”鉴权策略** | Session: S-20261127-1430 | 2026-11-27
+  - 🔍 Context: `one.20161213.xyz:16666` 暴露到公网后需防止未授权删改/发起录制，但用户明确拒绝每次打开网页还要弹窗输密码（FAIL-011）
+  - ✅ Decision: `server.py` 补全 `WXLIVE_ALLOWED_HOSTS`、`WXLIVE_READ_AUTH` 与 Web UI「🔑 令牌」弹窗/`localStorage`；`fetch.py`/`gui_fetch.py` 透传 `X-WXLIVE-Token`；NAS `.env` 配置 43 位随机 `WXLIVE_TOKEN`、`WXLIVE_ALLOWED_HOSTS=one.20161213.xyz`、`WXLIVE_READ_AUTH=false`
+  - ❌ Alternatives: ①强制 `WXLIVE_READ_AUTH=true`（新浏览器/清缓存打开即弹窗阻断，用户否决）；②不设 `WXLIVE_TOKEN`（公网可任意删除任务与启动录制，风险过高）
+  - 📌 Status: `Active`
+
 ### B2. 🎨 Style DNA（用户偏好档案）
 
 - `[S-20261116-2345]` **用户先提出自己的因果假设，但允许被推翻。** 本轮他说"是不是 GOI 调用了什么工具"，实际是工具在轮询自己的状态条。他接受纠正，关注点在"能不能优化"。→ 不要因为用户给了假设就顺着编解释，要独立验证。
@@ -313,6 +357,8 @@
 - `[跨会话]` 偏好 GUI 操作技术工作流；技术讨论到代码/测试/系统配置级别。
 - `[跨会话]` 喜欢"双线赛马"——同一任务并行跑多个 AI 再对擂取优。
 - `[跨会话]` 说"go ahead"时期待直接从评审进入实现 + 配套回归测试。
+- `[S-20261127-1430]` **拒绝把安全策略做得影响日常顺手体验。** 当 `WXLIVE_READ_AUTH=true` 导致打开 NAS 网页要输密码时，明确要求调成只读免密、只锁写操作。→ 上线带“拦截日常只读浏览”的开关前，先给用户说清弹窗感知并确认默认档位。
+- `[S-20261127-1430]` **跨设备联调采用“PC 端出交接清单 → 手机端整改确认 → 服务端切配置闭环”的节奏。** 不代猜对端进展，等对方确认修完再合闸开启鉴权。
 
 ### B3. ❌ Failed Attempts Archive（失败档案）
 
@@ -375,13 +421,152 @@
   - 💥 Failure Reason: 系统代理 `10808` 会接管非 `127.0.0.1` 的局域网请求
   - 💡 Lesson: **探测局域网服务必须加 `curl --noproxy '*'`（或容器内 localhost 复测）**
 
+- **[FAIL-010] 档位对比与词表复盘脚本初版度量失真** | Session: S-20261126-1215 | 2026-11-26
+  - 🔧 Approach: 统计数字保真时未剥离格式序号 `9.`/`12.`，列表正则漏掉 `1.` 编号，A/A 基线跨语段算出 `0.03`
+  - 💥 Failure Reason: 度量口径本身被文本格式污染，产生误导性指标
+  - 💡 Lesson: **看到反常指标先查度量脚本本身，再下产品/模型结论**
+
+- **[FAIL-011] 公网开启鉴权时默认打开 `WXLIVE_READ_AUTH=true` 阻断网页免密浏览** | Session: S-20261127-1430 | 2026-11-27
+  - 🔧 Approach: 为追求“公网全锁”默认将 `.env` 的 `WXLIVE_READ_AUTH` 设为 `true`
+  - 💥 Failure Reason: 用户打开 NAS 网页直接弹密码框，反馈“不想登录网页还要输密码，太复杂了”，随即改为 `false` 重建
+  - 💡 Lesson: **对改变日常浏览门槛的安全开关，上线前应确认只读是否需要鉴权，默认保持读写分级**
+
+- **[FAIL-012] 在工作树 CWD 下以绝对路径运行正式目录的 `pytest`** | Session: S-20261127-1430 | 2026-11-27
+  - 🔧 Approach: 未切换工作目录，直接在 worktree 中通过绝对路径参数对正式目录 `tests/` 运行 `pytest -q`
+  - 💥 Failure Reason: Python 按 CWD 优先导入旧 worktree 里的 `wxlive` 包，收集阶段即报 `ModuleNotFoundError: No module named 'wxlive.artifacts'`
+  - 💡 Lesson: **运行测试前必须显式 `cd` 到目标仓库根目录**
+
 ### B4. 🏗️ Technical Debt Register
 
-见 Zone A3 的台账（DEBT-001 ~ DEBT-004）。此处不重复，保持单一事实来源。
+见 Zone A3 的台账（DEBT-001 ~ DEBT-010）。此处不重复，保持单一事实来源。
 
 ---
 
 ## Zone C — Session Archive（冻结区，新快照在最上方）
+
+---
+
+### 📸 Session Snapshot: S-20261128-0824 | v0.5.0 | 2026-11-28 08:24
+
+**Session Summary**: 由 King 一句「推送 NAS 有错误，需要 token，但 GUI 没有输入 token 的选项」触发的排障。
+查实**不是缺功能，而是屏幕上那个 GUI 进程是 11-26 17:55 启动的，比令牌输入框的重码提交
+（`043429f`，11-27 11:14）早 17 小时** —— 功能在代码里，只是从未被加载。
+顺着查下去修掉三个隐藏缺陷：令牌框宽 12 字符装不下 43 位令牌且无显示开关；地址与令牌从不落盘
+（每次开窗口重填）；「体检」只打免令牌的 `/api/health`，令牌错也显示"在线"（假绿灯）。
+体检改为 `health` + 空 body `POST /api/probe` 两步探针。随后应 King 追问「版本号是不是一直没变」，
+查实项目里并存三个互不相干的版本号（标题栏 `1.0` 从首提交起 12 天未动 / 包 `0.2.0` / RESUME `v0.4.0`），
+收口到 `wxlive.__version__` 单一真相源，并给标题栏加**源码指纹**以识别「改了代码没重启」的旧窗口。
+最后修掉自己引入的测试污染（启动日志写进了生产日志，一轮全量 107 条）。
+
+**Delta from Previous Save (增量变化)**
+
+- 📁 New files:
+  - `tests/test_version.py`（版本号一致性 5 用例）
+  - `docs/daily__pipeline_reviews/2026-11-28.md`（本轮日复盘）
+- ✏️ Modified files:
+  - `wxlive/__init__.py`：新增 `__version__ = "0.5.0"`、`VERSION_LABEL`、`build_stamp()`
+  - `wxlive/config.py`：新增 `NasConfig`（`base_url` / `token`）
+  - `wxlive/userconfig.py`：`SAVEABLE` 增 `nas` 段，`build_config_from_user` 合并 nas
+  - `wxlive/gui.py`：删硬编码 `APP_VER = "1.0"`，标题栏改 `v0.5.0 · <指纹>`；启动写日志；加载/回填 nas
+  - `wxlive/gui_fetch.py`：NAS 目标框改两行布局（令牌 width 44 + 显示开关）、落盘、体重写为两步探针、401 改可执行指引
+  - `tests/test_gui_fetch.py`：+6 NAS 用例；fixture 隔离 `OUTPUT_DIR`；修 2 个旧桩签名
+- 🔄 Superseded:
+  - 「GUI 令牌输入框待真机实测」这条遗留项**表述有误** —— 不是"没测"，
+    而是当时跑的进程里根本没有该控件。已更正。
+
+**Decisions Made**
+
+- **[DEC-017] 访问令牌不做"自动获取"，只做"存一次免填"**
+  | Session: S-20261128-0824 | 2026-11-28
+  - ❌ Problem: King 提出能否「自动获取解密 token」。核实后发现混淆了两个 token：
+    `decodeKey`（加密回放的 DRM key，早已全自动）与 `X-WXLIVE-Token`（NAS 鉴权，43 位随机）。
+  - ✅ Decision: `X-WXLIVE-Token` **原理上不可自动获取**（它是用户自己设在 NAS `.env` 的密钥，
+    能自动拿到 = 鉴权失效）。实施的是「写入 `config/user.json`（已 gitignore）+ 启动回填」。
+  - 🔒 Constraint: 令牌不得进版本库、不得回显在日志/对话中。
+  - 📌 Evidence: `wxlive/config.py#NasConfig`、`wxlive/userconfig.py#SAVEABLE`、`tests/test_version.py`
+
+- **[DEC-018] 健康检查必须能鉴别鉴权，不能只探活**
+  | Session: S-20261128-0824 | 2026-11-28
+  - ❌ Problem: 「体检」只打 `/api/health`（免令牌端点），令牌错也报"在线"，实测推送仍 401。
+  - ✅ Decision: 两步探针 —— `health` 判在线，空 body `POST /api/probe` 判鉴权。
+    `401` = 令牌问题，`422`/`2xx` = 通过。探针无副作用（不建任务、不碰磁盘）。
+  - 📌 Evidence: `wxlive/gui_fetch.py#_fetch_nas_health`；真实 NAS 三向实测
+    （空令牌 / 错令牌 / 正确令牌 分别 False/False/True）
+
+- **[DEC-019] 版本号单一真相源 + 标题栏带源码指纹**
+  | Session: S-20261128-0824 | 2026-11-28
+  - ❌ Problem: 三个版本号并存且标题栏 12 天未变，无法回答「屏幕上是哪一版」。
+  - ✅ Decision: `wxlive.__version__` 为唯一真相源；`build_stamp()` 对 `wxlive/*.py`
+    的 mtime+size 取 6 位哈希，用于识别「改了代码没重启」的旧窗口。
+    刻意不依赖 git（`pythonw` 下跑 git 会弹黑框）。
+  - 🔒 Constraint: 新增 `tests/test_version.py` 锁死一致性，防止再次漂移。
+  - 📌 Evidence: `wxlive/__init__.py`、`wxlive/gui.py#APP_STAMP`、`tests/test_version.py`
+
+**Verification Evidence**
+
+- 全量 `pytest -q`：**581 passed**（基线 570，+6 NAS +5 版本，另修 2 个旧桩）
+- 新测试有效性反证：`git stash` 回退修复后 6 个 NAS 用例 **6/6 失败**，恢复后 6/6 通过
+- 真实 NAS 三向探针：空令牌→`令牌为空`/False；错令牌→`与服务端不一致`/False；正确令牌→`令牌有效`/True
+- 推送链路：带真实令牌 `POST /api/probe` 返回 **200**（修复前必然 401）
+- 持久化：磁盘 `config/user.json` 的 `nas` 段写入且重开回填；`_save_settings()` 前后令牌长度不变（41→41）
+- 版本：真实窗口标题 `微信直播录音转写 v0.5.0 · 72698a`；`touch` 任一 `.py` → 指纹变 `41ab05`
+- 测试零污染：跑 `tests/test_gui_fetch.py` 前后生产日志行数均为 **206**
+- 运行确认：GUI 进程 PID 25768 @ 08:20:10，日志 `启动 … v0.5.0 · 源码指纹 4b20f7 · PID 25768`
+
+**Open Items Carried Forward**
+
+- 手机端带 Token 滑切真机验收（连续两轮遗留）
+- `txTime` 剩余有效期 + Clash 断网告警条真机实测（连续两轮遗留）
+- DEBT-007 字段精简（连续两轮遗留）
+- 今日直播 `20261128_073432_00dbef` 的 `meta.quality` / `transcript_complete` 取数（新增）
+
+---
+
+### 📸 Session Snapshot: S-20261127-1430 | v0.4.0 | 2026-11-27 14:30
+
+**Session Summary**: 围绕“项目演进复盘 + 手机端公网直推短板修补 + 全端鉴权闭环”展开工作。在 11-26 下午完成代理 2023 体检接管与加密回放自动解密推 NAS（`0b08ed4`、`834d5d3`）的基础上，今日整理提交 XSC 词表扩充与 `build_vocabulary(60, 40)` 统一注入（`adfa9b9`），修复长直播分块摘要超时无重试、全端禁用 `max` 思考档位并打通 `WXLIVE_TOKEN` / `WXLIVE_ALLOWED_HOSTS` / `WXLIVE_READ_AUTH` 全端鉴权闭环（`043429f`）；排查今早 `08:07` 假停播实为手机端修复前预加载串台，指导手机端完成整改后在 NAS 重建容器（`sha256:dca75fdff`）并按用户偏好调优为“网页免密只读 + 写操作 Token 保护”。
+
+**Delta from Previous Save (增量变化)**
+
+- 📁 New files:
+  - `wxlive/artifacts.py`、`tests/test_artifacts.py`（产物繁简/幻觉自检，11-26 午间合入）
+  - `scripts/bench_effort.py`、`scripts/lexicon_retro.py`
+  - `docs/思考强度档位复测-2026-11-26.md`、`docs/词表定期复盘可行性-2026-11-26.md`
+  - `docs/daily__pipeline_reviews/2026-11-27.md`（本轮日复盘）
+- ✏️ Modified files:
+  - 本地抓流/加密回放推 NAS：`wxlive/systemproxy.py`、`wxlive/fetch.py`、`wxlive/gui_fetch.py`、`wxlive/nas_runner.py`、`wxlive/stream_capture.py`
+  - 词表与 ASR 注入：`lexicon/xsc.json`、`wxlive/lexicon.py`、`auto_pipeline.py`、`scripts/auto_transcribe_after_stop.py`、`wxlive/gui.py`
+  - 分块重试、禁用 `max` 与全端鉴权：`wxlive/postprocess.py`、`wxlive/config.py`、`wxlive/server.py`、`docker/docker-compose.yml`、`docker/.env.example`
+  - 测试与档案：`tests/test_{artifacts,gui_fetch,lexicon,live_stream_url,nas_server,postprocess_truncation,text_meta_config}.py`、`Handover Book.md`、`docs/project-state/RESUME.md`
+- 🔑 Key changes:
+  - 全量单元测试从 512 passed, 2 skipped 增长至 **570 passed**（正式目录 `.venv-trim` 实测 `96.92s`）
+  - NAS 容器使用最新代码重建并完成内网/公网鉴权实测（`GET /` & `GET /api/jobs` 无令牌 `200`；`POST /api/probe` 无令牌 `401`、带有效 `X-WXLIVE-Token` 达 `422`）
+
+**Decisions Made This Session**: DEC-014, DEC-015, DEC-016
+
+**Failed Attempts This Session**: FAIL-010, FAIL-011, FAIL-012
+
+**Cognitive State at Close（会话关闭时的思维状态）**
+
+- PC 端与 NAS 端代码及 `.env` 鉴权配置已全部落盘并验证；手机端 `wechat_live_nas_pusher` 已由用户确认按交接清单修改，但尚未在开启 `WXLIVE_TOKEN` 后的真实直播中做端到端滑切推送实测。
+- 本地 `main` 分支已有 9 个提交领先 `origin/main`（含本次存档待提交），尚未 `git push`。
+
+**Context Window Highlights**
+
+- 用户对“打开 NAS 网页还要输密码”明确表示太复杂，要求关闭 `WXLIVE_READ_AUTH`，保留写操作 `WXLIVE_TOKEN`；这一权衡已在 `DEC-016` 与 `RESUME.md` 固定，避免后续会话误翻回。
+- 对 `08:07` 任务持续录制 3 小时的排查证明了音频抽样转写（RMS + 实际内容识别）比猜开关状态更可靠。
+
+**Session Reflect Report**
+
+- **R1 — 成功模式**:
+  - **真音频抽样定位**：直接拉取现网进行中任务的末尾/分段音频跑 RMS 与本地转写，一举排除“静音判停失效”的假象，定位出“手机端串台导致标题与流错配”的真根因。
+  - **`king-workstyle` 凭据保护 + 可逆部署**：NAS `.env` 先备份再改，43 位强随机 Token 全程不进对话或日志，从 `WXLIVE_READ_AUTH=true` 秒级回切 `false` 并双端验证。
+- **R2 — 边界案例**:
+  - **`WXLIVE_READ_AUTH` 默认值冲突**：从纯公网安全角度默认开了 `true`，但与用户“网页免密看列表、只锁写入/推送”的直觉冲突（FAIL-011）。已沉淀到风格档案和 `DEC-016`。
+  - **跨工作树跑测试的 CWD 陷阱**：worktree 目录下直接用绝对路径跑主目录 tests 会加载旧代码（FAIL-012）。
+- **R3 — 改进信号**:
+  - 下次跨端（PC/NAS + 手机 Termux）联调涉及鉴权开关时，先明确读写分级策略，再落盘配置。
+  - `project-save` 的校验器 `validate_closure.py` 仍期待 `ReadMe.md` 含版本头、且对 `Handover Book - Archive.md` 在未归档时也报缺少文件；在本项目仍坚持 `DEC-003` 不覆盖 `README.md`，验证时需明确说明该预期差异，不把脚本失败粉饰为全部通过。
 
 ---
 
