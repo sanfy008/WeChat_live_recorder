@@ -28,12 +28,17 @@ SAVEABLE = {
             "use_lexicon", "lexicon_path", "beam_size", "vad_filter"],
     "text": ["model", "reasoning_effort"],
     "output": ["keep_audio"],
+    # NAS 推送目标：地址与访问令牌要记住，否则每次开窗口都得重填一遍。
+    # 令牌是防公网白嫖的共享密钥，不是本机密码；写入 config/user.json，
+    # 该文件已在 .gitignore 里（见项目根）。
+    "nas": ["base_url", "token"],
 }
 
 
 def default_config_dict() -> dict:
     """从 dataclass 里取出厂默认值。"""
-    from .config import AsrConfig, AudioConfig, OutputConfig, TextConfig, VadConfig
+    from .config import (AsrConfig, AudioConfig, NasConfig, OutputConfig,
+                         TextConfig, VadConfig)
 
     return {
         "audio": asdict(AudioConfig()),
@@ -41,6 +46,7 @@ def default_config_dict() -> dict:
         "asr": asdict(AsrConfig()),
         "text": asdict(TextConfig()),
         "output": asdict(OutputConfig()),
+        "nas": asdict(NasConfig()),
     }
 
 
@@ -72,7 +78,8 @@ def save_user_config(data: dict) -> None:
 
 def build_config_from_user(base=None):
     """把 user.json 叠加到出厂 Config 上，返回 Config 实例。"""
-    from .config import AsrConfig, AudioConfig, Config, OutputConfig, TextConfig, VadConfig
+    from .config import (AsrConfig, AudioConfig, Config, NasConfig, OutputConfig,
+                         TextConfig, VadConfig)
 
     cfg = base or Config()
     user = load_user_config()
@@ -95,6 +102,7 @@ def build_config_from_user(base=None):
     cfg.text = _merge(cfg.text if isinstance(cfg.text, TextConfig) else TextConfig(), "text")
     cfg.output = _merge(cfg.output if isinstance(cfg.output, OutputConfig) else OutputConfig(),
                         "output")
+    cfg.nas = _merge(cfg.nas if isinstance(cfg.nas, NasConfig) else NasConfig(), "nas")
     _normalize_lexicon_path(cfg)
     return cfg
 

@@ -1127,3 +1127,185 @@ def test_push_expired_replay_fails_fast_with_clear_video_hint(
     assert "403" in warns[0][1]
     assert "视频/回放" in warns[0][1]
     assert "重新打开该直播" not in warns[0][1]
+
+
+# ==================== NAS 目标：令牌与持久化 ====================
+#
+# 这一组用例对应 2026-11-28 的三个真实缺陷。它们都**不报错**，
+# 只是让人做不成事，所以必须有测试锁住：
+#
+#   1. 令牌框只有 12 字符宽 —— NAS 令牌是 43 位，粘进去只看得到几个星号，
+#      输错了只收到 401，不知道错在哪。
+#   2. 地址/令牌从不落盘 —— 每次开窗口都回到硬编码默认值。
+#   3. 「体检」只打 /api/health（免令牌端点）—— 令牌错也显示「在线」。
+
+
+def test_nas_token_entry_wide_enough_for_43_chars(app):
+    """令牌框必须装得下 43 位随机串。
+
+    判据取控件真实 width 属性，不是"看起来挺宽"。
+    原实现 width=12，而 NAS 令牌固定 43 位。
+    """
+    entry = app.fetch_nas_token_entry
+    assert int(entry.cget("width")) >= 43
+
+
+def test_nas_token_masked_by_default_and_toggleable(app):
+    """默认遮挡，点「显示」能看明文 —— 否则无法核对粘对了没。"""
+    entry = app.fetch_nas_token_entry
+    assert entry.cget("show") == "*"
+
+    app.fetch_nas_show_token.set(True)
+    app._fetch_nas_toggle_token()
+    assert entry.cget("show") == ""
+
+    app.fetch_nas_show_token.set(False)
+    app._fetch_nas_toggle_token()
+    assert entry.cget("show") == "*"
+
+
+def test_nas_target_persisted_to_disk(app, tmp_path, monkeypatch):
+    """改完地址/令牌要真的写进 user.json（判据在磁盘，不在内存）。"""
+    import json
+
+    import wxlive.userconfig as UC
+
+    p = tmp_path / "user.json"
+    monkeypatch.setattr(UC, "USER_CONFIG_PATH", p)
+
+    app.fetch_nas_var.set("http://10.1.2.3:8910")
+    app.fetch_nas_token_var.set("T" * 43)
+    app._fetch_nas_on_target_changed()
+
+    assert p.exists(), "配置文件没有落盘"
+    nas = json.loads(p.read_text(encoding="utf-8"))["nas"]
+    assert nas["base_url"] == "http://10.1.2.3:8910"
+    assert nas["token"] == "T" * 43
+
+
+def test_nas_target_restored_on_next_launch(tmp_path, monkeypatch):
+    """重新构造 App 时应把上次存的地址与令牌填回界面。
+
+    这是「下次开窗口不用重填」的真正判据 —— 前面那条只证明写进去了。
+    """
+    import json
+
+    import wxlive.userconfig as UC
+
+    p = tmp_path / "user.json"
+    p.write_text(json.dumps({
+        "nas": {"base_url": "http://10.9.8.7:8910", "token": "K" * 43},
+    }, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(UC, "USER_CONFIG_PATH", p)
+    monkeypatch.delenv("WXLIVE_TOKEN", raising=False)
+
+    import wxlive.audio_capture as AC
+    monkeypatch.setattr(AC, "list_loopback_devices", lambda: [])
+    monkeypatch.setattr(AC, "pick_device", lambda hint="": type("D", (), {"name": ""})())
+    import wxlive.fetch as F
+    monkeypatch.setattr(F, "discover_live_streams", lambda *a, **kw: [])
+    monkeypatch.setattr(F, "discover_feed_videos", lambda *a, **kw: [])
+
+    from wxlive.gui import App
+
+    a = App()
+    try:
+        a.withdraw()
+        a.update()
+        assert a.fetch_nas_var.get() == "http://10.9.8.7:8910"
+        assert a.fetch_nas_token_var.get() == "K" * 43
+    finally:
+        try:
+            a.fetch_shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+        a.destroy()
+
+
+def test_saving_settings_does_not_wipe_nas_token(app, tmp_path, monkeypatch):
+    """点「保存设置」不能把下载页存好的令牌抹掉。
+
+    save_user_config 是整体覆盖写；_collect_settings 少带 nas 段就会清空它。
+    这类丢失是静默的 —— 下次推送才发现 401。
+    """
+    import json
+
+    import wxlive.userconfig as UC
+
+    p = tmp_path / "user.json"
+    monkeypatch.setattr(UC, "USER_CONFIG_PATH", p)
+
+    app.fetch_nas_var.set("http://10.5.5.5:8910")
+    app.fetch_nas_token_var.set("M" * 43)
+    app._fetch_nas_on_target_changed()
+
+    app._save_settings()   # 走设置页的整体保存路径
+    for _ in range(5):
+        app.update()
+
+    nas = json.loads(p.read_text(encoding="utf-8"))["nas"]
+    assert nas["token"] == "M" * 43, "保存设置把 NAS 令牌抹掉了"
+    assert nas["base_url"] == "http://10.5.5.5:8910"
+
+
+def test_nas_health_distinguishes_bad_token_from_offline(app, monkeypatch):
+    """体检必须能区分「令牌不对」和「连不上」。
+
+    原实现只打 /api/health —— 那是免令牌端点，令牌错也显示「在线」，
+    属于典型的假绿灯：界面全绿，一推送就 401。
+
+    这里桩住 HTTP，只验判定逻辑本身（真实网络见人工验收）。
+    """
+    import io
+    import urllib.error
+    import urllib.request
+
+    import wxlive.gui_fetch as GF
+
+    class _Resp(io.BytesIO):
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    # 注意签名：生产代码里是 opener.open(req, timeout=10)，
+    # 即 req 走位置参数、timeout 走关键字。桩必须照这个形态收参数，
+    # 否则会报 "got multiple values for argument 'timeout'"。
+    def fake_open(self, req, /, **kw):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        if url.endswith("/api/health"):
+            return _Resp(b'{"ok":true,"ffmpeg_available":true,"disk_free_gb":100,'
+                         b'"job_count":1,"active_count":0,"auth_required":true}')
+        # /api/probe：鉴权中间件先拦 → 401
+        raise urllib.error.HTTPError(url, 401, "Unauthorized", {}, io.BytesIO(b"no"))
+
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", fake_open)
+    monkeypatch.setattr(GF.messagebox, "showwarning", lambda *a, **kw: None)
+
+    _logs = []
+    monkeypatch.setattr(app, "_log", lambda m: _logs.append(m))
+
+    app.fetch_nas_var.set("http://10.0.0.1:8910")
+    app.fetch_nas_token_var.set("bad")
+    app._fetch_nas_health()
+
+    # 不能只等后台线程结束：线程一收尾，_ui_queue 里的状态更新还没被主线程
+    # 消费，此刻读到的是「验证中…」。要等状态真正离开中间的过渡态。
+    import time as _t
+
+    deadline = _t.time() + 8.0
+    while _t.time() < deadline:
+        app.update()
+        if app.fetch_nas_var_status.get() not in ("", "验证中…"):
+            for _ in range(20):
+                app.update()
+            break
+        _t.sleep(0.01)
+
+    status = app.fetch_nas_var_status.get()
+    assert "令牌没通过" in status, f"应当点明令牌问题，实际：{status!r}；日志={_logs}"
+    assert app.fetch_nas_verified is False
+    assert "在线" in status, "仍要给出「机器在线」这个信息，别让人以为是网络问题"

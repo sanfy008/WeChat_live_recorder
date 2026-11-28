@@ -149,12 +149,29 @@ class OutputConfig:
 
 
 @dataclass
+class NasConfig:
+    """NAS 推送目标。
+
+    为什么单独一段：地址和访问令牌是「到哪里推送」的凭据，和转写参数无关。
+    以前这两项写死在 `gui_fetch.py` 的控件默认值里、从不落盘，
+    导致每次开窗口都要重新填一遍（而且 43 位的令牌塞在 12 字符宽的框里，
+    输错一个字符就只看到个 401）。
+    """
+
+    # 默认局域网地址；用户在界面上改过就以 user.json 为准
+    base_url: str = "http://192.168.68.49:8910"
+    # NAS 的 X-WXLIVE-Token（服务端 WXLIVE_TOKEN 的值）。空 = 不鉴权。
+    token: str = ""
+
+
+@dataclass
 class Config:
     audio: AudioConfig = field(default_factory=AudioConfig)
     vad: VadConfig = field(default_factory=VadConfig)
     asr: AsrConfig = field(default_factory=AsrConfig)
     text: TextConfig = field(default_factory=TextConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
+    nas: NasConfig = field(default_factory=NasConfig)
     session_name: str = ""
 
 

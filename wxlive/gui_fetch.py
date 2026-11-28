@@ -278,35 +278,61 @@ class FetchTabMixin:
         #   · 下载 = 回放（已放完），本地拉一遍、抽音频、本地转写
         #   · 推 NAS = 直播（正在播），把流地址交给 NAS，本机可以关掉
         # 不做这个区分的话，直播就只能等播完再下，等于放弃了方案 A 的价值。
-        nas = ttk.Frame(f)
-        nas.pack(fill="x", padx=12, pady=(2, 4))
+        # NAS 目标拆成两行。原来挤在一行里，令牌框只有 12 字符宽，
+        # 而 NAS 的令牌是 43 位随机串 —— 贴进去只看得到前几个星号，
+        # 输错了完全没有视觉反馈，只会收到一个 401。
+        nas_box = ttk.LabelFrame(f, text="NAS 目标（推送/录制）")
+        nas_box.pack(fill="x", padx=12, pady=(2, 4))
 
-        ttk.Label(nas, text="NAS").pack(side="left")
+        # ---- 第一行：地址 + 令牌 + 验证 ----
+        nas = ttk.Frame(nas_box)
+        nas.pack(fill="x", padx=8, pady=(6, 2))
+
+        ttk.Label(nas, text="地址").pack(side="left")
         self.fetch_nas_var = tk.StringVar(value="http://192.168.68.49:8910")
-        ttk.Entry(nas, textvariable=self.fetch_nas_var, width=26).pack(side="left", padx=(4, 6))
+        self.fetch_nas_url_entry = ttk.Entry(nas, textvariable=self.fetch_nas_var, width=30)
+        self.fetch_nas_url_entry.pack(side="left", padx=(4, 10))
 
         ttk.Label(nas, text="令牌").pack(side="left")
         self.fetch_nas_token_var = tk.StringVar(value=os.environ.get("WXLIVE_TOKEN", ""))
-        ttk.Entry(nas, textvariable=self.fetch_nas_token_var, width=12, show="*").pack(
-            side="left", padx=(3, 8))
+        # width=44 才装得下 43 位；用 show="*" 默认遮挡，旁边给「显示」开关
+        self.fetch_nas_token_entry = ttk.Entry(
+            nas, textvariable=self.fetch_nas_token_var, width=44, show="*")
+        self.fetch_nas_token_entry.pack(side="left", padx=(4, 4))
+
+        self.fetch_nas_show_token = tk.BooleanVar(value=False)
+        ttk.Checkbutton(nas, text="显示", variable=self.fetch_nas_show_token,
+                        command=self._fetch_nas_toggle_token).pack(side="left", padx=(0, 8))
 
         self.fetch_nas_health_btn = ttk.Button(
-            nas, text="体检", width=6, command=self._fetch_nas_health)
+            nas, text="验证连接", width=9, command=self._fetch_nas_health)
         self.fetch_nas_health_btn.pack(side="left")
 
+        # ---- 第二行：推送动作 + 状态 ----
+        nas2 = ttk.Frame(nas_box)
+        nas2.pack(fill="x", padx=8, pady=(2, 6))
+
         self.fetch_nas_live_btn = ttk.Button(
-            nas, text="把正在播的直播推给 NAS", width=22,
+            nas2, text="把正在播的直播推给 NAS", width=22,
             command=self._fetch_push_local_live)
-        self.fetch_nas_live_btn.pack(side="left", padx=(10, 0))
+        self.fetch_nas_live_btn.pack(side="left")
 
         self.fetch_nas_sel_btn = ttk.Button(
-            nas, text="推送选中项到 NAS", width=17,
+            nas2, text="推送选中项到 NAS", width=17,
             command=self._fetch_push_selected_to_nas)
         self.fetch_nas_sel_btn.pack(side="left", padx=(6, 0))
 
         self.fetch_nas_var_status = tk.StringVar(value="")
-        ttk.Label(nas, textvariable=self.fetch_nas_var_status,
-                  style="Hint.TLabel").pack(side="left", padx=(10, 0))
+        self.fetch_nas_status_lbl = ttk.Label(
+            nas2, textvariable=self.fetch_nas_var_status, style="Hint.TLabel")
+        self.fetch_nas_status_lbl.pack(side="left", padx=(10, 0))
+
+        # 地址/令牌改动后落盘并作废旧结论。绑在「失焦」和「回车」上，
+        # 而不是绑在 trace 上 —— 逐字符写文件太浪费，且会打断输入。
+        self.fetch_nas_verified = None
+        for _w in (self.fetch_nas_url_entry, self.fetch_nas_token_entry):
+            _w.bind("<FocusOut>", lambda e: self._fetch_nas_on_target_changed())
+            _w.bind("<Return>", lambda e: self._fetch_nas_on_target_changed())
 
         # ===== 操作按钮 + 进度 =====
         btns = ttk.Frame(f)
@@ -384,6 +410,47 @@ class FetchTabMixin:
             return (var.get() or "").strip()
         return os.environ.get("WXLIVE_TOKEN", "").strip()
 
+    def _fetch_nas_toggle_token(self) -> None:
+        """显示/隐藏令牌明文。
+
+        43 位随机串靠人眼核对不现实，但「完全看不到」会让输错变成不可诊断的
+        401。给一个显式开关，让用户能自己确认粘对了没有。
+        """
+        try:
+            shown = bool(self.fetch_nas_show_token.get())
+            self.fetch_nas_token_entry.configure(show="" if shown else "*")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _fetch_nas_save_target(self) -> None:
+        """把 NAS 地址与令牌写进 config/user.json。
+
+        失败要静默 —— 这属于便利性持久化，绝不能因为写配置失败而让推送中断。
+        """
+        try:
+            from . import userconfig
+
+            data = userconfig.load_user_config()
+            data["nas"] = {
+                "base_url": self._fetch_nas_base(),
+                "token": self._fetch_nas_token(),
+            }
+            userconfig.save_user_config(data)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _fetch_nas_on_target_changed(self) -> None:
+        """地址/令牌改动后：落盘 + 把上一次的验证结论作废。
+
+        为什么作废：验证结论是「这一组地址+令牌」的结论，改了任何一个就不再成立。
+        留着旧的「在线」绿灯会让人以为改完还是好的。
+        """
+        self._fetch_nas_save_target()
+        try:
+            self.fetch_nas_verified = None
+        except Exception:  # noqa: BLE001
+            pass
+
     def _fetch_nas_headers(self, extra: dict | None = None) -> dict:
         headers = dict(extra or {})
         tok = self._fetch_nas_token()
@@ -398,35 +465,133 @@ class FetchTabMixin:
             pass
 
     def _fetch_nas_health(self) -> None:
-        """确认 NAS 服务在线，把关键信息显示在状态栏。"""
+        """验证「连得上」**且**「令牌真的能过鉴权」。
+
+        ## 为什么不能只看 /api/health
+
+        `/api/health` 是**免令牌**端点（服务端刻意放开，好让网页前端在
+        弹令牌框之前先知道自己活着）。所以它返回 200 只证明「机器在线」，
+        对令牌对错**零信息量**。
+
+        原来的「体检」只打这个端点，于是出现典型的假绿灯：
+        令牌填错 / 根本没填 → 界面上明明显示「在线」→ 一推送就 401。
+        这正是 MEMORY 里记了很多次的「自洽但外部错误」。
+
+        ## 怎么才算真的验证过
+
+        发一个**空 body 的 POST /api/probe**：
+          · 401 → 鉴权中间件先拦住 = 令牌不对（或没填）
+          · 422 → 过了鉴权，是 FastAPI 在抱怨 body 缺字段 = **令牌有效**
+          · 其他 2xx → 也算过了鉴权
+        这个请求不会建任务、不会碰磁盘，用它当探针没有副作用。
+        （已实测：无令牌与错令牌都是 401；正确令牌会走到 422。）
+        """
         import json
+        import urllib.error
         import urllib.request
 
         base = self._fetch_nas_base()
         if not base:
             self._fetch_nas_set_status("请先填 NAS 地址", warn=True)
             return
-        headers = self._fetch_nas_headers()
-        self._fetch_nas_set_status("检测中…")
+        # ⚠️ 必须在这里（主线程）就把令牌读出来。
+        # 下面 work() 跑在后台线程，而 _fetch_nas_headers() 内部读
+        # tk.StringVar（fetch_nas_token_var）—— Tk 变量绑定 Tcl 解释器，
+        # 后台线程读会抛 "main thread is not in main loop"。
+        # 这个坑在录制页也踩过一次（见 MEMORY「跨线程访问」）。
+        token = self._fetch_nas_token()
+        auth_headers = {"X-WXLIVE-Token": token} if token else {}
+        json_headers = dict(auth_headers, **{"Content-Type": "application/json"})
+        self._fetch_nas_set_status("验证中…")
 
         def work() -> None:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+            # ---- 第一步：机器在线吗 ----
             try:
-                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-                req = urllib.request.Request(base + "/api/health", headers=headers)
+                req = urllib.request.Request(base + "/api/health", headers=auth_headers)
                 with opener.open(req, timeout=10) as r:
                     h = json.loads(r.read().decode("utf-8"))
-                ok = bool(h.get("ok"))
-                msg = (f"在线 · ffmpeg={'有' if h.get('ffmpeg_available') else '缺'}"
-                       f" · 磁盘 {h.get('disk_free_gb')}GB"
-                       f" · 任务 {h.get('job_count')}（进行中 {h.get('active_count')}）")
-                self._ui(lambda: self._fetch_nas_set_status(msg if ok else "服务异常"))
-                self._log("[NAS] " + msg)
             except Exception as exc:  # noqa: BLE001
                 m = f"{type(exc).__name__}: {exc}"
                 self._ui(lambda: self._fetch_nas_set_status("连不上", warn=True))
-                self._log(f"[NAS] 体检失败：{m}")
+                self._log(f"[NAS] 验证失败（连不上）：{m}")
+                return
+
+            info = (f"ffmpeg={'有' if h.get('ffmpeg_available') else '缺'}"
+                    f" · 磁盘 {h.get('disk_free_gb')}GB"
+                    f" · 任务 {h.get('job_count')}（进行中 {h.get('active_count')}）")
+            needs_auth = bool(h.get("auth_required"))
+
+            # ---- 第二步：令牌能过鉴权吗 ----
+            probe_status = 0
+            probe_detail = ""
+            try:
+                preq = urllib.request.Request(
+                    base + "/api/probe", data=b"{}", headers=json_headers,
+                )
+                with opener.open(preq, timeout=10) as r:
+                    probe_status = r.status
+            except urllib.error.HTTPError as exc:
+                probe_status = exc.code
+                try:
+                    probe_detail = exc.read().decode("utf-8", "replace")[:200]
+                except Exception:  # noqa: BLE001
+                    probe_detail = ""
+            except Exception as exc:  # noqa: BLE001
+                m = f"{type(exc).__name__}: {exc}"
+                self._ui(lambda: self._fetch_nas_set_status("验证失败", warn=True))
+                self._log(f"[NAS] 验证失败（探针异常）：{m}")
+                return
+
+            # 401 = 被鉴权挡住。只有「服务端明确这么说」才算令牌问题；
+            # 真正的网络故障在上一步就返回了。
+            if probe_status == 401:
+                why = ("令牌为空" if not token
+                       else "令牌与服务端不一致（或已在 NAS .env 里换过）")
+                msg = f"在线，但令牌没通过 · {why}"
+                self._ui(lambda: self._fetch_nas_verified_set(False))
+                self._ui(lambda m=msg: self._fetch_nas_set_status(m, warn=True))
+                self._log(f"[NAS] {msg}｜{info}")
+                self._ui(lambda d=probe_detail: messagebox.showwarning(
+                    "令牌没有通过",
+                    "NAS 在线，但它拒绝了当前令牌。\n\n"
+                    f"原因：{why}\n\n"
+                    "处理办法：\n"
+                    "1. 打开 NAS 的 docker/.env，复制 WXLIVE_TOKEN 的值；\n"
+                    "2. 粘到本页「令牌」框里（点「显示」可以先核对）；\n"
+                    "3. 再点「验证连接」。\n\n"
+                    "令牌会随配置保存，下次开窗口不用重填。"))
+                return
+
+            ok_auth = probe_status in (200, 201, 202, 204, 422)
+            if not ok_auth:
+                msg = f"在线，但探针返回 HTTP {probe_status}（鉴权结果未知）"
+                self._ui(lambda: self._fetch_nas_verified_set(None))
+                self._ui(lambda m=msg: self._fetch_nas_set_status(m, warn=True))
+                self._log(f"[NAS] {msg}｜{info}")
+                return
+
+            # 服务端没开鉴权（auth_required=false）时，探针 422 也不能证明令牌对，
+            # 只能说「现在不需要令牌」。这一点要讲清楚，别给假的安心感。
+            if not needs_auth:
+                msg = f"在线 · 服务端未启用鉴权（不需要令牌）· {info}"
+                verdict = None
+            else:
+                msg = f"在线 · 令牌有效 · {info}"
+                verdict = True
+            self._ui(lambda: self._fetch_nas_verified_set(verdict))
+            self._ui(lambda m=msg: self._fetch_nas_set_status(m))
+            self._log("[NAS] " + msg)
 
         self._run_bg(work)
+
+    def _fetch_nas_verified_set(self, val) -> None:
+        """记录最近一次验证结论：True=令牌有效 / False=被拒 / None=未知。"""
+        try:
+            self.fetch_nas_verified = val
+        except Exception:  # noqa: BLE001
+            pass
 
     def _fetch_nas_push(self, url: str, name: str,
                         on_done=None, *,
@@ -503,6 +668,22 @@ class FetchTabMixin:
                     self._ui(on_done)
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", "replace")[:300]
+                if exc.code == 401:
+                    # 401 是最容易卡住人的一种：日志里只有一行 HTTP 401，
+                    # 但真正要做的动作（去填令牌 + 验证）完全没被提示出来。
+                    self._ui(lambda: self._fetch_nas_set_status("令牌未通过", warn=True))
+                    self._log(f"[NAS] 推送被拒 HTTP 401（令牌未通过）：{detail}")
+                    self._ui(lambda: self._fetch_nas_verified_set(False))
+                    self._ui(lambda d=detail: messagebox.showwarning(
+                        "NAS 拒绝了这次请求（401）",
+                        "NAS 开着令牌鉴权，而当前令牌没通过。\n\n"
+                        "处理办法：\n"
+                        "1. 打开 NAS 的 docker/.env，复制 WXLIVE_TOKEN 的值；\n"
+                        "2. 粘到本页「令牌」框（点「显示」可先核对长度 43 位）；\n"
+                        "3. 点「验证连接」看到「令牌有效」再推送。\n\n"
+                        "令牌会随配置保存，下次开窗口不用重填。\n\n"
+                        f"服务端原文：{d}"))
+                    return
                 self._ui(lambda: self._fetch_nas_set_status("推送失败", warn=True))
                 self._log(f"[NAS] 推送失败 HTTP {exc.code}：{detail}")
                 self._ui(lambda d=detail, c=exc.code: messagebox.showwarning(

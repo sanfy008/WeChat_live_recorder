@@ -488,6 +488,18 @@ class App(FetchTabMixin, tk.Tk):
         self.cloudmin_var.set(str(c.vad.cloud_min_segment_seconds))
         self.lex_path_var.set(c.asr.lexicon_path or str(
             Path(__file__).resolve().parent.parent / "lexicon" / "xsc.json"))
+
+        # NAS 目标：以前这两个值只写在 gui_fetch._build_fetch_tab 的默认参数里，
+        # 从不读配置 —— 于是每次开窗口 NAS 地址都回到硬编码值、
+        # 令牌永远是空（或环境变量）。这就是「明明填过又要重填」的来源。
+        # 环境变量优先级最高，便于临时用别的令牌覆盖而不改配置。
+        try:
+            env_tok = os.environ.get("WXLIVE_TOKEN", "").strip()
+            self.fetch_nas_var.set(c.nas.base_url or "http://192.168.68.49:8910")
+            self.fetch_nas_token_var.set(env_tok or (c.nas.token or ""))
+        except Exception:  # noqa: BLE001
+            pass
+
         self._sync_source_mode()
         self._sync_mode()
         self._refresh_devices()
@@ -535,6 +547,12 @@ class App(FetchTabMixin, tk.Tk):
                 "model": self.text_model_var.get() or postprocess.DEFAULT_MODEL,
                 # 非法档直接抛错，由保存/开始按钮提示，不静默写盘。
                 "reasoning_effort": validate_reasoning_effort(self.reasoning_var.get()),
+            },
+            # nas 段必须一起带上：save_user_config 是整体覆盖写，
+            # 少这一段就会把下载页刚存好的 NAS 令牌抹掉。
+            "nas": {
+                "base_url": self._fetch_nas_base() if hasattr(self, "_fetch_nas_base") else "",
+                "token": self._fetch_nas_token() if hasattr(self, "_fetch_nas_token") else "",
             },
         }
 
