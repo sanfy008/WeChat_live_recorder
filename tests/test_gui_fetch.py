@@ -26,6 +26,16 @@ def app(tmp_path, monkeypatch):
 
     monkeypatch.setattr(S, "STATE_PATH", tmp_path / "fetch_state.json")
 
+    # App 启动时会往 OUTPUT_DIR/logs/gui_YYYYMMDD.log 写一条启动记录。
+    # 不隔离的话，跑一次全量测试就在**生产日志**里塞上百条假的「启动」
+    # 和「设置已保存」，把真实历史冲得无法阅读（2026-11-28 实测 107 条）。
+    # gui 模块是 from .config import OUTPUT_DIR 直接绑定的，必须改 gui 里的名字。
+    import wxlive.gui as G
+
+    monkeypatch.setattr(G, "OUTPUT_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(G, "RECORDINGS_DIR", tmp_path / "rec", raising=False)
+    monkeypatch.setattr(G, "TRANSCRIPTS_DIR", tmp_path / "txt", raising=False)
+
     # 关键：把所有 messagebox 换成 noop。
     # 真实弹窗是**模态**的，测试里没人点，_pump 会一直等 → 整个用例卡死。
     # 实测未替换时单跑 test_fetch_clear_search_resets_page 就卡满 60 秒。
@@ -1207,6 +1217,9 @@ def test_nas_target_restored_on_next_launch(tmp_path, monkeypatch):
     import wxlive.fetch as F
     monkeypatch.setattr(F, "discover_live_streams", lambda *a, **kw: [])
     monkeypatch.setattr(F, "discover_feed_videos", lambda *a, **kw: [])
+    # 同上：别把启动记录写进生产日志
+    import wxlive.gui as G
+    monkeypatch.setattr(G, "OUTPUT_DIR", tmp_path, raising=False)
 
     from wxlive.gui import App
 
