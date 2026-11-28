@@ -158,10 +158,13 @@
   - ⚡ Impact: Medium。`audio_dir` 修复对它有效，但未经真实点击验证
   - 💡 Suggested Fix: GUI 点一次 5 分钟录制，确认产物落点与"打开逐字稿"
 
-- **[DEBT-009]** 手机端插件硬编码微信 `8.0.62`（`versionCode=2881`）R8 混淆符号且暂缺加密回放提取 | Introduced: S-20261127-1430 | Status: `Open`
+- **[DEBT-009]** 手机端插件硬编码微信 `8.0.62`（`versionCode=2881`）R8 混淆符号且暂缺加密回放提取 | Introduced: S-20261127-1430 | Status: `User-verified`（2026-11-28 关闭）
   - 📍 Location: 手机端 `wechat_live_nas_pusher` (`HookEntry.java`)
   - ⚡ Impact: Medium。微信大版本升级即失效，且手机端暂不能直接推送加密回放的 `decrypt_key`
   - 💡 Suggested Fix: 手机端补齐微信版本校验、特征签名动态查找及回放 `decodeKey` 提取
+  - ✅ 关闭依据：King 于 2026-11-28 08:30 明确告知「手机端已经完成优化验收」。
+    **证据级别：用户口头确认**，手机端为独立项目不在本仓库，本机无法复现验证。
+    风险描述保留 —— 「微信大版本升级即失效」是结构性约束，不会因本次验收消失。
 
 - **[DEBT-010]** 公网只读免密暴露面与本地 9 个提交未推送远端 | Introduced: S-20261127-1430 | Status: `Open`
   - 📍 Location: NAS `.env` (`WXLIVE_READ_AUTH=false`) / 本地 `main` 分支

@@ -50,7 +50,9 @@ evidence_level: mixed
 
 **未验证（明确标注）**:
 
-- [inferred] 手机端 `wechat_live_nas_pusher` 读入 NAS `.env` 令牌并修复串台后的真实直播间滑切推送与公网带令牌闭环 — 用户反馈已按清单修复，但尚未在开启 Token 后的现网执行真机实播推送验证（**连续两轮遗留**）
+- [user-confirmed] 手机端 `wechat_live_nas_pusher` 读入 NAS `.env` 令牌并修复串台后的真实直播间滑切推送与公网带令牌闭环 — **King 于 2026-11-28 08:30 明确告知「手机端已经完成优化验收」**。
+  证据级别：用户口头确认，非本机可复现（手机端代码不在本仓库，`wechat_live_nas_pusher` 为独立项目）。
+  台账动作：DEBT-009 由 `Open` 转为 `User-verified`，仍保留「微信大版本升级即失效」的风险描述。
 - [inferred] 新版容器下 2 小时以上长直播的 `summarize_digest` 分块重试与 `meta.quality` 落盘表现 — 今日 `20261128_073432_00dbef` 正在录制，可作为首场样本，但产物未取数
 - [inferred] `txTime` 剩余有效期显示与 Clash 断网态橙色告警条的真实点击验证 — 仅自动化单测覆盖（**连续两轮遗留**）
 
