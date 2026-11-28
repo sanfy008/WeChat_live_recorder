@@ -20,6 +20,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from . import _force_utf8  # noqa: F401
+from . import VERSION_LABEL, build_stamp
 from .gui_fetch import FetchTabMixin
 from .config import (
     OUTPUT_DIR, RECORDINGS_DIR, TRANSCRIPTS_DIR, Config,
@@ -28,13 +29,19 @@ from .config import (
 from . import model_discovery, postprocess, userconfig
 
 APP_TITLE = "微信直播录音转写"
-APP_VER = "1.0"
+# 版本号不再在这里写死 —— 唯一真相源是 wxlive/__init__.py 的 __version__。
+# 原来这里硬编码 "1.0"，从 2026-11-16 首次提交起就没再变过，
+# 而包版本已经到 0.4，两边对不上，看标题栏判断不了跑的是哪一版。
+APP_VER = VERSION_LABEL          # 形如 "v0.5.0"
+APP_STAMP = build_stamp()        # 源码指纹，形如 "a3f9c1"
 
 
 class App(FetchTabMixin, tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title(f"{APP_TITLE} v{APP_VER}")
+        # 标题栏带版本 + 源码指纹：改了代码没重启的话，指纹不会变，
+        # 一眼就能看出来窗口是旧的（这次 401 就是栽在这上面）。
+        self.title(f"{APP_TITLE} {APP_VER} · {APP_STAMP}")
         self.geometry("1080x760")
         self.minsize(920, 640)
 
@@ -51,6 +58,11 @@ class App(FetchTabMixin, tk.Tk):
         self._load_settings_into_ui()
         self._poll_log()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # 启动留痕：写进当天的 gui_YYYYMMDD.log。
+        # 事后排查「当时跑的是哪一版」时，这一行比任何推断都直接。
+        self._log(f"启动 {APP_TITLE} {APP_VER} · 源码指纹 {APP_STAMP} · "
+                  f"PID {os.getpid()}")
         # Tk 变量只能在主线程读取，先取值再交给后台线程
         _m_base = self.api_url_var.get()
         _m_key = self.api_key_var.get()

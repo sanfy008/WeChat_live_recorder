@@ -986,7 +986,9 @@ def test_push_encrypted_replay_to_nas_falls_back_to_decrypt_and_upload(
 
     monkeypatch.setattr(F, "probe_item", lambda item, timeout=20: ProbeInfo(
         ok=True, status=200, encrypted=True, enc_len=131072, size_bytes=1024000))
-    monkeypatch.setattr(F, "nas_supports_decrypt", lambda base: False)
+    # 签名要收 token：生产代码会传 token=（NAS 开了鉴权后必须带上）。
+    # 桩只收 base 会抛 TypeError，线程里的异常被吞成「没推送」，测试假失败。
+    monkeypatch.setattr(F, "nas_supports_decrypt", lambda base, token="": False)
 
     calls = {"dl": 0, "ex": 0, "up": []}
 
@@ -1056,7 +1058,7 @@ def test_push_encrypted_replay_uses_native_nas_decrypt_when_supported(
 
     monkeypatch.setattr(F, "probe_item", lambda item, timeout=20: ProbeInfo(
         ok=True, status=200, encrypted=True, enc_len=131072, size_bytes=1024000))
-    monkeypatch.setattr(F, "nas_supports_decrypt", lambda base: True)
+    monkeypatch.setattr(F, "nas_supports_decrypt", lambda base, token="": True)
 
     sent = []
 

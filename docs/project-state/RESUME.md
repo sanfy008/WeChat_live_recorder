@@ -1,9 +1,9 @@
 ---
-updated: 2026-11-26T00:30:00+08:00
-session: S-20261126-0030
-project_version: v0.3.0
+updated: 2026-11-28T08:20:00+08:00
+session: S-20261128-0820
+project_version: v0.5.0
 status: active
-evidence_level: verified_with_live_nas_deploy
+evidence_level: mixed
 ---
 
 # Resume Card
@@ -12,47 +12,47 @@ evidence_level: verified_with_live_nas_deploy
 
 ## Current Contract
 
-- **Goal**: 打通并加固「本地抓流/代理 → NAS 远程拉流/转码/保留 → ASR/后处理/完整性判定」全链路，完成 NAS 容器重建验收并沉淀复盘。
+- **Goal**: 巩固「PC 抓流/解密直推 + 手机端公网直推 + NAS 无人值守录制/转写/摘要」全链路，补齐分块摘要重试、禁用 `max` 思考档位、统一 XSC 词表注入及 `WXLIVE_TOKEN` / `WXLIVE_ALLOWED_HOSTS` 鉴权闭环，并完成当前阶段复盘存档。
 - **Scope（本轮已完成）**:
-  - 本地代理与抓流：`systemproxy.py` 探测上游 `127.0.0.1:10808`、`gui_fetch.py` `content_id` 精确行绑定 + `txTime` 剩余有效期显示 + 告警原话展示
-  - NAS 拉流/转码/保留：`nas_runner.py` / `stream_capture.py` / `server.py` / `retention.py` 修复启动卡 `recording`、断点续转、音频缺失置 `failed`、归因码、单场 `meta.asr`、中文目录下载、显式 ffmpeg 校验、原片保留清理，仓库根新增 `.dockerignore`
-  - ASR/后处理/完整性：`quality.py` `compute_completeness()` 统一完整性、`session.py` 原子写盘 + 保留 `asr_text`、`engine.py` `_content_failure_calls`、`pipeline.py` 停止事件 + 2s 哨兵、`auto_transcribe_after_stop.py` 1MB 头扫描、`postprocess.py` 逐轮放大 `max_tokens`（8k→16k→32k）+ 剥离序号保护小数、`lexicon.py` 缺失 warning
-  - NAS 端部署与验收：同步 14 个 `wxlive/*.py` + `.dockerignore`，重建并启动 `wxlive-nas` 容器，全套验收通过
+  - 词表扩充与注入统一（`adfa9b9`）：扩充 `lexicon/xsc.json`，`wxlive/lexicon.py` 新增 `build_vocabulary(60, 40)` 并统一接入 `auto_pipeline.py` / `scripts/auto_transcribe_after_stop.py` / `wxlive/gui.py` / `wxlive/nas_runner.py`
+  - 分块摘要重试与禁用 `max`（`043429f`）：`wxlive/postprocess.py` 新增 `_complete_multi_with_retry`（`DIGEST_RETRY_DELAYS = (2.0, 6.0)`）；`wxlive/config.py` 将 `VALID_REASONING_EFFORTS` 收紧为 `("none", "low", "high")`；`wxlive/server.py` 与 `wxlive/nas_runner.py` 移除/降级 `max`
+  - 全端鉴权与 Host 白名单闭环（`043429f`）：`wxlive/server.py` 实现 `WXLIVE_ALLOWED_HOSTS`、`WXLIVE_READ_AUTH` 与 Web UI「🔑 令牌」入口；`wxlive/fetch.py` / `wxlive/gui_fetch.py` 透传 `X-WXLIVE-Token`；`docker/docker-compose.yml` 与 `docker/.env.example` 透传环境变量
+  - 手机端联调与 NAS 现网配置：排查今早 `20261127_080703_167a58` 串台假停播根因，输出手机端整改交接清单（用户已反馈手机端 `agy` 修复完成）；等待任务结束后重建 `wxlive-nas`（`sha256:dca75fdff`），并在 NAS `.env` 配置 43 位强随机 `WXLIVE_TOKEN`（不回显）、`WXLIVE_ALLOWED_HOSTS=one.20161213.xyz`、`WXLIVE_READ_AUTH=false`
 - **Non-goals（故意不做）**:
-  - **不覆盖 `README.md`**（Windows 下与 `ReadMe.md` 为同一文件，DEC-003）
-  - **不给 Tk 测试加 skip 消掉 `tk.tcl` error**
-  - **不把句级时间戳改成精确值**（保持 `estimated`）
-  - **不修改 `audio_capture.py` / `gui.py` 的 NAS 侧差异**（本轮未改这两个文件，保持原样）
+  - **不覆盖 `README.md`**（Windows 下与 `ReadMe.md` 为同一文件，保留 GitHub 用户文档，DEC-003）
+  - **不开启 `WXLIVE_READ_AUTH=true`**（用户明确偏好网页免密只读浏览，仅对写操作/推送强制 `WXLIVE_TOKEN`，DEC-016）
+  - **不给 Tk 测试加 skip 消掉 `tk.tcl` 偶发 error**
+  - **不把句级时间戳改成精确值**（保持 `ts_source="estimated"`）
 - **Acceptance check**:
-  - 本地全量测试：`python -m pytest -q` → **512 passed, 2 skipped** (55.43s)
-  - NAS 端验收：`GET /api/health` 200 (`ok: true`, `ffmpeg_path: "/host-ffmpeg/ffmpeg"`), `/host-ffmpeg/ffmpeg` 真实编码 59844B flv, 中文库下载 200 (112544B), 容器出网 `baidu.com` / `channels.weixin.qq.com` 均 200
+  - 本地全量测试：`cd /d/File/01_Vibe_Coding/14-WeChat_live && .venv-trim/Scripts/python.exe -m pytest -q` → **570 passed** (96.92s)
+  - NAS 内网与公网鉴权实测：`GET /api/health` → `200` (`auth_required=True`, `read_auth_required=False`)；无令牌 `GET /` 与 `GET /api/jobs` → `200` (`jobs=16`)；无令牌 `POST /api/probe` → `401`；带有效 `X-WXLIVE-Token` `POST /api/probe` → `422`
 
 ## Verified State
 
-- [verified] 全量单元与集成测试通过：`python -m pytest -q` → **512 passed, 2 skipped**
-- [verified] NAS 容器 `wxlive-nas` 使用最新代码重建并启动：容器内 `server.py` / `nas_runner.py` / `stream_capture.py` / `retention.py` MD5 与本地 100% 一致
-- [verified] `.dockerignore` 置于仓库根后 BuildKit 生效：`COPY wxlive` 2.7s、`COPY lexicon` 2.4s
-- [verified] NAS 宿主机 ffmpeg 挂载正常：`/host-ffmpeg/ffmpeg` (`8.1.1-mediasrv`) 真实编码产出 `59844` 字节 flv
-- [verified] NAS 中文标题库下载正常：`/api/library/20261124_080917_欢迎来到我的直播间_stream/download/md` → `200`
-- [verified] NAS 容器出网正常：`https://www.baidu.com` 与 `https://channels.weixin.qq.com` 均返回 `200`
+- [verified] 正式目录 `D:/File/01_Vibe_Coding/14-WeChat_live`（`main` 分支）全量测试通过：`.venv-trim/Scripts/python.exe -m pytest -q` → **570 passed in 96.92s**
+- [verified] NAS 容器 `wxlive-nas` 已基于最新代码重建并重载 `.env`（镜像 `sha256:dca75fdff`，`WXLIVE_TOKEN` 已生效、`WXLIVE_ALLOWED_HOSTS=one.20161213.xyz`、`WXLIVE_READ_AUTH=false`）
+- [verified] 内网（`http://192.168.68.49:8910`）与公网（`http://one.20161213.xyz:16666`）双端实测：网页/只读 API 免密 `200`（`jobs=16`），写接口无令牌 `401`、携带有效 `X-WXLIVE-Token` 通过鉴权
 
 **未验证（明确标注）**:
 
-- [inferred] 真实桌面 GUI 在 Clash 断网态下的橙色告警条与 `txTime` 倒计时显示 — 仅单测覆盖，未开桌面 GUI 实测
-- [inferred] 新版 `wxlive-nas` 容器在真实 1 小时以上微信直播推流下的端到端长跑表现 — 尚未开播实测
+- [inferred] 手机端 `wechat_live_nas_pusher` 读入 NAS `.env` 令牌并修复串台后的真实直播间滑切推送与公网带令牌闭环 — 用户反馈手机端已按清单修复，但尚未在开启 Token 后的现网执行真机实播推送验证
+- [inferred] 新版容器下 2 小时以上长直播的 `summarize_digest` 分块重试与 `meta.quality` 落盘表现 — 尚无重建后的长场次完成样本
+- [inferred] 桌面 GUI 在填写 `WXLIVE_TOKEN` 后对 NAS 的探活/加密回放直推，以及 `txTime` 剩余有效期 / Clash 断网态告警条实机点击验证 — 仅自动化单测覆盖
 
 ## Blockers and Do-Not-Repeat
 
-- **`.dockerignore` 放错位置会静默失效** — compose 的 `build.context` 是 `..`（仓库根），放 `docker/.dockerignore` 不会被 BuildKit 读取，必须放仓库根 `.dockerignore`。
-- **本机 curl 访问局域网 NAS 必须加 `--noproxy '*'`** — 否则会被 `HTTP_PROXY=10808` 拦截导致超时或 000。
-- **NAS Docker 命令权限**：`wong` 不在 `docker` 组，非交互 SSH 需通过 `sudo -S`（使用已授权凭据）执行 `docker` / `docker compose`。
+- **跑 `pytest` 必须先 `cd` 进入目标仓库根目录**：从其他工作树目录用绝对路径调用 `pytest D:/.../tests` 会导入旧工作树的 `wxlive` 包并报 `ModuleNotFoundError: No module named 'wxlive.artifacts'`（FAIL-012）。
+- **不得擅自将 `WXLIVE_READ_AUTH` 设为 `true`**：用户明确拒绝打开网页弹窗输密码（FAIL-011 / DEC-016）。
+- **`.dockerignore` 放错位置会静默失效**：compose 的 `build.context` 是 `..`（仓库根），必须保留在仓库根 `.dockerignore`。
+- **本机 curl 访问局域网 NAS 必须加 `--noproxy '*'`**，否则会被 `HTTP_PROXY=10808` 拦截。
+- **NAS `docker compose` 必须在 `/vol1/1000/docker/wxlive-nas/docker/` 目录执行**（非交互 SSH 使用管理员 `wong` 授权提权）。
 
 ## One Next Action
 
-- **action**: 推送一场真实微信直播到新版 `wxlive-nas` 容器，并在桌面 GUI 上验证 `txTime` 剩余有效期显示与完整录制 → 转码 → ASR → 后处理闭环。
-- **completion check**: 录制期间 `audio_bytes > 0` 且持续增长，结束后 `meta.transcript_complete == true` 且三份产物齐全无截断。
+- **action**: 将正式目录 `D:/File/01_Vibe_Coding/14-WeChat_live` 的 `main` 分支（含本轮存档文档与领先 `origin/main` 的代码提交）推送到远程仓库，并由手机端真机带 `X-WXLIVE-Token` 滑切直播间推送一场真实直播到 `http://one.20161213.xyz:16666` 做闭环验收。
+- **completion check**: `git status` 干净且 `main` 与 `origin/main` 同步；手机端弹窗标题/流与实际录制一致，NAS 日志无 401/串台，结束后 `meta.transcript_complete == true`、`meta.quality.ok == true` 且 `llm_status` 非 `partial`。
 
 ## Read First
 
-- `Handover Book.md`（Zone A 仪表板 + B1 DEC-011~013 + B3 FAIL-008~009 + Zone C `S-20261126-0030`）
-- `docs/daily__pipeline_reviews/2026-11-26.md`（本轮完整复盘 + 上次事项追踪）
+- `Handover Book.md`（Zone A 仪表板 + B1 DEC-014~016 + B3 FAIL-010~012 + Zone C `S-20261127-1430`）
+- `docs/daily__pipeline_reviews/2026-11-27.md`（本轮完整复盘 + 上次事项追踪）
